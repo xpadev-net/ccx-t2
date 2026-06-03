@@ -4,40 +4,49 @@
 
 ```
 ccx-t2/
-├── cmd/
-│   └── ccx/
-│       └── main.go               ← エントリーポイント
-├── internal/
-│   ├── config/
-│   │   └── config.go             ← 設定ファイル読み込み（yaml.v3 で直接 unmarshal）
-│   ├── ledger/
-│   │   ├── ledger.go             ← 台帳読み書き（ミューテックスで排他制御）
-│   │   └── parser.go             ← MD front matter パーサー
-│   ├── tmux/
-│   │   └── tmux.go               ← tmux セッション・ウィンドウ管理
-│   ├── worktree/
-│   │   └── worktree.go           ← git worktree 管理
-│   ├── harness/
-│   │   └── harness.go            ← ハーネス起動・usage 管理
-│   ├── github/
-│   │   └── github.go             ← GitHub API クライアント
-│   ├── orchestrator/
-│   │   └── orchestrator.go       ← Orchestrator 起動（tmux ウィンドウへのハーネス起動）
-│   ├── scheduler/
-│   │   └── scheduler.go          ← ハートビート管理（Orchestrator.Trigger を呼ぶ）
-│   ├── mcp/
-│   │   └── server.go             ← MCP HTTP サーバー（/mcp/orchestrator・/mcp/worker）
-│   ├── event/
-│   │   └── queue.go              ← Worker notify イベントの直列キュー（chan Event）
-│   └── web/
-│       ├── server.go             ← Web UI HTTP サーバー・REST API
-│       ├── ws.go                 ← WebSocket ハンドラ
-│       └── static/               ← フロントエンド静的ファイル（go:embed でバイナリに同梱）
+├── server/                        ← Go バックエンド
+│   ├── cmd/
+│   │   └── ccx/
+│   │       └── main.go           ← エントリーポイント
+│   ├── internal/
+│   │   ├── config/
+│   │   │   └── config.go         ← 設定ファイル読み込み（yaml.v3 で直接 unmarshal）
+│   │   ├── ledger/
+│   │   │   ├── ledger.go         ← 台帳読み書き（ミューテックスで排他制御）
+│   │   │   └── parser.go         ← MD front matter パーサー
+│   │   ├── tmux/
+│   │   │   └── tmux.go           ← tmux セッション・ウィンドウ管理
+│   │   ├── worktree/
+│   │   │   └── worktree.go       ← git worktree 管理
+│   │   ├── harness/
+│   │   │   └── harness.go        ← ハーネス起動・usage 管理
+│   │   ├── github/
+│   │   │   └── github.go         ← GitHub API クライアント
+│   │   ├── orchestrator/
+│   │   │   └── orchestrator.go   ← Orchestrator 起動（tmux ウィンドウへのハーネス起動）
+│   │   ├── scheduler/
+│   │   │   └── scheduler.go      ← ハートビート管理（Orchestrator.Trigger を呼ぶ）
+│   │   ├── mcp/
+│   │   │   └── server.go         ← MCP HTTP サーバー（/mcp/orchestrator・/mcp/worker）
+│   │   ├── event/
+│   │   │   └── queue.go          ← Worker notify イベントの直列キュー（chan Event）
+│   │   └── web/
+│   │       ├── server.go         ← REST API・静的ファイル配信
+│   │       └── ws.go             ← WebSocket ハンドラ
+│   └── go.mod
+├── web/                           ← フロントエンド（Vite + React + TypeScript）
+│   ├── src/
+│   │   ├── components/
+│   │   ├── pages/
+│   │   └── main.tsx
+│   ├── index.html
+│   ├── vite.config.ts
+│   ├── tsconfig.json
+│   └── package.json
 ├── tasks/
-│   ├── ledger.md                 ← タスク台帳（未着手・進行中）
-│   └── archive/                  ← 完了タスク
-├── config.yaml
-└── go.mod
+│   ├── ledger.md                  ← タスク台帳（未着手・進行中）
+│   └── archive/                   ← 完了タスク
+└── config.yaml
 ```
 
 ---
@@ -50,10 +59,11 @@ ccx-t2/
 ### 実装内容
 
 **`internal/ledger/parser.go`**
-- `---` 行を検出したとき、次の行が `id:` で始まる場合のみ front matter 開始とみなし、そうでなければ body 内の水平線として読み飛ばす
+- パーサーは「body 状態」と「front matter 状態」の2ステートで動作する
+- body 状態では、`---` 行を検出したとき次の行が `id:` で始まる場合のみ front matter 開始（front matter 状態へ遷移）とみなし、そうでなければ body 内の水平線として読み飛ばす
+- front matter 状態では、`---` 行を検出したとき次の行の内容に関わらず front matter ブロックの終了（body 状態へ遷移）とみなす
 - front matter + body のペアをスライスで返す
 - front matter は YAML としてパース（`gopkg.in/yaml.v3`）
-- この先読みにより body 内の `---` 水平線と front matter 区切りを明確に区別する
 
 **`internal/ledger/ledger.go`**
 - `Load() ([]Task, error)` — ファイル読み込み・パース
@@ -134,7 +144,10 @@ Worker からのイベントを直列に処理し、Orchestrator を適切なタ
 **`internal/event/queue.go`**
 - Worker notify イベントを受け取る FIFO キュー（バッファ付き `chan Event`）
 - goroutine で1件ずつ処理（直列）
-- 処理後に Orchestrator.Trigger を呼ぶ
+- イベント種別に応じて台帳を更新してから Orchestrator.Trigger を呼ぶ
+  - `completed`：status を `completed` に設定し payload の `pr_url` を台帳に書き込む（`merge_commit` はアーカイブファイルに記録するため台帳には書かない）
+  - `blocked`：status を `blocked` に設定し、payload の `reason` を台帳に書き込む
+  - `split_request`：元タスクの status を `split` に設定し、payload の `proposed_slices` を `unstarted` 子タスクとして台帳に追加する
 
 **`internal/orchestrator/orchestrator.go`**
 - `Trigger(ctx context.Context, reason string) error`
@@ -157,7 +170,7 @@ Worker からのイベントを直列に処理し、Orchestrator を適切なタ
 
 ### 実装内容
 
-**`internal/web/server.go`**
+**`server/internal/web/server.go`**
 - REST API
   - `GET /api/tasks` — 台帳一覧
   - `POST /api/tasks` — タスク追加（Orchestrator にトリガー）
@@ -167,17 +180,20 @@ Worker からのイベントを直列に処理し、Orchestrator を適切なタ
   - `GET /api/harnesses` — ハーネス一覧
   - `GET /api/config` — 設定取得（GitHub トークン等のシークレットは返さない）
   - `PATCH /api/config` — 設定更新
+- 本番ビルド時は `web/dist/` をビルド済み静的ファイルとして配信
 
-**`internal/web/ws.go`**
+**`server/internal/web/ws.go`**
 - `GET /ws/worker/:window` — tmux pipe-pane をブリッジして Worker ログをストリーミング
 - `GET /ws/ledger` — 台帳の変更（MCP ツール実行・REST 書き込みの後）を push 通知
 
-**`internal/web/static/`**
-- `//go:embed static` でバイナリに同梱する
-- タスク台帳ビュー（一覧・編集・削除）
-- タスク追加フォーム（自然言語入力 → Orchestrator 経由）
-- Worker ダッシュボード（ログストリーミング）
-- 設定画面
+**`web/` （Vite + React + TypeScript）**
+- 開発時は Vite dev server（デフォルト `localhost:5173`）を起動し、`/api` と `/ws` を Go サーバー（デフォルト `localhost:8080`）にプロキシする
+- 本番ビルド（`vite build`）の出力 `web/dist/` を Go サーバーが配信する
+- 画面構成
+  - タスク台帳ビュー（一覧・編集・削除）
+  - タスク追加フォーム（自然言語入力 → Orchestrator 経由）
+  - Worker ダッシュボード（ログストリーミング）
+  - 設定画面
 
 ---
 
