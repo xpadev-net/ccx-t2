@@ -66,8 +66,9 @@ func IsWindowAlive(session, window string) (bool, error) {
 	return false, nil
 }
 
-// IsPaneIdle reports whether the pane's foreground process is a shell (bash,
-// zsh, sh, or fish), indicating that the harness process has exited.
+// IsPaneIdle reports whether the pane's foreground process is a shell
+// (bash, zsh, sh, fish, dash, ksh, tcsh, or nu), indicating that the
+// harness process has exited.
 func IsPaneIdle(session, window string) (bool, error) {
 	target := session + ":" + window
 	out, err := output("tmux", "display-message", "-t", target, "-p", "#{pane_current_command}")

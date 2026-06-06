@@ -4,12 +4,17 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 )
 
 // Create creates a new git worktree at worktreePath branching from baseRef.
-// repoPath is the main repository root. Fails if worktreePath already exists.
+// worktreePath must be absolute so that both os.Stat and git resolve it
+// consistently regardless of the process working directory.
 func Create(repoPath, branch, worktreePath, baseRef string) error {
+	if !filepath.IsAbs(worktreePath) {
+		return fmt.Errorf("worktreePath must be absolute, got: %s", worktreePath)
+	}
 	if _, err := os.Stat(worktreePath); err == nil {
 		return fmt.Errorf("worktree path already exists: %s", worktreePath)
 	} else if !os.IsNotExist(err) {
