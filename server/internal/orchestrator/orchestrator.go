@@ -603,15 +603,6 @@ func buildMCPTokens(template, mcpURL, secret string) ([]string, error) {
 	return tokens, nil
 }
 
-func buildHarnessCommand(command string, mcpTokens []string) string {
-	parts := make([]string, 0, 1+len(mcpTokens))
-	parts = append(parts, shellQuoteArg(command))
-	for _, tok := range mcpTokens {
-		parts = append(parts, shellQuoteArg(tok))
-	}
-	return strings.Join(parts, " ")
-}
-
 func buildHarnessCommandWithSecretEnv(command string, mcpTokens []string) string {
 	parts := make([]string, 0, 1+len(mcpTokens))
 	parts = append(parts, shellQuoteArg(command))
