@@ -217,10 +217,6 @@ func runCtx(ctx context.Context, name string, args ...string) error {
 	return nil
 }
 
-func output(name string, args ...string) (string, error) {
-	return outputCtx(context.Background(), name, args...)
-}
-
 func outputCtx(ctx context.Context, name string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
 	out, err := cmd.Output()
