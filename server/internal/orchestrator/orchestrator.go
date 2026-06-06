@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"time"
@@ -53,22 +54,30 @@ type Orchestrator struct {
 	baseURL      string
 	tmux         tmuxClient
 	pollInterval time.Duration
+	done         chan struct{}
+	closeOnce    sync.Once
+	cond         *sync.Cond
 
 	mu       sync.Mutex
 	queued   []string
 	draining bool
+	closed   bool
+	starting bool
 }
 
 // New creates an Orchestrator triggerer.
 func New(l *ledger.Ledger, cfg *config.Config, session, baseURL string) *Orchestrator {
-	return &Orchestrator{
+	o := &Orchestrator{
 		ledger:       l,
 		cfg:          cfg,
-		session:      session,
-		baseURL:      strings.TrimRight(baseURL, "/"),
+		session:      strings.TrimSpace(session),
+		baseURL:      strings.TrimRight(strings.TrimSpace(baseURL), "/"),
 		tmux:         realTmux{},
 		pollInterval: time.Second,
+		done:         make(chan struct{}),
 	}
+	o.cond = sync.NewCond(&o.mu)
+	return o
 }
 
 // Trigger queues an orchestrator run. If the orchestrator window is idle or
@@ -83,6 +92,10 @@ func (o *Orchestrator) Trigger(ctx context.Context, reason string) error {
 	}
 	reason = strings.TrimSpace(reason)
 	o.mu.Lock()
+	if o.closed {
+		o.mu.Unlock()
+		return fmt.Errorf("orchestrator is closed")
+	}
 	queuedIndex := len(o.queued)
 	o.queued = append(o.queued, reason)
 	if o.draining {
@@ -107,13 +120,54 @@ func (o *Orchestrator) Trigger(ctx context.Context, reason string) error {
 	return nil
 }
 
+// Close stops the background drain loop. It does not kill the tmux window.
+func (o *Orchestrator) Close() {
+	if o == nil || o.done == nil {
+		return
+	}
+	o.closeOnce.Do(func() {
+		o.mu.Lock()
+		o.closed = true
+		for o.starting {
+			o.cond.Wait()
+		}
+		o.mu.Unlock()
+		close(o.done)
+	})
+}
+
 func (o *Orchestrator) drain() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		select {
+		case <-o.done:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
 	ticker := time.NewTicker(o.pollInterval)
 	defer ticker.Stop()
-	for range ticker.C {
-		startedOrBusy, err := o.tryStartNext(context.Background())
+	for {
+		select {
+		case <-o.done:
+			o.mu.Lock()
+			o.draining = false
+			o.mu.Unlock()
+			return
+		case <-ticker.C:
+		}
+		startedOrBusy, err := o.tryStartNext(ctx)
 		if err != nil {
+			if ctx.Err() != nil {
+				o.mu.Lock()
+				o.draining = false
+				o.mu.Unlock()
+				return
+			}
 			// Keep the request queued and retry on the next tick.
+			log.Printf("warn: orchestrator trigger drain retrying after error: %v", err)
 			continue
 		}
 		if startedOrBusy {
@@ -134,6 +188,10 @@ func (o *Orchestrator) tryStartNext(ctx context.Context) (bool, error) {
 		return false, err
 	}
 	o.mu.Lock()
+	if o.closed {
+		o.mu.Unlock()
+		return false, context.Canceled
+	}
 	if len(o.queued) == 0 {
 		o.mu.Unlock()
 		return false, nil
@@ -148,9 +206,19 @@ func (o *Orchestrator) tryStartNext(ctx context.Context) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
+	o.mu.Lock()
+	closed := o.closed
+	o.mu.Unlock()
+	if closed {
+		return false, context.Canceled
+	}
 	if active {
 		return true, nil
 	}
+	if err := o.claimStart(); err != nil {
+		return false, err
+	}
+	defer o.releaseStart()
 	started, err := o.start(ctx, reason)
 	if err != nil {
 		return false, err
@@ -164,6 +232,23 @@ func (o *Orchestrator) tryStartNext(ctx context.Context) (bool, error) {
 	}
 	o.mu.Unlock()
 	return true, nil
+}
+
+func (o *Orchestrator) claimStart() error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.closed {
+		return context.Canceled
+	}
+	o.starting = true
+	return nil
+}
+
+func (o *Orchestrator) releaseStart() {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.starting = false
+	o.cond.Broadcast()
 }
 
 func (o *Orchestrator) removeQueuedAtLocked(index int, reason string) {

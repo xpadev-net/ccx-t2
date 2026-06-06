@@ -108,13 +108,17 @@ func TestTriggerStartsOrchestratorWithSnapshotAndMCPArgs(t *testing.T) {
 		t.Fatalf("Trigger: %v", err)
 	}
 
-	if got := fake.creates; got != 1 {
+	creates, commands, _ := fake.counts()
+	if got := creates; got != 1 {
 		t.Fatalf("creates = %d, want 1", got)
 	}
-	if len(fake.commands) != 1 {
-		t.Fatalf("commands = %#v, want one command", fake.commands)
+	if commands != 1 {
+		t.Fatalf("commands count = %d, want 1", commands)
 	}
-	args, err := shellquote.Split(fake.commands[0])
+	fake.mu.Lock()
+	command := fake.commands[0]
+	fake.mu.Unlock()
+	args, err := shellquote.Split(command)
 	if err != nil {
 		t.Fatalf("command shell syntax: %v", err)
 	}
@@ -122,17 +126,21 @@ func TestTriggerStartsOrchestratorWithSnapshotAndMCPArgs(t *testing.T) {
 	if !reflect.DeepEqual(args, wantArgs) {
 		t.Fatalf("command args = %#v, want %#v", args, wantArgs)
 	}
-	if len(fake.prompts) != 1 {
-		t.Fatalf("prompts = %#v, want one prompt", fake.prompts)
+	_, _, prompts := fake.counts()
+	if prompts != 1 {
+		t.Fatalf("prompts count = %d, want 1", prompts)
 	}
+	fake.mu.Lock()
+	prompt := fake.prompts[0]
+	fake.mu.Unlock()
 	for _, want := range []string{
 		"Trigger reason: heartbeat",
 		`"id": "task-001"`,
 		`"title": "Task"`,
 		`"name": "worker"`,
 	} {
-		if !strings.Contains(fake.prompts[0], want) {
-			t.Fatalf("prompt does not contain %q:\n%s", want, fake.prompts[0])
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt does not contain %q:\n%s", want, prompt)
 		}
 	}
 }
@@ -208,10 +216,7 @@ func TestTriggerCanceledContextDoesNotQueueWhenActive(t *testing.T) {
 		t.Fatalf("queued = %#v, want empty", queued)
 	}
 	fake.setIdle(true)
-	creates, commands, prompts := fake.counts()
-	if creates != 0 || commands != 0 || prompts != 0 {
-		t.Fatalf("canceled active trigger drained later: creates=%d commands=%d prompts=%d", creates, commands, prompts)
-	}
+	assertNoTmuxActivity(t, fake, 100*time.Millisecond)
 }
 
 func TestTriggerMidCallCancellationDoesNotQueue(t *testing.T) {
@@ -235,10 +240,7 @@ func TestTriggerMidCallCancellationDoesNotQueue(t *testing.T) {
 		t.Fatalf("queued = %#v, want empty", queued)
 	}
 	fake.setIdle(true)
-	creates, commands, prompts := fake.counts()
-	if creates != 0 || commands != 0 || prompts != 0 {
-		t.Fatalf("mid-call canceled trigger drained later: creates=%d commands=%d prompts=%d", creates, commands, prompts)
-	}
+	assertNoTmuxActivity(t, fake, 100*time.Millisecond)
 }
 
 func TestTriggerMidCallCancellationKeepsOlderQueuedWork(t *testing.T) {
@@ -367,6 +369,115 @@ func TestDrainRetriesAfterStartError(t *testing.T) {
 	}
 }
 
+func TestCloseStopsDrainLoop(t *testing.T) {
+	l, cfg := newTestDeps(t)
+	fake := &fakeTmux{alive: true, idle: false}
+	o := New(l, cfg, "proj", "http://localhost:8080")
+	o.tmux = fake
+	o.pollInterval = time.Millisecond
+
+	if err := o.Trigger(context.Background(), "queued"); err != nil {
+		t.Fatalf("Trigger queued behind active window: %v", err)
+	}
+	o.Close()
+	fake.setIdle(true)
+	assertNoTmuxActivity(t, fake, 100*time.Millisecond)
+	if queued := queuedSnapshot(o); !reflect.DeepEqual(queued, []string{"queued"}) {
+		t.Fatalf("queued = %#v, want queued work preserved after close", queued)
+	}
+}
+
+func TestTriggerAfterCloseFails(t *testing.T) {
+	l, cfg := newTestDeps(t)
+	o := New(l, cfg, "proj", "http://localhost:8080")
+	o.tmux = &fakeTmux{}
+	o.Close()
+
+	if err := o.Trigger(context.Background(), "after close"); err == nil {
+		t.Fatal("Trigger after Close error = nil, want error")
+	}
+}
+
+func TestCloseWaitsForInFlightDirectStart(t *testing.T) {
+	l, cfg := newTestDeps(t)
+	insideCreate := make(chan struct{})
+	releaseCreate := make(chan struct{})
+	fake := &blockingCreateTmux{
+		fakeTmux:      fakeTmux{},
+		insideCreate:  insideCreate,
+		releaseCreate: releaseCreate,
+	}
+	o := New(l, cfg, "proj", "http://localhost:8080")
+	o.tmux = fake
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- o.Trigger(context.Background(), "direct")
+	}()
+	<-insideCreate
+	closed := make(chan struct{})
+	go func() {
+		o.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+		t.Fatal("Close returned while direct start was in flight")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(releaseCreate)
+	if err := <-errCh; err != nil {
+		t.Fatalf("Trigger direct: %v", err)
+	}
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("Close did not return after direct start finished")
+	}
+}
+
+func TestCloseStopsInFlightDrainBeforeStart(t *testing.T) {
+	l, cfg := newTestDeps(t)
+	insideAlive := make(chan struct{})
+	releaseAlive := make(chan struct{})
+	fake := &fakeTmux{
+		alive: true,
+		idle:  false,
+	}
+	o := New(l, cfg, "proj", "http://localhost:8080")
+	o.tmux = fake
+	o.pollInterval = time.Millisecond
+
+	if err := o.Trigger(context.Background(), "queued"); err != nil {
+		t.Fatalf("Trigger queued behind active window: %v", err)
+	}
+	fake.mu.Lock()
+	fake.onAlive = func() {
+		close(insideAlive)
+		<-releaseAlive
+	}
+	fake.mu.Unlock()
+	fake.setIdle(true)
+	<-insideAlive
+	o.Close()
+	close(releaseAlive)
+	assertNoTmuxActivity(t, fake, 100*time.Millisecond)
+	if queued := queuedSnapshot(o); !reflect.DeepEqual(queued, []string{"queued"}) {
+		t.Fatalf("queued = %#v, want queued work preserved after close", queued)
+	}
+}
+
+func TestNewTrimsSessionAndBaseURL(t *testing.T) {
+	l, cfg := newTestDeps(t)
+	o := New(l, cfg, " proj ", " http://localhost:8080/ ")
+	if o.session != "proj" {
+		t.Fatalf("session = %q, want trimmed", o.session)
+	}
+	if o.baseURL != "http://localhost:8080" {
+		t.Fatalf("baseURL = %q, want trimmed without trailing slash", o.baseURL)
+	}
+}
+
 var errCreateWindow = errors.New("create window failed")
 
 type flakyTmux struct {
@@ -386,10 +497,43 @@ func (f *flakyTmux) CreateWindow(session, name, startDir string) error {
 	return f.fakeTmux.CreateWindow(session, name, startDir)
 }
 
+type blockingCreateTmux struct {
+	fakeTmux
+	insideCreate  chan struct{}
+	releaseCreate chan struct{}
+	once          sync.Once
+}
+
+func (b *blockingCreateTmux) CreateWindow(session, name, startDir string) error {
+	b.once.Do(func() {
+		close(b.insideCreate)
+		<-b.releaseCreate
+	})
+	return b.fakeTmux.CreateWindow(session, name, startDir)
+}
+
 func queuedSnapshot(o *Orchestrator) []string {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	return append([]string(nil), o.queued...)
+}
+
+func assertNoTmuxActivity(t *testing.T, fake *fakeTmux, window time.Duration) {
+	t.Helper()
+	deadline := time.After(window)
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		creates, commands, prompts := fake.counts()
+		if creates != 0 || commands != 0 || prompts != 0 {
+			t.Fatalf("unexpected tmux activity: creates=%d commands=%d prompts=%d", creates, commands, prompts)
+		}
+		select {
+		case <-deadline:
+			return
+		case <-ticker.C:
+		}
+	}
 }
 
 func TestBuildMCPTokensRejectsInvalidTemplateShellSyntax(t *testing.T) {
