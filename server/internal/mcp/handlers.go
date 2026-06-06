@@ -415,8 +415,12 @@ func handleArchiveTask(deps *Deps) ToolHandler {
 			}
 		}
 		if t == nil {
-			if deps.Ledger.IsArchived(id) {
-				cleanupArchivedTaskResources(deps, id, "")
+			archivedTask, archived, err := deps.Ledger.ArchivedTask(id)
+			if err != nil {
+				return nil, err
+			}
+			if archived {
+				cleanupArchivedTaskResources(deps, id, archivedTask.Branch)
 				return map[string]any{"archived": id}, nil
 			}
 			return nil, fmt.Errorf("task not found: %s", id)

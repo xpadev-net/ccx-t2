@@ -355,6 +355,29 @@ func TestArchiveAlreadyArchivedTaskIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestArchivedTaskReturnsArchivedMetadata(t *testing.T) {
+	dir := t.TempDir()
+	archiveDir := filepath.Join(dir, "archive")
+	l := NewLedger(filepath.Join(dir, "ledger.md"), archiveDir)
+
+	if err := l.Add(Task{ID: "task-001", Title: "Do thing", Status: "completed", Branch: "feature/done"}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if err := l.Archive("task-001", "abc123"); err != nil {
+		t.Fatalf("Archive: %v", err)
+	}
+	task, ok, err := l.ArchivedTask("task-001")
+	if err != nil {
+		t.Fatalf("ArchivedTask: %v", err)
+	}
+	if !ok {
+		t.Fatal("ArchivedTask ok = false, want true")
+	}
+	if task.Branch != "feature/done" {
+		t.Fatalf("ArchivedTask branch = %q, want feature/done", task.Branch)
+	}
+}
+
 func TestArchiveAlreadyArchivedRequiresExactID(t *testing.T) {
 	dir := t.TempDir()
 	archiveDir := filepath.Join(dir, "archive")
@@ -369,10 +392,18 @@ func TestArchiveAlreadyArchivedRequiresExactID(t *testing.T) {
 	if err := l.Archive("task-20260607", ""); err == nil {
 		t.Fatal("Archive partial archived ID error = nil, want task not found")
 	}
-	if l.IsArchived("task-20260607") {
+	archived, err := l.IsArchived("task-20260607")
+	if err != nil {
+		t.Fatalf("IsArchived(partial ID): %v", err)
+	}
+	if archived {
 		t.Fatal("IsArchived(partial ID) = true, want false")
 	}
-	if !l.IsArchived("task-20260607-0001") {
+	archived, err = l.IsArchived("task-20260607-0001")
+	if err != nil {
+		t.Fatalf("IsArchived(exact ID): %v", err)
+	}
+	if !archived {
 		t.Fatal("IsArchived(exact ID) = false, want true")
 	}
 }

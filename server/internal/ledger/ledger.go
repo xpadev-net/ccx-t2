@@ -549,7 +549,12 @@ func (l *Ledger) Archive(id, mergeCommit string) error {
 		}
 	}
 	if idx == -1 {
-		if l.archiveContainsID(id) {
+		archived, err := l.archiveContainsID(id)
+		if err != nil {
+			l.mu.Unlock()
+			return err
+		}
+		if archived {
 			l.mu.Unlock()
 			return nil
 		}
@@ -639,10 +644,17 @@ func (l *Ledger) Archive(id, mergeCommit string) error {
 }
 
 // IsArchived reports whether an archive file for id already exists.
-func (l *Ledger) IsArchived(id string) bool {
+func (l *Ledger) IsArchived(id string) (bool, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.archiveContainsID(id)
+}
+
+// ArchivedTask returns the archived task metadata for id if it exists.
+func (l *Ledger) ArchivedTask(id string) (Task, bool, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.archivedTask(id)
 }
 
 // GenerateID generates a unique task ID in the format task-{YYYYMMDD}-{4-digit seq}.
@@ -676,7 +688,11 @@ func (l *Ledger) generateIDs(n int) ([]string, error) {
 	for _, t := range tasks {
 		existing[t.ID] = true
 	}
-	for id := range l.archiveIDs() {
+	archiveIDs, err := l.archiveIDs()
+	if err != nil {
+		return nil, err
+	}
+	for id := range archiveIDs {
 		existing[id] = true
 	}
 
@@ -708,7 +724,11 @@ func (l *Ledger) generateIDFromTasks(tasks []Task) (string, error) {
 	for _, t := range tasks {
 		existing[t.ID] = true
 	}
-	for id := range l.archiveIDs() {
+	archiveIDs, err := l.archiveIDs()
+	if err != nil {
+		return "", err
+	}
+	for id := range archiveIDs {
 		existing[id] = true
 	}
 
@@ -722,22 +742,57 @@ func (l *Ledger) generateIDFromTasks(tasks []Task) (string, error) {
 	return "", fmt.Errorf("could not generate unique task ID for date %s", date)
 }
 
-func (l *Ledger) archiveContainsID(id string) bool {
-	return l.archiveIDs()[id]
+func (l *Ledger) archiveContainsID(id string) (bool, error) {
+	ids, err := l.archiveIDs()
+	if err != nil {
+		return false, err
+	}
+	return ids[id], nil
 }
 
-func (l *Ledger) archiveIDs() map[string]bool {
+func (l *Ledger) archiveIDs() (map[string]bool, error) {
 	ids := make(map[string]bool)
 	entries, err := os.ReadDir(l.archiveDir)
 	if err != nil {
-		return ids
+		if os.IsNotExist(err) {
+			return ids, nil
+		}
+		return nil, fmt.Errorf("read archive directory: %w", err)
 	}
 	for _, e := range entries {
 		if id, ok := archiveIDFromFilename(e.Name()); ok {
 			ids[id] = true
 		}
 	}
-	return ids
+	return ids, nil
+}
+
+func (l *Ledger) archivedTask(id string) (Task, bool, error) {
+	entries, err := os.ReadDir(l.archiveDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return Task{}, false, nil
+		}
+		return Task{}, false, fmt.Errorf("read archive directory: %w", err)
+	}
+	for _, e := range entries {
+		if archiveID, ok := archiveIDFromFilename(e.Name()); !ok || archiveID != id {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(l.archiveDir, e.Name()))
+		if err != nil {
+			return Task{}, false, fmt.Errorf("read archive task %s: %w", id, err)
+		}
+		tasks, err := parseContent(string(data))
+		if err != nil {
+			return Task{}, false, fmt.Errorf("parse archive task %s: %w", id, err)
+		}
+		if len(tasks) == 0 {
+			return Task{}, false, fmt.Errorf("archive task %s has no task content", id)
+		}
+		return tasks[0], true, nil
+	}
+	return Task{}, false, nil
 }
 
 func archiveIDFromFilename(name string) (string, bool) {

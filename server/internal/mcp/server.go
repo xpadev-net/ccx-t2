@@ -103,7 +103,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		})
 
 	case "notifications/initialized":
-		w.WriteHeader(http.StatusNoContent)
+		if req.ID != nil {
+			writeResult(w, req.ID, map[string]any{})
+			return
+		}
+		writeJSON(w, map[string]any{})
 
 	case "tools/list":
 		writeResult(w, req.ID, map[string]any{"tools": s.toolDefs})
@@ -151,8 +155,7 @@ func (s *Server) handleToolCall(ctx context.Context, w http.ResponseWriter, req 
 }
 
 func writeResult(w http.ResponseWriter, id any, result any) {
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{
+	writeJSON(w, map[string]any{
 		"jsonrpc": "2.0",
 		"id":      id,
 		"result":  result,
@@ -160,12 +163,16 @@ func writeResult(w http.ResponseWriter, id any, result any) {
 }
 
 func writeError(w http.ResponseWriter, id any, code int, message string) {
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{
+	writeJSON(w, map[string]any{
 		"jsonrpc": "2.0",
 		"id":      id,
 		"error":   map[string]any{"code": code, "message": message},
 	})
+}
+
+func writeJSON(w http.ResponseWriter, value any) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(value)
 }
 
 // stringArg extracts a required string argument.

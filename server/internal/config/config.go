@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"regexp"
@@ -93,7 +94,11 @@ func expandEnv(cfg *Config) {
 	expand := func(s string) string {
 		return reEnvVar.ReplaceAllStringFunc(s, func(match string) string {
 			key := match[2 : len(match)-1] // strip ${ and }
-			return os.Getenv(key)
+			val := os.Getenv(key)
+			if val == "" {
+				log.Printf("warn: environment variable %s referenced in config expands to empty string", key)
+			}
+			return val
 		})
 	}
 
