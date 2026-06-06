@@ -511,7 +511,15 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 				if !ok || exitErr.ExitCode() != 128 {
 					return nil, fmt.Errorf("check branch existence: %w", gitErr)
 				}
-				// Exit 128 = ref not found; branch is available.
+				// Exit 128 covers both "ref not found" and other fatal git errors.
+				// Distinguish via Stderr: "not a git repository" is a real error,
+				// "Needed a single revision" or similar means the ref just doesn't exist.
+				stderr := strings.ToLower(string(exitErr.Stderr))
+				if strings.Contains(stderr, "not a git repository") ||
+					strings.Contains(stderr, "not a git repo") {
+					return nil, fmt.Errorf("check branch existence: %w", gitErr)
+				}
+				// Otherwise, ref not found — branch name is available.
 			} else if strings.TrimSpace(string(out)) != "" {
 				// Exit 0 with output = branch already exists.
 				return nil, fmt.Errorf("branch %q already exists", branch)
@@ -861,9 +869,6 @@ func handleNotify(deps *Deps) ToolHandler {
 					title: childTitle, desc: childDesc,
 					allowed: childAllowed, forbidden: childForbidden,
 				})
-			}
-			if len(pendingSRs) == 0 {
-				return nil, fmt.Errorf("proposed_slices produced no valid child tasks")
 			}
 			// Generate all IDs in one read pass (loop GenerateID returns duplicates
 			// since IDs are not on-disk yet).
