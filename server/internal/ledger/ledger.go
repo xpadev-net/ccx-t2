@@ -269,6 +269,113 @@ func (l *Ledger) DeleteTasks(ids []string) error {
 	return err
 }
 
+// UpdateIfStatus modifies task fields only when the task's current status
+// matches expectedStatus. Returns an error if the status has changed (e.g.,
+// due to a concurrent split_task or stop_worker call). Use this for transitions
+// that require the task to still be in a specific state, such as spawn_worker
+// moving a task from "unstarted" to "in_progress".
+func (l *Ledger) UpdateIfStatus(id, expectedStatus string, fields map[string]any) error {
+	return l.updateWithCheck(id, expectedStatus, fields)
+}
+
+func (l *Ledger) updateWithCheck(id, expectedStatus string, fields map[string]any) error {
+	l.mu.Lock()
+	tasks, err := l.load()
+	if err != nil {
+		l.mu.Unlock()
+		return err
+	}
+	found := false
+	for i := range tasks {
+		if tasks[i].ID != id {
+			continue
+		}
+		if tasks[i].Status != expectedStatus {
+			l.mu.Unlock()
+			return fmt.Errorf("task %s status is %q, expected %q (concurrent modification?)",
+				id, tasks[i].Status, expectedStatus)
+		}
+		found = true
+		t := &tasks[i]
+		if err := applyFields(t, fields); err != nil {
+			l.mu.Unlock()
+			return err
+		}
+		t.UpdatedAt = time.Now().Format(time.RFC3339)
+		break
+	}
+	if !found {
+		l.mu.Unlock()
+		return fmt.Errorf("task not found: %s", id)
+	}
+	err = l.save(tasks)
+	onChange := l.onChange
+	l.mu.Unlock()
+	if err == nil && onChange != nil {
+		onChange()
+	}
+	return err
+}
+
+// applyFields updates task fields from the given map (same semantics as Update).
+func applyFields(t *Task, fields map[string]any) error {
+	for k, v := range fields {
+		switch k {
+		case "title":
+			if s, ok := v.(string); ok {
+				t.Title = s
+			}
+		case "status":
+			if s, ok := v.(string); ok {
+				t.Status = s
+			}
+		case "branch":
+			if s, ok := v.(string); ok {
+				t.Branch = s
+			}
+		case "worker_id":
+			if s, ok := v.(string); ok {
+				t.WorkerID = s
+			}
+		case "harness":
+			if s, ok := v.(string); ok {
+				t.Harness = s
+			}
+		case "allowed_files":
+			switch val := v.(type) {
+			case []string:
+				t.AllowedFiles = val
+			case nil:
+				t.AllowedFiles = nil
+			}
+		case "forbidden_files":
+			switch val := v.(type) {
+			case []string:
+				t.ForbiddenFiles = val
+			case nil:
+				t.ForbiddenFiles = nil
+			}
+		case "pr_url":
+			if s, ok := v.(string); ok {
+				t.PrURL = s
+			}
+		case "merge_commit":
+			if s, ok := v.(string); ok {
+				t.MergeCommit = s
+			}
+		case "reason":
+			if s, ok := v.(string); ok {
+				t.Reason = s
+			}
+		case "body":
+			if s, ok := v.(string); ok {
+				t.Body = s
+			}
+		}
+	}
+	return nil
+}
+
 // Update modifies fields of an existing task by ID, updating updated_at.
 func (l *Ledger) Update(id string, fields map[string]any) error {
 	l.mu.Lock()
@@ -286,59 +393,9 @@ func (l *Ledger) Update(id string, fields map[string]any) error {
 		}
 		found = true
 		t := &tasks[i]
-		for k, v := range fields {
-			switch k {
-			case "title":
-				if s, ok := v.(string); ok {
-					t.Title = s
-				}
-			case "status":
-				if s, ok := v.(string); ok {
-					t.Status = s
-				}
-			case "branch":
-				if s, ok := v.(string); ok {
-					t.Branch = s
-				}
-			case "worker_id":
-				if s, ok := v.(string); ok {
-					t.WorkerID = s
-				}
-			case "harness":
-				if s, ok := v.(string); ok {
-					t.Harness = s
-				}
-			case "allowed_files":
-				switch val := v.(type) {
-				case []string:
-					t.AllowedFiles = val
-				case nil:
-					t.AllowedFiles = nil
-				}
-			case "forbidden_files":
-				switch val := v.(type) {
-				case []string:
-					t.ForbiddenFiles = val
-				case nil:
-					t.ForbiddenFiles = nil
-				}
-			case "pr_url":
-				if s, ok := v.(string); ok {
-					t.PrURL = s
-				}
-			case "merge_commit":
-				if s, ok := v.(string); ok {
-					t.MergeCommit = s
-				}
-			case "reason":
-				if s, ok := v.(string); ok {
-					t.Reason = s
-				}
-			case "body":
-				if s, ok := v.(string); ok {
-					t.Body = s
-				}
-			}
+		if err := applyFields(t, fields); err != nil {
+			l.mu.Unlock()
+			return err
 		}
 		t.UpdatedAt = time.Now().Format(time.RFC3339)
 		break

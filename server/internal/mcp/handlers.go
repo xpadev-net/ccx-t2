@@ -552,8 +552,10 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 			return nil, fmt.Errorf("create tmux window: %w", err)
 		}
 
-		// Step 3: Update ledger.
-		updateErr := deps.Ledger.Update(taskID, map[string]any{
+		// Step 3: Update ledger — use UpdateIfStatus to reject concurrent
+		// modifications (e.g., a split_task that changed the status to "split"
+		// between our preflight check and this write).
+		updateErr := deps.Ledger.UpdateIfStatus(taskID, "unstarted", map[string]any{
 			"status":          "in_progress",
 			"branch":          branch,
 			"worker_id":       workerID,
