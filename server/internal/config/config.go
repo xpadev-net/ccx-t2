@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 	"time"
 
@@ -76,14 +77,21 @@ func Load(path string) (*Config, error) {
 	return &cfg, nil
 }
 
+// reEnvVar matches ${VAR} placeholders only (not bare $VAR).
+// Restricting to the braced form prevents accidental expansion of shell
+// special variables like $@, $1, $2 that may appear in validation_command.
+var reEnvVar = regexp.MustCompile(`\$\{([^}]+)\}`)
+
 // expandEnv replaces ${VAR} patterns with environment variable values.
+// Bare $VAR patterns (e.g. $@, $1) are left untouched.
 // Unknown variable names expand to an empty string (os.Getenv behaviour).
 // Callers that configure optional security fields (e.g. mcp_secret) via env
 // vars should ensure the referenced variable is actually set; an undefined
 // variable will silently disable the associated protection.
 func expandEnv(cfg *Config) {
 	expand := func(s string) string {
-		return os.Expand(s, func(key string) string {
+		return reEnvVar.ReplaceAllStringFunc(s, func(match string) string {
+			key := match[2 : len(match)-1] // strip ${ and }
 			return os.Getenv(key)
 		})
 	}
