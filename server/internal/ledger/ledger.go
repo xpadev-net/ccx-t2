@@ -172,10 +172,12 @@ func (l *Ledger) AddAll(newTasks []Task) error {
 		return err
 	}
 	now := time.Now().Format(time.RFC3339)
-	for i := range newTasks {
-		newTasks[i].UpdatedAt = now
+	stamped := make([]Task, len(newTasks))
+	for i, t := range newTasks {
+		t.UpdatedAt = now
+		stamped[i] = t
 	}
-	tasks = append(tasks, newTasks...)
+	tasks = append(tasks, stamped...)
 	err = l.save(tasks)
 	onChange := l.onChange
 	l.mu.Unlock()

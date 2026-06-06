@@ -317,13 +317,9 @@ func handleSplitTask(deps *Deps) ToolHandler {
 			})
 		}
 
-		// If in_progress or blocked, clean up the worker first.
-		if original.Status == "in_progress" || original.Status == "blocked" {
-			stopWorkerCleanup(deps, original.WorkerID, original.Branch, id)
-		}
-
-		// Atomically add all children in one write — prevents partial orphans
-		// if a failure occurs mid-way through adding individual children.
+		// Atomically add all children first — if AddAll fails, the parent's
+		// status is unchanged and the worker (if any) is still running, so
+		// the caller can retry split_task without manual recovery.
 		childTasks := make([]ledger.Task, len(children))
 		childIDs := make([]string, len(children))
 		for i, c := range children {
@@ -341,7 +337,7 @@ func handleSplitTask(deps *Deps) ToolHandler {
 			return nil, err
 		}
 
-		// Update parent to split only after all children are written.
+		// Update parent to split only after all children are safely written.
 		if err := deps.Ledger.Update(id, map[string]any{
 			"status":    "split",
 			"reason":    reason,
@@ -350,6 +346,11 @@ func handleSplitTask(deps *Deps) ToolHandler {
 			"harness":   "",
 		}); err != nil {
 			return nil, err
+		}
+
+		// Clean up worker resources best-effort (parent already committed as split).
+		if original.Status == "in_progress" || original.Status == "blocked" {
+			stopWorkerCleanup(deps, original.WorkerID, original.Branch, id)
 		}
 
 		return map[string]any{"child_ids": childIDs}, nil
@@ -458,7 +459,7 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 
 		// Validate mcp_args shell syntax before any state mutation.
 		workerMCPURL := deps.BaseURL + "/mcp/worker"
-		mcpArgsStr := replaceMcpURL(hCfg.McpArgs, workerMCPURL)
+		mcpArgsStr := replaceMcpURL(hCfg.McpArgs, workerMCPURL, deps.Config.Server.McpSecret)
 		if _, err := shellquote.Split(mcpArgsStr); err != nil {
 			return nil, fmt.Errorf("invalid mcp_args shell syntax: %w", err)
 		}

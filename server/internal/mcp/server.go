@@ -4,6 +4,7 @@ package mcp
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -70,7 +71,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if s.secret != "" {
 		auth := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if auth != s.secret {
+		if subtle.ConstantTimeCompare([]byte(auth), []byte(s.secret)) != 1 {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
@@ -260,7 +261,11 @@ func arrayProp(itemType, description string) map[string]any {
 	}
 }
 
-// replaceMcpURL replaces {url} in mcp_args with the actual endpoint URL.
-func replaceMcpURL(mcpArgs, url string) string {
-	return strings.ReplaceAll(mcpArgs, "{url}", url)
+// replaceMcpURL replaces {url} and {secret} in mcp_args.
+// {url} is replaced with the MCP endpoint URL.
+// {secret} is replaced with the optional shared secret (empty if not configured).
+func replaceMcpURL(mcpArgs, url, secret string) string {
+	s := strings.ReplaceAll(mcpArgs, "{url}", url)
+	s = strings.ReplaceAll(s, "{secret}", secret)
+	return s
 }
