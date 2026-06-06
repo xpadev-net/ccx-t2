@@ -176,6 +176,9 @@ func handleCreateTask(deps *Deps) ToolHandler {
 		if err != nil {
 			return nil, err
 		}
+		if strings.TrimSpace(title) == "" {
+			return nil, fmt.Errorf("title must be a non-empty string")
+		}
 		description := optionalStringArg(args, "description")
 		allowedFiles, _ := stringSliceArg(args, "allowed_files")
 		forbiddenFiles, _ := stringSliceArg(args, "forbidden_files")
@@ -444,6 +447,9 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 		branch, err := stringArg(args, "branch")
 		if err != nil {
 			return nil, err
+		}
+		if strings.TrimSpace(branch) == "" {
+			return nil, fmt.Errorf("branch must be a non-empty string")
 		}
 		allowedFiles, err := stringSliceArg(args, "allowed_files")
 		if err != nil {
@@ -772,7 +778,11 @@ func handleNotify(deps *Deps) ToolHandler {
 				return nil, err
 			}
 
-			// Cleanup worker resources using the ledger's worker_id (not reconstructed).
+			// Cleanup worker resources. The git branch is intentionally NOT deleted
+			// here; it is preserved so archive_task can record it in the archive
+			// front matter and then delete it. If archive_task is never called the
+			// branch will be orphaned, but that matches the spec's deferred-deletion
+			// design for completed tasks.
 			wid := task.WorkerID
 			if wid == "" {
 				wid = "worker-" + taskID // fallback
