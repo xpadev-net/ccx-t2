@@ -449,6 +449,9 @@ func handleListHarnesses(deps *Deps) ToolHandler {
 }
 
 func cleanupArchivedTaskResources(deps *Deps, taskID, branch string) {
+	workerID := "worker-" + taskID
+	_ = tmux.KillWindow(deps.Session, workerID)
+	deps.Registry.Remove(workerID)
 	wPath := filepath.Join(deps.Config.Project.WorktreeBase,
 		deps.Config.Project.Slug+"-"+taskID)
 	_ = worktree.Remove(deps.Config.Project.RepoPath, wPath)
@@ -704,6 +707,10 @@ func handleFollowupWorker(deps *Deps) ToolHandler {
 		}
 		message, err := stringArg(args, "message")
 		if err != nil {
+			return nil, err
+		}
+
+		if err := ensureWorkerTaskActive(deps.Ledger, workerID); err != nil {
 			return nil, err
 		}
 
