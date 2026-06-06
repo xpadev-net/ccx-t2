@@ -384,12 +384,20 @@ func handleSplitTask(deps *Deps) ToolHandler {
 		}
 
 		// Guard against concurrent transitions winning the race between our preflight
-		// and the UpdateReturnPrev write. "unstarted" covers stop_worker resetting
-		// the task; "completed"/"split" cover notify/split winning the race.
+		// and the UpdateReturnPrev write.
 		switch prevTask.Status {
-		case "completed", "split", "unstarted":
+		case "completed", "split":
+			// Always a race — task reached a terminal state before our write.
 			_ = deps.Ledger.DeleteTasks(childIDs)
 			return nil, fmt.Errorf("cannot split task %s: it reached status %q concurrently", id, prevTask.Status)
+		case "unstarted":
+			// "unstarted" is expected when the original status was already "unstarted".
+			// It's a race only when a concurrent stop_worker reset the task from
+			// in_progress/blocked to "unstarted" before our UpdateReturnPrev.
+			if original.Status != "unstarted" {
+				_ = deps.Ledger.DeleteTasks(childIDs)
+				return nil, fmt.Errorf("cannot split task %s: it reached status %q concurrently", id, prevTask.Status)
+			}
 		}
 
 		// Clean up worker resources based on the actual previous status and
