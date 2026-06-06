@@ -132,6 +132,9 @@ func PipeOutput(session, window string) (<-chan string, func(), error) {
 				case <-stop:
 					return
 				}
+			} else if err := scanner.Err(); err != nil {
+				// Real read error — stop streaming.
+				return
 			} else {
 				// No new data yet — avoid busy-looping.
 				time.Sleep(50 * time.Millisecond)

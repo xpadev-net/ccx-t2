@@ -12,6 +12,8 @@ import (
 func Create(repoPath, branch, worktreePath, baseRef string) error {
 	if _, err := os.Stat(worktreePath); err == nil {
 		return fmt.Errorf("worktree path already exists: %s", worktreePath)
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("checking worktree path %s: %w", worktreePath, err)
 	}
 	return run("git", "-C", repoPath, "worktree", "add", "-b", branch, worktreePath, baseRef)
 }
