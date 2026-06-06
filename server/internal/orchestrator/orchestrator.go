@@ -126,10 +126,17 @@ func (o *Orchestrator) Trigger(ctx context.Context, reason string) error {
 
 func normalizeReason(reason string) string {
 	normalized := strings.Join(strings.Fields(reason), " ")
-	if len(normalized) > maxReasonLen {
-		return normalized[:maxReasonLen]
+	if len(normalized) <= maxReasonLen {
+		return normalized
 	}
-	return normalized
+	var sb strings.Builder
+	for _, r := range normalized {
+		if sb.Len()+len(string(r)) > maxReasonLen {
+			break
+		}
+		sb.WriteRune(r)
+	}
+	return sb.String()
 }
 
 // Close stops the background drain loop. It does not kill the tmux window.

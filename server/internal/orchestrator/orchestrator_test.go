@@ -9,6 +9,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	shellquote "github.com/kballard/go-shellquote"
 	"github.com/xpadev/ccx-t2/internal/config"
@@ -317,6 +318,17 @@ func TestTriggerNormalizesReasonBeforePrompt(t *testing.T) {
 	longReason := strings.Repeat("a", maxReasonLen+1)
 	if got := normalizeReason(longReason); len(got) != maxReasonLen {
 		t.Fatalf("normalized long reason length = %d, want %d", len(got), maxReasonLen)
+	}
+	longUnicodeReason := strings.Repeat("界", maxReasonLen+1)
+	got := normalizeReason(longUnicodeReason)
+	if !utf8.ValidString(got) {
+		t.Fatalf("normalized unicode reason is invalid UTF-8: %q", got)
+	}
+	if len(got) > maxReasonLen {
+		t.Fatalf("normalized unicode reason length = %d, want <= %d", len(got), maxReasonLen)
+	}
+	if runeCount := utf8.RuneCountInString(got); runeCount == 0 {
+		t.Fatal("normalized unicode reason is empty")
 	}
 }
 
