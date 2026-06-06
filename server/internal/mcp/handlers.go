@@ -743,22 +743,22 @@ func handleNotify(deps *Deps) ToolHandler {
 
 			// Validate and build children before any mutations.
 			type srChild struct {
-				id, title, desc string
+				id, title, desc    string
 				allowed, forbidden []string
 			}
 			srChildren := make([]srChild, 0, len(proposedSlices))
-			for _, s := range proposedSlices {
+			for i, s := range proposedSlices {
 				sliceMap, ok := s.(map[string]any)
 				if !ok {
-					continue
+					return nil, fmt.Errorf("proposed_slices[%d] must be an object", i)
 				}
 				childAllowed, _ := stringSliceArg(sliceMap, "allowed_files")
 				childForbidden, _ := stringSliceArg(sliceMap, "forbidden_files")
 				if err := ledger.ValidatePaths(childAllowed); err != nil {
-					return nil, fmt.Errorf("slice allowed_files: %w", err)
+					return nil, fmt.Errorf("proposed_slices[%d] allowed_files: %w", i, err)
 				}
 				if err := ledger.ValidatePaths(childForbidden); err != nil {
-					return nil, fmt.Errorf("slice forbidden_files: %w", err)
+					return nil, fmt.Errorf("proposed_slices[%d] forbidden_files: %w", i, err)
 				}
 				childID, err := deps.Ledger.GenerateID()
 				if err != nil {
@@ -771,9 +771,26 @@ func handleNotify(deps *Deps) ToolHandler {
 					allowed: childAllowed, forbidden: childForbidden,
 				})
 			}
+			if len(srChildren) == 0 {
+				return nil, fmt.Errorf("proposed_slices produced no valid child tasks")
+			}
 
-			// Update ledger BEFORE resource cleanup so task is never stuck
-			// in in_progress with no live worker if the update fails.
+			// Add children BEFORE marking parent split — same as handleSplitTask.
+			// If Add fails, parent remains in_progress/blocked and can be retried.
+			for _, c := range srChildren {
+				if err := deps.Ledger.Add(ledger.Task{
+					ID:             c.id,
+					Title:          c.title,
+					Status:         "unstarted",
+					AllowedFiles:   c.allowed,
+					ForbiddenFiles: c.forbidden,
+					Body:           c.desc,
+				}); err != nil {
+					return nil, err
+				}
+			}
+
+			// Update parent to split after children are safely written.
 			if err := deps.Ledger.Update(taskID, map[string]any{
 				"status":    "split",
 				"worker_id": "",
@@ -784,7 +801,7 @@ func handleNotify(deps *Deps) ToolHandler {
 				return nil, err
 			}
 
-			// Cleanup resources (best-effort after ledger is committed).
+			// Cleanup resources (best-effort, parent already committed as split).
 			wid := task.WorkerID
 			if wid == "" {
 				wid = "worker-" + taskID
@@ -798,19 +815,6 @@ func handleNotify(deps *Deps) ToolHandler {
 					"branch", "-D", task.Branch).Run()
 			}
 			deps.Registry.Remove(wid)
-
-			for _, c := range srChildren {
-				if err := deps.Ledger.Add(ledger.Task{
-					ID:             c.id,
-					Title:          c.title,
-					Status:         "unstarted",
-					AllowedFiles:   c.allowed,
-					ForbiddenFiles: c.forbidden,
-					Body:           c.desc,
-				}); err != nil {
-					return nil, err
-				}
-			}
 
 		default:
 			return nil, fmt.Errorf("unknown notify type: %s", notifyType)

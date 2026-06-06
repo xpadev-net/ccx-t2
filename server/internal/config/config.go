@@ -167,6 +167,9 @@ func validateHarness(cfg *Config, name string, checkBinary bool) error {
 	if strings.TrimSpace(h.McpArgs) == "" {
 		return fmt.Errorf("mcp_args is empty")
 	}
+	if !strings.Contains(h.McpArgs, "{url}") {
+		return fmt.Errorf("mcp_args must contain the {url} placeholder")
+	}
 	if checkBinary {
 		if _, err := exec.LookPath(h.Command); err != nil {
 			return fmt.Errorf("binary %q not found in PATH: %w", h.Command, err)
