@@ -3,6 +3,7 @@ package ledger
 import (
 	"bufio"
 	"bytes"
+	"fmt"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -20,7 +21,7 @@ type rawTask struct {
 //   - A "---" line inside a front matter block ends it (regardless of next line).
 //   - All other "---" lines are treated as horizontal rules in the body.
 //   - EOF terminates the last body.
-func parse(content string) []rawTask {
+func parse(content string) ([]rawTask, error) {
 	scanner := bufio.NewScanner(strings.NewReader(content))
 
 	var lines []string
@@ -90,14 +91,19 @@ func parse(content string) []rawTask {
 	}
 
 	// Flush remaining task.
-	if inTask && state == stateBody {
+	if inTask {
+		if state == stateFrontMatter {
+			// Front matter was opened but never closed — treat the accumulated
+			// content as a partial front matter and return an error to the caller.
+			return nil, fmt.Errorf("unclosed front matter block (missing closing '---')")
+		}
 		tasks = append(tasks, rawTask{
 			frontMatter: currentFM.String(),
 			body:        currentBody.String(),
 		})
 	}
 
-	return tasks
+	return tasks, nil
 }
 
 // unmarshalTask parses YAML front matter into a Task.
@@ -131,6 +137,9 @@ func marshalFrontMatter(t Task) ([]byte, error) {
 		}
 		buf.WriteString(line)
 		buf.WriteString("\n")
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("marshal front matter: scanner error: %w", err)
 	}
 
 	return buf.Bytes(), nil

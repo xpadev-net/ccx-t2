@@ -73,7 +73,10 @@ func (l *Ledger) load() ([]Task, error) {
 }
 
 func parseContent(content string) ([]Task, error) {
-	raws := parse(content)
+	raws, err := parse(content)
+	if err != nil {
+		return nil, err
+	}
 	tasks := make([]Task, 0, len(raws))
 	for _, r := range raws {
 		t, err := unmarshalTask(r.frontMatter)
@@ -89,8 +92,13 @@ func parseContent(content string) ([]Task, error) {
 // Save writes tasks back to the ledger file atomically.
 func (l *Ledger) Save(tasks []Task) error {
 	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.save(tasks)
+	err := l.save(tasks)
+	onChange := l.onChange
+	l.mu.Unlock()
+	if err == nil && onChange != nil {
+		onChange()
+	}
+	return err
 }
 
 func (l *Ledger) save(tasks []Task) error {
@@ -131,34 +139,35 @@ func (l *Ledger) save(tasks []Task) error {
 		os.Remove(tmpName)
 		return err
 	}
-
-	if l.onChange != nil {
-		l.onChange()
-	}
 	return nil
 }
 
 // Add appends a new task to the ledger with updated_at set to now.
 func (l *Ledger) Add(task Task) error {
 	l.mu.Lock()
-	defer l.mu.Unlock()
-
 	tasks, err := l.load()
 	if err != nil {
+		l.mu.Unlock()
 		return err
 	}
 	task.UpdatedAt = time.Now().Format(time.RFC3339)
 	tasks = append(tasks, task)
-	return l.save(tasks)
+	err = l.save(tasks)
+	onChange := l.onChange
+	l.mu.Unlock()
+	if err == nil && onChange != nil {
+		onChange()
+	}
+	return err
 }
 
 // Update modifies fields of an existing task by ID, updating updated_at.
 func (l *Ledger) Update(id string, fields map[string]any) error {
 	l.mu.Lock()
-	defer l.mu.Unlock()
 
 	tasks, err := l.load()
 	if err != nil {
+		l.mu.Unlock()
 		return err
 	}
 
@@ -172,15 +181,25 @@ func (l *Ledger) Update(id string, fields map[string]any) error {
 		for k, v := range fields {
 			switch k {
 			case "title":
-				t.Title, _ = v.(string)
+				if s, ok := v.(string); ok {
+					t.Title = s
+				}
 			case "status":
-				t.Status, _ = v.(string)
+				if s, ok := v.(string); ok {
+					t.Status = s
+				}
 			case "branch":
-				t.Branch, _ = v.(string)
+				if s, ok := v.(string); ok {
+					t.Branch = s
+				}
 			case "worker_id":
-				t.WorkerID, _ = v.(string)
+				if s, ok := v.(string); ok {
+					t.WorkerID = s
+				}
 			case "harness":
-				t.Harness, _ = v.(string)
+				if s, ok := v.(string); ok {
+					t.Harness = s
+				}
 			case "allowed_files":
 				switch val := v.(type) {
 				case []string:
@@ -196,32 +215,48 @@ func (l *Ledger) Update(id string, fields map[string]any) error {
 					t.ForbiddenFiles = nil
 				}
 			case "pr_url":
-				t.PrURL, _ = v.(string)
+				if s, ok := v.(string); ok {
+					t.PrURL = s
+				}
 			case "merge_commit":
-				t.MergeCommit, _ = v.(string)
+				if s, ok := v.(string); ok {
+					t.MergeCommit = s
+				}
 			case "reason":
-				t.Reason, _ = v.(string)
+				if s, ok := v.(string); ok {
+					t.Reason = s
+				}
 			case "body":
-				t.Body, _ = v.(string)
+				if s, ok := v.(string); ok {
+					t.Body = s
+				}
 			}
 		}
 		t.UpdatedAt = time.Now().Format(time.RFC3339)
+		break
 	}
 
 	if !found {
+		l.mu.Unlock()
 		return fmt.Errorf("task not found: %s", id)
 	}
-	return l.save(tasks)
+	err = l.save(tasks)
+	onChange := l.onChange
+	l.mu.Unlock()
+	if err == nil && onChange != nil {
+		onChange()
+	}
+	return err
 }
 
 // Archive moves a completed task to the archive directory.
 // mergeCommit is optional; if non-empty it's added to the archive front matter.
 func (l *Ledger) Archive(id, mergeCommit string) error {
 	l.mu.Lock()
-	defer l.mu.Unlock()
 
 	tasks, err := l.load()
 	if err != nil {
+		l.mu.Unlock()
 		return err
 	}
 
@@ -233,31 +268,31 @@ func (l *Ledger) Archive(id, mergeCommit string) error {
 		}
 	}
 	if idx == -1 {
+		l.mu.Unlock()
 		return fmt.Errorf("task not found: %s", id)
 	}
 
 	t := tasks[idx]
 	if t.Status != "completed" {
+		l.mu.Unlock()
 		return fmt.Errorf("task %s is not completed (status: %s)", id, t.Status)
 	}
 
 	slug := titleToSlug(t.Title)
-
-	// Strip merge_commit comment from body.
-	body := removeMergeCommitComment(t.Body)
-	t.Body = body
-
+	t.Body = removeMergeCommitComment(t.Body)
 	if mergeCommit != "" {
 		t.MergeCommit = mergeCommit
 	}
 
 	archiveFile := filepath.Join(l.archiveDir, fmt.Sprintf("%s-%s.md", id, slug))
 	if err := os.MkdirAll(l.archiveDir, 0o755); err != nil {
+		l.mu.Unlock()
 		return err
 	}
 
 	fm, err := marshalFrontMatter(t)
 	if err != nil {
+		l.mu.Unlock()
 		return err
 	}
 	var ab strings.Builder
@@ -271,12 +306,22 @@ func (l *Ledger) Archive(id, mergeCommit string) error {
 	}
 
 	if err := os.WriteFile(archiveFile, []byte(ab.String()), 0o644); err != nil {
+		l.mu.Unlock()
 		return err
 	}
 
-	// Remove from ledger.
-	remaining := append(tasks[:idx], tasks[idx+1:]...)
-	return l.save(remaining)
+	// Build remaining slice without aliasing the original backing array.
+	remaining := make([]Task, 0, len(tasks)-1)
+	remaining = append(remaining, tasks[:idx]...)
+	remaining = append(remaining, tasks[idx+1:]...)
+
+	err = l.save(remaining)
+	onChange := l.onChange
+	l.mu.Unlock()
+	if err == nil && onChange != nil {
+		onChange()
+	}
+	return err
 }
 
 // GenerateID generates a unique task ID in the format task-{YYYYMMDD}-{4-digit seq}.
