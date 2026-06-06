@@ -97,7 +97,7 @@ tmux ウィンドウの作成・削除・キー送信と git worktree の管理�
 
 **`internal/worktree/worktree.go`**
 - `Create(repoPath, branch, worktreePath string) error` — `git worktree add -b {branch}`（ブランチを新規作成）
-- `Remove(worktreePath string) error` — `git worktree remove`
+- `Remove(repoPath, worktreePath string) error` — `git -C {repoPath} worktree remove --force`
 
 ---
 
