@@ -90,7 +90,7 @@ func (o *Orchestrator) Trigger(ctx context.Context, reason string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	reason = strings.TrimSpace(reason)
+	reason = normalizeReason(reason)
 	o.mu.Lock()
 	if o.closed {
 		o.mu.Unlock()
@@ -118,6 +118,10 @@ func (o *Orchestrator) Trigger(ctx context.Context, reason string) error {
 	}
 	go o.drain()
 	return nil
+}
+
+func normalizeReason(reason string) string {
+	return strings.Join(strings.Fields(reason), " ")
 }
 
 // Close stops the background drain loop. It does not kill the tmux window.
