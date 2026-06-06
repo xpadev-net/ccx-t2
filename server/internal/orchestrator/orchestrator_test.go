@@ -296,6 +296,27 @@ func TestTriggerKeepsQueuedWorkWhenWindowBecomesActiveBeforeStart(t *testing.T) 
 	}
 }
 
+func TestTriggerActiveWindowWithZeroTimeoutWaits(t *testing.T) {
+	l, cfg := newTestDeps(t)
+	cfg.Orchestrator.Timeout = 0
+	fake := &fakeTmux{alive: true, idle: false}
+	o := New(l, cfg, "proj", "http://localhost:8080")
+	o.tmux = fake
+	o.pollInterval = time.Millisecond
+	t.Cleanup(o.Close)
+
+	if err := o.Trigger(context.Background(), "active"); err != nil {
+		t.Fatalf("Trigger: %v", err)
+	}
+	creates, commands, prompts := fake.counts()
+	if kills := fake.killCount(); kills != 0 || creates != 0 || commands != 0 || prompts != 0 {
+		t.Fatalf("zero-timeout active trigger relaunched: kills=%d creates=%d commands=%d prompts=%d", kills, creates, commands, prompts)
+	}
+	if queued := queuedSnapshot(o); !reflect.DeepEqual(queued, []string{"active"}) {
+		t.Fatalf("queued = %#v, want active trigger preserved", queued)
+	}
+}
+
 func TestTriggerNormalizesReasonBeforePrompt(t *testing.T) {
 	l, cfg := newTestDeps(t)
 	fake := &fakeTmux{}
@@ -587,6 +608,22 @@ func TestNewTrimsSessionAndBaseURL(t *testing.T) {
 	}
 	if o.baseURL != "http://localhost:8080" {
 		t.Fatalf("baseURL = %q, want trimmed without trailing slash", o.baseURL)
+	}
+}
+
+func TestRemoveQueuedAtLockedPrefersEntryAtOrAfterIndex(t *testing.T) {
+	l, cfg := newTestDeps(t)
+	o := New(l, cfg, "proj", "http://localhost:8080")
+	o.queued = []string{"same", "other", "same", "same"}
+	o.removeQueuedAtLocked(2, "same")
+	if !reflect.DeepEqual(o.queued, []string{"same", "other", "same"}) {
+		t.Fatalf("queued after remove = %#v", o.queued)
+	}
+
+	o.queued = []string{"same", "other", "same"}
+	o.removeQueuedAtLocked(5, "same")
+	if !reflect.DeepEqual(o.queued, []string{"other", "same"}) {
+		t.Fatalf("fallback queued after remove = %#v", o.queued)
 	}
 }
 

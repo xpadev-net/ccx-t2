@@ -232,6 +232,9 @@ func (o *Orchestrator) tryStartNext(ctx context.Context) (bool, error) {
 		return false, context.Canceled
 	}
 	if active && !o.activeTimedOut() {
+		if o.cfg.Orchestrator.Timeout <= 0 {
+			log.Printf("warn: orchestrator window is active and no timeout is configured; queued triggers will wait indefinitely")
+		}
 		return true, nil
 	}
 	if err := o.claimStart(); err != nil {
@@ -280,7 +283,17 @@ func (o *Orchestrator) removeQueuedAtLocked(index int, reason string) {
 		o.removeQueuedIndexLocked(index)
 		return
 	}
-	for i := len(o.queued) - 1; i >= 0; i-- {
+	start := index
+	if start < 0 {
+		start = 0
+	}
+	for i := start; i < len(o.queued); i++ {
+		if o.queued[i] == reason {
+			o.removeQueuedIndexLocked(i)
+			return
+		}
+	}
+	for i := 0; i < start && i < len(o.queued); i++ {
 		if o.queued[i] == reason {
 			o.removeQueuedIndexLocked(i)
 			return
