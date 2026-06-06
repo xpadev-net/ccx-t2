@@ -217,6 +217,12 @@ func handleUpdateTask(deps *Deps) ToolHandler {
 		fields := make(map[string]any)
 		for _, key := range []string{"title", "reason"} {
 			if v, ok := args[key]; ok {
+				if key == "title" {
+					s, ok := v.(string)
+					if !ok || strings.TrimSpace(s) == "" {
+						return nil, fmt.Errorf("title must be a non-empty string")
+					}
+				}
 				fields[key] = v
 			}
 		}

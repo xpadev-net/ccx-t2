@@ -239,12 +239,16 @@ func intArg(args map[string]any, key string) (int, error) {
 }
 
 // inSchema returns a JSON Schema object for tools/list.
+// "required" is omitted entirely when empty to avoid emitting null.
 func inSchema(properties map[string]any, required []string) map[string]any {
-	return map[string]any{
+	s := map[string]any{
 		"type":       "object",
 		"properties": properties,
-		"required":   required,
 	}
+	if len(required) > 0 {
+		s["required"] = required
+	}
+	return s
 }
 
 // prop is a convenience function for building schema properties.
