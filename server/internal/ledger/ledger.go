@@ -237,6 +237,40 @@ func (l *Ledger) AddAll(newTasks []Task) error {
 	return err
 }
 
+// AddAllNew generates IDs and appends all tasks atomically under one lock.
+// It returns the generated IDs in the same order as newTasks.
+func (l *Ledger) AddAllNew(newTasks []Task) ([]string, error) {
+	l.mu.Lock()
+	tasks, err := l.load()
+	if err != nil {
+		l.mu.Unlock()
+		return nil, err
+	}
+	ids, err := l.generateIDsFromTasks(tasks, len(newTasks))
+	if err != nil {
+		l.mu.Unlock()
+		return nil, err
+	}
+	now := time.Now().Format(time.RFC3339)
+	stamped := make([]Task, len(newTasks))
+	for i, t := range newTasks {
+		t.ID = ids[i]
+		t.UpdatedAt = now
+		stamped[i] = t
+	}
+	tasks = append(tasks, stamped...)
+	err = l.save(tasks)
+	onChange := l.onChange
+	l.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	if onChange != nil {
+		onChange()
+	}
+	return ids, nil
+}
+
 // DeleteTasks removes tasks with the given IDs from the ledger, ignoring
 // IDs that are not present. Used to roll back orphaned tasks after a
 // partial write failure (e.g., AddAll succeeded but the parent Update failed).
@@ -683,7 +717,13 @@ func (l *Ledger) generateIDs(n int) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	return l.generateIDsFromTasks(tasks, n)
+}
 
+func (l *Ledger) generateIDsFromTasks(tasks []Task, n int) ([]string, error) {
+	if n <= 0 {
+		return nil, nil
+	}
 	existing := make(map[string]bool)
 	for _, t := range tasks {
 		existing[t.ID] = true
