@@ -624,7 +624,9 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 			_ = exec.Command("git", "-C", repoPath, "branch", "-D", branch).Run()
 			// Reset lifecycle fields only — do not restore allowed/forbidden_files
 			// to avoid overwriting concurrent update_task edits.
-			if rollbackErr := deps.Ledger.Update(taskID, map[string]any{
+			// Use UpdateIfStatuses so a concurrent split_task that already committed
+			// (moving the parent to "split") is not overwritten by this rollback.
+			if rollbackErr := deps.Ledger.UpdateIfStatuses(taskID, []string{"in_progress"}, map[string]any{
 				"status":    "unstarted",
 				"worker_id": "",
 				"branch":    "",
@@ -969,7 +971,11 @@ func handleNotify(deps *Deps) ToolHandler {
 				_ = deps.Ledger.DeleteTasks(srChildIDs)
 				return nil, updateErr
 			}
-			if prevTask.Status == "completed" || prevTask.Status == "split" {
+			// Also guard "unstarted": a concurrent stop_worker may have reset the task
+			// between the preflight check and UpdateReturnPrev, leaving prevTask.WorkerID
+			// empty and cleanup a no-op while children are permanently orphaned.
+			switch prevTask.Status {
+			case "completed", "split", "unstarted":
 				_ = deps.Ledger.DeleteTasks(srChildIDs)
 				return nil, fmt.Errorf("cannot split task %s: it reached status %q concurrently", taskID, prevTask.Status)
 			}
