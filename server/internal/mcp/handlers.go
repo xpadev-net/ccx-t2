@@ -576,14 +576,13 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 			_ = tmux.KillWindow(deps.Session, workerID)
 			_ = worktree.Remove(repoPath, worktreePath)
 			_ = exec.Command("git", "-C", repoPath, "branch", "-D", branch).Run()
-			// Restore to original values from before the spawn attempt.
+			// Reset lifecycle fields only — do not restore allowed/forbidden_files
+			// to avoid overwriting concurrent update_task edits.
 			_ = deps.Ledger.Update(taskID, map[string]any{
-				"status":          "unstarted",
-				"worker_id":       "",
-				"branch":          "",
-				"harness":         "",
-				"allowed_files":   task.AllowedFiles,
-				"forbidden_files": task.ForbiddenFiles,
+				"status":    "unstarted",
+				"worker_id": "",
+				"branch":    "",
+				"harness":   "",
 			})
 			deps.Registry.Remove(workerID)
 			return nil, fmt.Errorf("send harness command: %w", err)

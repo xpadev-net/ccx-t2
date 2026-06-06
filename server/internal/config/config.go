@@ -169,6 +169,9 @@ func validateHarness(cfg *Config, name string, checkBinary bool) error {
 	if strings.TrimSpace(h.Command) == "" {
 		return fmt.Errorf("command is empty")
 	}
+	if strings.ContainsAny(h.Command, " \t\n") {
+		return fmt.Errorf("command must be a single binary name or path with no whitespace; got %q", h.Command)
+	}
 	if strings.TrimSpace(h.McpArgs) == "" {
 		return fmt.Errorf("mcp_args is empty")
 	}
