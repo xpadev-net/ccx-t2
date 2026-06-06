@@ -463,9 +463,9 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 			return nil, fmt.Errorf("invalid mcp_args shell syntax: %w", err)
 		}
 
-		// Check branch uniqueness.
+		// Check branch uniqueness via literal name lookup (not glob).
 		out, _ := exec.Command("git", "-C", deps.Config.Project.RepoPath,
-			"branch", "--list", branch).Output()
+			"rev-parse", "--verify", "refs/heads/"+branch).Output()
 		if strings.TrimSpace(string(out)) != "" {
 			return nil, fmt.Errorf("branch %q already exists", branch)
 		}

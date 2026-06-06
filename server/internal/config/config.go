@@ -92,6 +92,7 @@ func expandEnv(cfg *Config) {
 	cfg.GitHub.Token = expand(cfg.GitHub.Token)
 	cfg.GitHub.Owner = expand(cfg.GitHub.Owner)
 	cfg.GitHub.Repo = expand(cfg.GitHub.Repo)
+	cfg.Server.McpSecret = expand(cfg.Server.McpSecret)
 
 	for name, h := range cfg.Harnesses {
 		h.Command = expand(h.Command)
