@@ -875,7 +875,7 @@ func handleNotify(deps *Deps) ToolHandler {
 			if reason != "" {
 				fields["reason"] = reason
 			}
-			if err := deps.Ledger.Update(taskID, fields); err != nil {
+			if err := deps.Ledger.UpdateIfStatuses(taskID, []string{"in_progress", "blocked"}, fields); err != nil {
 				return nil, err
 			}
 
@@ -974,8 +974,10 @@ func handleNotify(deps *Deps) ToolHandler {
 				return nil, fmt.Errorf("cannot split task %s: it reached status %q concurrently", taskID, prevTask.Status)
 			}
 
-			// Cleanup resources (best-effort, parent already committed as split).
-			wid := task.WorkerID
+			// Cleanup resources using prevTask snapshot (not stale task load) so that
+			// a concurrent stop_worker + spawn_worker that updated worker_id/branch
+			// between the initial load and UpdateReturnPrev is handled correctly.
+			wid := prevTask.WorkerID
 			if wid == "" {
 				wid = "worker-" + taskID
 			}
@@ -983,9 +985,9 @@ func handleNotify(deps *Deps) ToolHandler {
 			_ = worktree.Remove(deps.Config.Project.RepoPath,
 				filepath.Join(deps.Config.Project.WorktreeBase,
 					deps.Config.Project.Slug+"-"+taskID))
-			if task.Branch != "" {
+			if prevTask.Branch != "" {
 				_ = exec.Command("git", "-C", deps.Config.Project.RepoPath,
-					"branch", "-D", task.Branch).Run()
+					"branch", "-D", prevTask.Branch).Run()
 			}
 			deps.Registry.Remove(wid)
 
