@@ -124,35 +124,39 @@ func PipeOutput(session, window string) (<-chan string, func(), error) {
 		// Use bufio.Reader rather than bufio.Scanner: Scanner sets an internal
 		// done flag on the first io.EOF and never reads the file again, making
 		// it unsuitable for tailing a growing file. Reader.ReadString returns
-		// io.EOF on every read that reaches the current end of file, which we
-		// treat as "no data yet" and retry after a short sleep.
+		// io.EOF on every read that reaches the current end of file.
+		//
+		// Partial-line handling: ReadString('\n') may return (partial, io.EOF)
+		// when the writer hasn't flushed the trailing newline yet. We accumulate
+		// fragments in a strings.Builder and only emit a line once a '\n' is
+		// seen (err == nil), avoiding split messages to consumers.
+		// Blank lines are emitted as empty strings; callers may filter them.
 		reader := bufio.NewReader(f)
+		var buf strings.Builder
 		for {
 			select {
 			case <-stop:
 				return
 			default:
 			}
-			line, err := reader.ReadString('\n')
-			if len(line) > 0 {
-				// Deliver whatever was read (may not have trailing newline yet).
-				trimmed := strings.TrimRight(line, "\r\n")
-				if trimmed != "" {
-					select {
-					case ch <- trimmed:
-					case <-stop:
-						return
-					}
-				}
-			}
+			fragment, err := reader.ReadString('\n')
+			buf.WriteString(fragment)
 			if err != nil {
 				if errors.Is(err, io.EOF) {
 					// Transient EOF — file still being written. Sleep and retry.
 					time.Sleep(50 * time.Millisecond)
-				} else {
-					// Real read error — stop streaming.
-					return
+					continue
 				}
+				// Real read error — stop streaming.
+				return
+			}
+			// Complete line received (ends with '\n').
+			line := strings.TrimRight(buf.String(), "\r\n")
+			buf.Reset()
+			select {
+			case ch <- line:
+			case <-stop:
+				return
 			}
 		}
 	}()
