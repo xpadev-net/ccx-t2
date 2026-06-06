@@ -207,6 +207,29 @@ func TestTriggerQueuesWhileWindowActiveAndDrainsAfterIdle(t *testing.T) {
 	}
 }
 
+func TestTriggerRejectsWhenQueueFull(t *testing.T) {
+	l, cfg := newTestDeps(t)
+	fake := &fakeTmux{alive: true, idle: false}
+	o := New(l, cfg, "proj", "http://localhost:8080")
+	o.tmux = fake
+	o.queued = make([]string, maxQueuedReasons)
+
+	err := o.Trigger(context.Background(), "overflow")
+	if err == nil {
+		t.Fatal("Trigger full queue error = nil, want error")
+	}
+	if !strings.Contains(err.Error(), "orchestrator queue is full") {
+		t.Fatalf("Trigger full queue error = %v", err)
+	}
+	if queued := queuedSnapshot(o); len(queued) != maxQueuedReasons {
+		t.Fatalf("queued len = %d, want %d", len(queued), maxQueuedReasons)
+	}
+	creates, commands, prompts := fake.counts()
+	if creates != 0 || commands != 0 || prompts != 0 {
+		t.Fatalf("full queue triggered tmux activity: creates=%d commands=%d prompts=%d", creates, commands, prompts)
+	}
+}
+
 func TestTriggerCanceledContextDoesNotQueueWhenIdle(t *testing.T) {
 	l, cfg := newTestDeps(t)
 	fake := &fakeTmux{}

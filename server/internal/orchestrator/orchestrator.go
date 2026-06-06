@@ -19,6 +19,7 @@ import (
 const (
 	windowName       = "orchestrator"
 	maxReasonLen     = 200
+	maxQueuedReasons = 256
 	cleanupTmuxLimit = 5 * time.Second
 )
 
@@ -103,6 +104,10 @@ func (o *Orchestrator) Trigger(ctx context.Context, reason string) error {
 	if o.closed {
 		o.mu.Unlock()
 		return fmt.Errorf("orchestrator is closed")
+	}
+	if len(o.queued) >= maxQueuedReasons {
+		o.mu.Unlock()
+		return fmt.Errorf("orchestrator queue is full (%d)", maxQueuedReasons)
 	}
 	queuedIndex := len(o.queued)
 	o.queued = append(o.queued, reason)
@@ -459,7 +464,9 @@ func (o *Orchestrator) start(ctx context.Context, reason string) (bool, error) {
 func (o *Orchestrator) cleanupStartedWindow() {
 	ctx, cancel := context.WithTimeout(context.Background(), cleanupTmuxLimit)
 	defer cancel()
-	_ = o.tmux.KillWindow(ctx, o.session, windowName)
+	if err := o.tmux.KillWindow(ctx, o.session, windowName); err != nil {
+		log.Printf("warn: orchestrator failed to clean up partial window: %v", err)
+	}
 }
 
 func (o *Orchestrator) buildPrompt(reason string) (string, error) {
