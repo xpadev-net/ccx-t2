@@ -135,7 +135,7 @@ func PipeOutput(session, window string) (<-chan string, func(), error) {
 			line, err := reader.ReadString('\n')
 			if len(line) > 0 {
 				// Deliver whatever was read (may not have trailing newline yet).
-				trimmed := strings.TrimRight(line, "\n")
+				trimmed := strings.TrimRight(line, "\r\n")
 				if trimmed != "" {
 					select {
 					case ch <- trimmed:
