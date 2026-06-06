@@ -352,6 +352,9 @@ func handleArchiveTask(deps *Deps) ToolHandler {
 		if t == nil {
 			return nil, fmt.Errorf("task not found: %s", id)
 		}
+		if t.Status != "completed" {
+			return nil, fmt.Errorf("task %s is not completed (status: %s); only completed tasks can be archived", id, t.Status)
+		}
 
 		// Extract merge_commit from body comment.
 		mergeCommit := extractMergeCommit(t.Body)
@@ -428,6 +431,13 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 			return nil, err
 		}
 
+		// Validate mcp_args shell syntax before any state mutation.
+		workerMCPURL := deps.BaseURL + "/mcp/worker"
+		mcpArgsStr := replaceMcpURL(hCfg.McpArgs, workerMCPURL)
+		if _, err := shellquote.Split(mcpArgsStr); err != nil {
+			return nil, fmt.Errorf("invalid mcp_args shell syntax: %w", err)
+		}
+
 		// Check branch uniqueness.
 		out, _ := exec.Command("git", "-C", deps.Config.Project.RepoPath,
 			"branch", "--list", branch).Output()
@@ -484,13 +494,8 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 		})
 
 		// Step 4: Launch harness with MCP args.
-		workerMCPURL := deps.BaseURL + "/mcp/worker"
-		mcpArgsStr := replaceMcpURL(hCfg.McpArgs, workerMCPURL)
-		mcpTokens, err := shellquote.Split(mcpArgsStr)
-		if err != nil {
-			return nil, fmt.Errorf("split mcp_args: %w", err)
-		}
-		harnessCmd := strings.Join(append([]string{hCfg.Command}, mcpTokens...), " ")
+		// mcpArgsStr was validated above; use it directly to preserve quoting.
+		harnessCmd := hCfg.Command + " " + mcpArgsStr
 		if err := tmux.SendKeys(deps.Session, workerID, harnessCmd); err != nil {
 			// Best-effort: harness may still start.
 			fmt.Printf("warn: send harness command: %v\n", err)
