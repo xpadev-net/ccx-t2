@@ -549,6 +549,10 @@ func (l *Ledger) Archive(id, mergeCommit string) error {
 		}
 	}
 	if idx == -1 {
+		if l.archiveContainsID(id) {
+			l.mu.Unlock()
+			return nil
+		}
 		l.mu.Unlock()
 		return fmt.Errorf("task not found: %s", id)
 	}
@@ -634,6 +638,13 @@ func (l *Ledger) Archive(id, mergeCommit string) error {
 	return err
 }
 
+// IsArchived reports whether an archive file for id already exists.
+func (l *Ledger) IsArchived(id string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.archiveContainsID(id)
+}
+
 // GenerateID generates a unique task ID in the format task-{YYYYMMDD}-{4-digit seq}.
 func (l *Ledger) GenerateID() (string, error) {
 	l.mu.Lock()
@@ -665,17 +676,8 @@ func (l *Ledger) generateIDs(n int) ([]string, error) {
 	for _, t := range tasks {
 		existing[t.ID] = true
 	}
-	if entries, err := os.ReadDir(l.archiveDir); err == nil {
-		for _, e := range entries {
-			name := e.Name()
-			if strings.HasSuffix(name, ".md") {
-				parts := strings.SplitN(name, "-", 4)
-				if len(parts) >= 3 {
-					candidate := strings.TrimSuffix(strings.Join(parts[:3], "-"), ".md")
-					existing[candidate] = true
-				}
-			}
-		}
+	for id := range l.archiveIDs() {
+		existing[id] = true
 	}
 
 	date := time.Now().Format("20060102")
@@ -706,25 +708,8 @@ func (l *Ledger) generateIDFromTasks(tasks []Task) (string, error) {
 	for _, t := range tasks {
 		existing[t.ID] = true
 	}
-
-	// Also check archive directory.
-	if entries, err := os.ReadDir(l.archiveDir); err == nil {
-		for _, e := range entries {
-			name := e.Name()
-			if strings.HasSuffix(name, ".md") {
-				// Extract the id prefix: everything before the first '-' after "task-YYYYMMDD-".
-				// Archive filenames are "{id}-{slug}.md".
-				// id format: task-{YYYYMMDD}-{4digits}
-				// We need to match "task-YYYYMMDD-NNNN" prefix.
-				parts := strings.SplitN(name, "-", 4)
-				if len(parts) >= 3 {
-					candidate := strings.Join(parts[:3], "-")
-					// Remove .md if it happened to be at the end (3-part id with no slug).
-					candidate = strings.TrimSuffix(candidate, ".md")
-					existing[candidate] = true
-				}
-			}
-		}
+	for id := range l.archiveIDs() {
+		existing[id] = true
 	}
 
 	date := time.Now().Format("20060102")
@@ -737,10 +722,45 @@ func (l *Ledger) generateIDFromTasks(tasks []Task) (string, error) {
 	return "", fmt.Errorf("could not generate unique task ID for date %s", date)
 }
 
+func (l *Ledger) archiveContainsID(id string) bool {
+	return l.archiveIDs()[id]
+}
+
+func (l *Ledger) archiveIDs() map[string]bool {
+	ids := make(map[string]bool)
+	entries, err := os.ReadDir(l.archiveDir)
+	if err != nil {
+		return ids
+	}
+	for _, e := range entries {
+		if id, ok := archiveIDFromFilename(e.Name()); ok {
+			ids[id] = true
+		}
+	}
+	return ids
+}
+
+func archiveIDFromFilename(name string) (string, bool) {
+	if !strings.HasSuffix(name, ".md") {
+		return "", false
+	}
+	stem := strings.TrimSuffix(name, ".md")
+	if match := reTaskID.FindString(stem); match != "" && (len(stem) == len(match) || stem[len(match)] == '-') {
+		return match, true
+	}
+	// Compatibility for legacy tests/fixtures that use task-NNN IDs.
+	if match := reLegacyTaskID.FindString(stem); match != "" && (len(stem) == len(match) || stem[len(match)] == '-') {
+		return match, true
+	}
+	return "", false
+}
+
 var (
 	reSlugNonAlnum = regexp.MustCompile(`[^a-z0-9-]`)
 	reSlugHyphens  = regexp.MustCompile(`-{2,}`)
 	reMergeCommit  = regexp.MustCompile(`(?m)\n?<!-- merge_commit: [^\n]+ -->`)
+	reTaskID       = regexp.MustCompile(`^task-\d{8}-\d{4}`)
+	reLegacyTaskID = regexp.MustCompile(`^task-\d{3}`)
 )
 
 // titleToSlug converts a title to a URL slug.

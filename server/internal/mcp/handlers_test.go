@@ -133,6 +133,38 @@ func TestHandleNotifySplitRequestRejectsStaleWorkerIDUnderLedgerLock(t *testing.
 	})
 }
 
+func TestHandleArchiveTaskAlreadyArchivedIsIdempotent(t *testing.T) {
+	dir := t.TempDir()
+	l := ledger.NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
+	if err := l.Add(ledger.Task{ID: "task-001", Title: "Done", Status: "completed"}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if err := l.Archive("task-001", "abc123"); err != nil {
+		t.Fatalf("Archive: %v", err)
+	}
+
+	deps := &Deps{
+		Ledger:   l,
+		Registry: worker.NewRegistry(),
+		Config: &config.Config{
+			Project: config.ProjectConfig{
+				Slug:         "proj",
+				RepoPath:     dir,
+				WorktreeBase: dir,
+			},
+		},
+	}
+
+	got, err := handleArchiveTask(deps)(context.Background(), map[string]any{"id": "task-001"})
+	if err != nil {
+		t.Fatalf("handleArchiveTask already archived: %v", err)
+	}
+	archived, ok := got.(map[string]any)["archived"].(string)
+	if !ok || archived != "task-001" {
+		t.Fatalf("handleArchiveTask result = %#v, want archived task-001", got)
+	}
+}
+
 func testHandleNotifyRejectsStaleWorkerID(t *testing.T, notifyType string, extraPayload map[string]any) {
 	t.Helper()
 	dir := t.TempDir()

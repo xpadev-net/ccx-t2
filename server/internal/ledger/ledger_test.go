@@ -339,6 +339,44 @@ func TestArchiveIdempotentRecovery(t *testing.T) {
 	}
 }
 
+func TestArchiveAlreadyArchivedTaskIsIdempotent(t *testing.T) {
+	dir := t.TempDir()
+	archiveDir := filepath.Join(dir, "archive")
+	l := NewLedger(filepath.Join(dir, "ledger.md"), archiveDir)
+
+	if err := l.Add(Task{ID: "task-001", Title: "Do thing", Status: "completed", Body: "body"}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if err := l.Archive("task-001", "abc123"); err != nil {
+		t.Fatalf("first Archive: %v", err)
+	}
+	if err := l.Archive("task-001", "abc123"); err != nil {
+		t.Fatalf("second Archive for already archived task: %v", err)
+	}
+}
+
+func TestArchiveAlreadyArchivedRequiresExactID(t *testing.T) {
+	dir := t.TempDir()
+	archiveDir := filepath.Join(dir, "archive")
+	if err := os.MkdirAll(archiveDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(archiveDir, "task-20260607-0001-title.md"), []byte("content"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	l := NewLedger(filepath.Join(dir, "ledger.md"), archiveDir)
+	if err := l.Archive("task-20260607", ""); err == nil {
+		t.Fatal("Archive partial archived ID error = nil, want task not found")
+	}
+	if l.IsArchived("task-20260607") {
+		t.Fatal("IsArchived(partial ID) = true, want false")
+	}
+	if !l.IsArchived("task-20260607-0001") {
+		t.Fatal("IsArchived(exact ID) = false, want true")
+	}
+}
+
 // ---- GenerateID tests ----
 
 func TestGenerateIDUnique(t *testing.T) {
@@ -382,6 +420,29 @@ func TestGenerateIDNoConflictWithArchive(t *testing.T) {
 	}
 	if id == existingID {
 		t.Errorf("GenerateID returned conflicting ID %s", id)
+	}
+}
+
+func TestAddNewNoConflictWithArchive(t *testing.T) {
+	dir := t.TempDir()
+	archiveDir := filepath.Join(dir, "archive")
+	if err := os.MkdirAll(archiveDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+
+	date := time.Now().Format("20060102")
+	existingID := "task-" + date + "-0001"
+	if err := os.WriteFile(filepath.Join(archiveDir, existingID+"-archived.md"), []byte("content"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	l := NewLedger(filepath.Join(dir, "ledger.md"), archiveDir)
+	id, err := l.AddNew(Task{Title: "New", Status: "unstarted"})
+	if err != nil {
+		t.Fatalf("AddNew: %v", err)
+	}
+	if id == existingID {
+		t.Errorf("AddNew returned archived ID %s", id)
 	}
 }
 

@@ -415,6 +415,10 @@ func handleArchiveTask(deps *Deps) ToolHandler {
 			}
 		}
 		if t == nil {
+			if deps.Ledger.IsArchived(id) {
+				cleanupArchivedTaskResources(deps, id, "")
+				return map[string]any{"archived": id}, nil
+			}
 			return nil, fmt.Errorf("task not found: %s", id)
 		}
 		if t.Status != "completed" {
@@ -428,15 +432,7 @@ func handleArchiveTask(deps *Deps) ToolHandler {
 			return nil, err
 		}
 
-		// Best-effort cleanup: remove worktree (may still exist if the server
-		// crashed between notify(completed) and the worktree.Remove call) and
-		// delete the git branch.
-		wPath := filepath.Join(deps.Config.Project.WorktreeBase,
-			deps.Config.Project.Slug+"-"+id)
-		_ = worktree.Remove(deps.Config.Project.RepoPath, wPath)
-		if t.Branch != "" {
-			_ = exec.Command("git", "-C", deps.Config.Project.RepoPath, "branch", "-D", t.Branch).Run()
-		}
+		cleanupArchivedTaskResources(deps, id, t.Branch)
 
 		return map[string]any{"archived": id}, nil
 	}
@@ -445,6 +441,15 @@ func handleArchiveTask(deps *Deps) ToolHandler {
 func handleListHarnesses(deps *Deps) ToolHandler {
 	return func(ctx context.Context, args map[string]any) (any, error) {
 		return harness.List(deps.Config), nil
+	}
+}
+
+func cleanupArchivedTaskResources(deps *Deps, taskID, branch string) {
+	wPath := filepath.Join(deps.Config.Project.WorktreeBase,
+		deps.Config.Project.Slug+"-"+taskID)
+	_ = worktree.Remove(deps.Config.Project.RepoPath, wPath)
+	if branch != "" {
+		_ = exec.Command("git", "-C", deps.Config.Project.RepoPath, "branch", "-D", branch).Run()
 	}
 }
 
