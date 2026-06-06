@@ -590,15 +590,20 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 		}
 
 		// Step 5: Send task prompt (best-effort — worker is already running).
+		// If this fails, include prompt_sent:false in the response so the orchestrator
+		// knows to call followup_worker to deliver the task description.
 		prompt := buildWorkerPrompt(task, taskID, branch, allowedFiles, forbiddenFiles,
 			worktreePath, deps.Config.Project.ValidationCommand)
+		promptSent := true
 		if err := tmux.SendKeys(deps.Session, workerID, prompt); err != nil {
 			log.Printf("warn: send task prompt: %v", err)
+			promptSent = false
 		}
 
 		return map[string]any{
 			"worker_id":     workerID,
 			"worktree_path": worktreePath,
+			"prompt_sent":   promptSent,
 		}, nil
 	}
 }
