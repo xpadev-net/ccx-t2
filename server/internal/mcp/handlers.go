@@ -288,14 +288,17 @@ func handleSplitTask(deps *Deps) ToolHandler {
 			allowedFiles   []string
 			forbiddenFiles []string
 		}
-		children := make([]childTask, 0, len(slicesAny))
+		// Validate all slices before allocating IDs.
+		type pendingSlice struct {
+			title, desc    string
+			allowed, forbidden []string
+		}
+		pending := make([]pendingSlice, 0, len(slicesAny))
 		for _, s := range slicesAny {
 			sliceMap, ok := s.(map[string]any)
 			if !ok {
 				return nil, fmt.Errorf("each slice must be an object")
 			}
-			childTitle, _ := sliceMap["title"].(string)
-			childDesc, _ := sliceMap["description"].(string)
 			childAllowed, _ := stringSliceArg(sliceMap, "allowed_files")
 			childForbidden, _ := stringSliceArg(sliceMap, "forbidden_files")
 			if err := ledger.ValidatePaths(childAllowed); err != nil {
@@ -304,24 +307,33 @@ func handleSplitTask(deps *Deps) ToolHandler {
 			if err := ledger.ValidatePaths(childForbidden); err != nil {
 				return nil, fmt.Errorf("slice forbidden_files: %w", err)
 			}
-			childID, err := deps.Ledger.GenerateID()
-			if err != nil {
-				return nil, err
-			}
-			children = append(children, childTask{
-				id:             childID,
-				title:          childTitle,
-				desc:           childDesc,
-				allowedFiles:   childAllowed,
-				forbiddenFiles: childForbidden,
+			pending = append(pending, pendingSlice{
+				title:   sliceMap["title"].(string),
+				desc:    func() string { s, _ := sliceMap["description"].(string); return s }(),
+				allowed: childAllowed, forbidden: childForbidden,
 			})
+		}
+		// Generate all IDs in one read pass — loop GenerateID would return
+		// duplicate IDs because the IDs are not on-disk until AddAll.
+		childIDs, err := deps.Ledger.GenerateIDs(len(pending))
+		if err != nil {
+			return nil, err
+		}
+		children := make([]childTask, len(pending))
+		for i, p := range pending {
+			children[i] = childTask{
+				id:             childIDs[i],
+				title:          p.title,
+				desc:           p.desc,
+				allowedFiles:   p.allowed,
+				forbiddenFiles: p.forbidden,
+			}
 		}
 
 		// Atomically add all children first — if AddAll fails, the parent's
 		// status is unchanged and the worker (if any) is still running, so
 		// the caller can retry split_task without manual recovery.
 		childTasks := make([]ledger.Task, len(children))
-		childIDs := make([]string, len(children))
 		for i, c := range children {
 			childTasks[i] = ledger.Task{
 				ID:             c.id,
@@ -744,12 +756,16 @@ func handleNotify(deps *Deps) ToolHandler {
 				return nil, fmt.Errorf("proposed_slices must not be empty for split_request")
 			}
 
-			// Validate and build children before any mutations.
+			// Validate all slices before allocating IDs.
 			type srChild struct {
 				id, title, desc    string
 				allowed, forbidden []string
 			}
-			srChildren := make([]srChild, 0, len(proposedSlices))
+			type pendingSR struct {
+				title, desc        string
+				allowed, forbidden []string
+			}
+			pendingSRs := make([]pendingSR, 0, len(proposedSlices))
 			for i, s := range proposedSlices {
 				sliceMap, ok := s.(map[string]any)
 				if !ok {
@@ -763,19 +779,28 @@ func handleNotify(deps *Deps) ToolHandler {
 				if err := ledger.ValidatePaths(childForbidden); err != nil {
 					return nil, fmt.Errorf("proposed_slices[%d] forbidden_files: %w", i, err)
 				}
-				childID, err := deps.Ledger.GenerateID()
-				if err != nil {
-					return nil, err
-				}
 				childTitle, _ := sliceMap["title"].(string)
 				childDesc, _ := sliceMap["description"].(string)
-				srChildren = append(srChildren, srChild{
-					id: childID, title: childTitle, desc: childDesc,
+				pendingSRs = append(pendingSRs, pendingSR{
+					title: childTitle, desc: childDesc,
 					allowed: childAllowed, forbidden: childForbidden,
 				})
 			}
-			if len(srChildren) == 0 {
+			if len(pendingSRs) == 0 {
 				return nil, fmt.Errorf("proposed_slices produced no valid child tasks")
+			}
+			// Generate all IDs in one read pass (loop GenerateID returns duplicates
+			// since IDs are not on-disk yet).
+			srIDs, err := deps.Ledger.GenerateIDs(len(pendingSRs))
+			if err != nil {
+				return nil, err
+			}
+			srChildren := make([]srChild, len(pendingSRs))
+			for i, p := range pendingSRs {
+				srChildren[i] = srChild{
+					id: srIDs[i], title: p.title, desc: p.desc,
+					allowed: p.allowed, forbidden: p.forbidden,
+				}
 			}
 
 			// Atomically add all children before marking parent split.

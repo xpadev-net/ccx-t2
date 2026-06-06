@@ -386,6 +386,58 @@ func (l *Ledger) GenerateID() (string, error) {
 	return l.generateID()
 }
 
+// GenerateIDs generates n unique task IDs in a single read pass.
+// All IDs are distinct from each other and from existing ledger/archive IDs.
+// Callers generating IDs for multiple tasks must use this method instead of
+// calling GenerateID in a loop, which would return the same ID each time
+// (since the IDs are not on-disk yet when the next call reads the ledger).
+func (l *Ledger) GenerateIDs(n int) ([]string, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.generateIDs(n)
+}
+
+func (l *Ledger) generateIDs(n int) ([]string, error) {
+	if n <= 0 {
+		return nil, nil
+	}
+	tasks, err := l.load()
+	if err != nil {
+		return nil, err
+	}
+
+	existing := make(map[string]bool)
+	for _, t := range tasks {
+		existing[t.ID] = true
+	}
+	if entries, err := os.ReadDir(l.archiveDir); err == nil {
+		for _, e := range entries {
+			name := e.Name()
+			if strings.HasSuffix(name, ".md") {
+				parts := strings.SplitN(name, "-", 4)
+				if len(parts) >= 3 {
+					candidate := strings.TrimSuffix(strings.Join(parts[:3], "-"), ".md")
+					existing[candidate] = true
+				}
+			}
+		}
+	}
+
+	date := time.Now().Format("20060102")
+	ids := make([]string, 0, n)
+	for seq := 1; seq <= 9999 && len(ids) < n; seq++ {
+		id := fmt.Sprintf("task-%s-%04d", date, seq)
+		if !existing[id] {
+			ids = append(ids, id)
+			existing[id] = true // reserve for subsequent iterations
+		}
+	}
+	if len(ids) < n {
+		return nil, fmt.Errorf("could not generate %d unique task IDs for date %s", n, date)
+	}
+	return ids, nil
+}
+
 func (l *Ledger) generateID() (string, error) {
 	tasks, err := l.load()
 	if err != nil {
