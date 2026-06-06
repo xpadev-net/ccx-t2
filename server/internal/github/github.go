@@ -121,7 +121,7 @@ func normalizeCheckStatus(run *gh.CheckRun) CheckStatus {
 		return CheckFailure
 	}
 	switch status {
-	case "queued", "in_progress":
+	case "queued", "in_progress", "waiting", "requested", "pending":
 		return CheckPending
 	}
 	// Unknown conclusion+status combination — treat as failure so the orchestrator
