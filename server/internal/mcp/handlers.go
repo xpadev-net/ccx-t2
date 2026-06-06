@@ -483,10 +483,20 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 		}
 
 		// Check branch uniqueness via literal name lookup (not glob).
-		out, _ := exec.Command("git", "-C", deps.Config.Project.RepoPath,
-			"rev-parse", "--verify", "refs/heads/"+branch).Output()
+		// rev-parse --verify exits non-zero when the ref does not exist,
+		// so a non-empty output means the branch exists; other errors
+		// (not a git repo, corrupt objects) are surfaced directly.
+		cmd := exec.Command("git", "-C", deps.Config.Project.RepoPath,
+			"rev-parse", "--verify", "refs/heads/"+branch)
+		out, gitErr := cmd.Output()
 		if strings.TrimSpace(string(out)) != "" {
 			return nil, fmt.Errorf("branch %q already exists", branch)
+		}
+		if gitErr != nil {
+			// Exit code 128 means "ref not found" — expected when branch is new.
+			if exitErr, ok := gitErr.(*exec.ExitError); !ok || exitErr.ExitCode() != 128 {
+				return nil, fmt.Errorf("check branch existence: %w", gitErr)
+			}
 		}
 
 		// Build paths.
@@ -703,7 +713,7 @@ func handleNotify(deps *Deps) ToolHandler {
 		}
 		if task.Status != "in_progress" && task.Status != "blocked" {
 			// Silently ignore notifications for non-active tasks.
-			fmt.Printf("warn: notify %s for task %s with status %q — ignored\n",
+			log.Printf("warn: notify %s for task %s with status %q — ignored",
 				notifyType, taskID, task.Status)
 			return map[string]any{"ignored": true}, nil
 		}

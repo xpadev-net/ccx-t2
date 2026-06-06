@@ -150,6 +150,12 @@ func (l *Ledger) Add(task Task) error {
 		l.mu.Unlock()
 		return err
 	}
+	for _, t := range tasks {
+		if t.ID == task.ID {
+			l.mu.Unlock()
+			return fmt.Errorf("task ID already exists: %s", task.ID)
+		}
+	}
 	task.UpdatedAt = time.Now().Format(time.RFC3339)
 	tasks = append(tasks, task)
 	err = l.save(tasks)
@@ -171,9 +177,19 @@ func (l *Ledger) AddAll(newTasks []Task) error {
 		l.mu.Unlock()
 		return err
 	}
+	// Build a set of existing IDs (including IDs within newTasks) to detect duplicates.
+	existing := make(map[string]bool, len(tasks)+len(newTasks))
+	for _, t := range tasks {
+		existing[t.ID] = true
+	}
 	now := time.Now().Format(time.RFC3339)
 	stamped := make([]Task, len(newTasks))
 	for i, t := range newTasks {
+		if existing[t.ID] {
+			l.mu.Unlock()
+			return fmt.Errorf("task ID already exists: %s", t.ID)
+		}
+		existing[t.ID] = true
 		t.UpdatedAt = now
 		stamped[i] = t
 	}
