@@ -502,19 +502,21 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 		}
 
 		// Check branch uniqueness via literal name lookup (not glob).
-		// rev-parse --verify exits non-zero when the ref does not exist,
-		// so a non-empty output means the branch exists; other errors
-		// (not a git repo, corrupt objects) are surfaced directly.
-		cmd := exec.Command("git", "-C", deps.Config.Project.RepoPath,
-			"rev-parse", "--verify", "refs/heads/"+branch)
-		out, gitErr := cmd.Output()
-		if strings.TrimSpace(string(out)) != "" {
-			return nil, fmt.Errorf("branch %q already exists", branch)
-		}
-		if gitErr != nil {
-			// Exit code 128 means "ref not found" — expected when branch is new.
-			if exitErr, ok := gitErr.(*exec.ExitError); !ok || exitErr.ExitCode() != 128 {
-				return nil, fmt.Errorf("check branch existence: %w", gitErr)
+		// Check gitErr first: exit 0 means found, exit 128 means not found,
+		// any other error means a real git failure.
+		{
+			cmd := exec.Command("git", "-C", deps.Config.Project.RepoPath,
+				"rev-parse", "--verify", "refs/heads/"+branch)
+			out, gitErr := cmd.Output()
+			if gitErr != nil {
+				exitErr, ok := gitErr.(*exec.ExitError)
+				if !ok || exitErr.ExitCode() != 128 {
+					return nil, fmt.Errorf("check branch existence: %w", gitErr)
+				}
+				// Exit 128 = ref not found; branch is available.
+			} else if strings.TrimSpace(string(out)) != "" {
+				// Exit 0 with output = branch already exists.
+				return nil, fmt.Errorf("branch %q already exists", branch)
 			}
 		}
 
@@ -578,10 +580,12 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 			_ = worktree.Remove(repoPath, worktreePath)
 			_ = exec.Command("git", "-C", repoPath, "branch", "-D", branch).Run()
 			_ = deps.Ledger.Update(taskID, map[string]any{
-				"status":    "unstarted",
-				"worker_id": "",
-				"branch":    "",
-				"harness":   "",
+				"status":          "unstarted",
+				"worker_id":       "",
+				"branch":          "",
+				"harness":         "",
+				"allowed_files":   []string(nil),
+				"forbidden_files": []string(nil),
 			})
 			deps.Registry.Remove(workerID)
 			return nil, fmt.Errorf("send harness command: %w", err)

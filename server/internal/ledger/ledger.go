@@ -220,11 +220,16 @@ func (l *Ledger) DeleteTasks(ids []string) error {
 	for _, id := range ids {
 		del[id] = true
 	}
-	remaining := tasks[:0]
+	remaining := make([]Task, 0, len(tasks))
 	for _, t := range tasks {
 		if !del[t.ID] {
 			remaining = append(remaining, t)
 		}
+	}
+	if len(remaining) == len(tasks) {
+		// Nothing to delete.
+		l.mu.Unlock()
+		return nil
 	}
 	err = l.save(remaining)
 	onChange := l.onChange

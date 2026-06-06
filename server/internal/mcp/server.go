@@ -70,8 +70,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if s.secret != "" {
-		auth := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if subtle.ConstantTimeCompare([]byte(auth), []byte(s.secret)) != 1 {
+		hdr := r.Header.Get("Authorization")
+		if !strings.HasPrefix(hdr, "Bearer ") {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		token := hdr[len("Bearer "):]
+		if subtle.ConstantTimeCompare([]byte(token), []byte(s.secret)) != 1 {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
