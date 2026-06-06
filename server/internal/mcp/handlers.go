@@ -521,6 +521,7 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 		// Step 2: Create tmux window.
 		if err := tmux.CreateWindow(deps.Session, workerID, worktreePath); err != nil {
 			_ = worktree.Remove(repoPath, worktreePath)
+			_ = exec.Command("git", "-C", repoPath, "branch", "-D", branch).Run()
 			return nil, fmt.Errorf("create tmux window: %w", err)
 		}
 
@@ -536,6 +537,7 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 		if updateErr != nil {
 			_ = tmux.KillWindow(deps.Session, workerID)
 			_ = worktree.Remove(repoPath, worktreePath)
+			_ = exec.Command("git", "-C", repoPath, "branch", "-D", branch).Run()
 			return nil, fmt.Errorf("update ledger: %w", updateErr)
 		}
 
