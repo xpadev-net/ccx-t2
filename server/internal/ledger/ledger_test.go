@@ -385,6 +385,95 @@ func TestGenerateIDNoConflictWithArchive(t *testing.T) {
 	}
 }
 
+func TestUpdateIfStatusesReturnPrevReturnsSnapshotAndRejectsDisallowedStatus(t *testing.T) {
+	dir := t.TempDir()
+	l := NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
+
+	if err := l.Add(Task{
+		ID:       "task-001",
+		Title:    "Before",
+		Status:   "in_progress",
+		WorkerID: "worker-old",
+	}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	prev, err := l.UpdateIfStatusesReturnPrev("task-001", []string{"in_progress"}, map[string]any{
+		"status":    "completed",
+		"title":     "After",
+		"worker_id": "",
+	})
+	if err != nil {
+		t.Fatalf("UpdateIfStatusesReturnPrev: %v", err)
+	}
+	if prev.Status != "in_progress" || prev.WorkerID != "worker-old" || prev.Title != "Before" {
+		t.Fatalf("prev snapshot mismatch: %#v", prev)
+	}
+
+	if _, err := l.UpdateIfStatusesReturnPrev("task-001", []string{"in_progress"}, map[string]any{
+		"status": "blocked",
+	}); err == nil {
+		t.Fatal("UpdateIfStatusesReturnPrev with disallowed status error = nil, want error")
+	}
+
+	tasks, err := l.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if tasks[0].Status != "completed" || tasks[0].Title != "After" {
+		t.Fatalf("task changed after rejected update or first update failed: %#v", tasks[0])
+	}
+}
+
+func TestUpdateIfStatusesReturnPrevWithComputesFieldsFromCurrentSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	l := NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
+
+	if err := l.Add(Task{
+		ID:     "task-001",
+		Title:  "Task",
+		Status: "in_progress",
+		Body:   "current body",
+	}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	prev, err := l.UpdateIfStatusesReturnPrevWith("task-001", []string{"in_progress"}, func(current Task) (map[string]any, error) {
+		if current.Body != "current body" {
+			t.Fatalf("updater saw body %q, want current body", current.Body)
+		}
+		return map[string]any{
+			"status": "completed",
+			"body":   current.Body + "\n<!-- merge_commit: abc123 -->",
+		}, nil
+	})
+	if err != nil {
+		t.Fatalf("UpdateIfStatusesReturnPrevWith: %v", err)
+	}
+	if prev.Body != "current body" || prev.Status != "in_progress" {
+		t.Fatalf("prev snapshot mismatch: %#v", prev)
+	}
+
+	called := false
+	if _, err := l.UpdateIfStatusesReturnPrevWith("task-001", []string{"in_progress"}, func(current Task) (map[string]any, error) {
+		called = true
+		return map[string]any{"status": "blocked"}, nil
+	}); err == nil {
+		t.Fatal("UpdateIfStatusesReturnPrevWith disallowed status error = nil, want error")
+	}
+	if called {
+		t.Fatal("updater was called for disallowed status")
+	}
+
+	tasks, err := l.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if tasks[0].Body != "current body\n<!-- merge_commit: abc123 -->" {
+		t.Fatalf("body mismatch: %q", tasks[0].Body)
+	}
+}
+
 // ---- FrontMatter field order test ----
 
 func TestIDFirstInFrontMatter(t *testing.T) {

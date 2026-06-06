@@ -808,25 +808,32 @@ func handleNotify(deps *Deps) ToolHandler {
 			prURL, _ := payload["pr_url"].(string)
 			mergeCommit, _ := payload["merge_commit"].(string)
 
-			fields := map[string]any{
-				"status":    "completed",
-				"pr_url":    prURL,
-				"worker_id": "",
-				"harness":   "",
-			}
-			if mergeCommit != "" {
-				// Append merge_commit comment to body so archive_task can read it.
-				// Avoid a leading newline when body is empty.
-				comment := "<!-- merge_commit: " + mergeCommit + " -->"
-				var body string
-				if task.Body == "" {
-					body = comment
-				} else {
-					body = task.Body + "\n" + comment
-				}
-				fields["body"] = body
-			}
-			if err := deps.Ledger.UpdateIfStatuses(taskID, []string{"in_progress", "blocked"}, fields); err != nil {
+			prevTask, err := deps.Ledger.UpdateIfStatusesReturnPrevWith(taskID, []string{"in_progress", "blocked"},
+				func(current ledger.Task) (map[string]any, error) {
+					if callerWorkerID != "" && current.WorkerID != callerWorkerID {
+						return nil, fmt.Errorf("worker %q is not assigned to task %s (assigned to %q)",
+							callerWorkerID, taskID, current.WorkerID)
+					}
+					fields := map[string]any{
+						"status":    "completed",
+						"pr_url":    prURL,
+						"worker_id": "",
+						"harness":   "",
+					}
+					if mergeCommit != "" {
+						// Append merge_commit comment to body so archive_task can read it.
+						// Avoid a leading newline when body is empty.
+						comment := "<!-- merge_commit: " + mergeCommit + " -->"
+						if current.Body == "" {
+							fields["body"] = comment
+						} else {
+							fields["body"] = current.Body + "\n" + comment
+						}
+					}
+					return fields, nil
+				},
+			)
+			if err != nil {
 				return nil, err
 			}
 
@@ -835,7 +842,7 @@ func handleNotify(deps *Deps) ToolHandler {
 			// front matter and then delete it. If archive_task is never called the
 			// branch will be orphaned, but that matches the spec's deferred-deletion
 			// design for completed tasks.
-			wid := task.WorkerID
+			wid := prevTask.WorkerID
 			if wid == "" {
 				wid = "worker-" + taskID // fallback
 			}
@@ -847,11 +854,19 @@ func handleNotify(deps *Deps) ToolHandler {
 
 		case "blocked":
 			reason, _ := payload["reason"].(string)
-			fields := map[string]any{"status": "blocked"}
-			if reason != "" {
-				fields["reason"] = reason
-			}
-			if err := deps.Ledger.UpdateIfStatuses(taskID, []string{"in_progress", "blocked"}, fields); err != nil {
+			if _, err := deps.Ledger.UpdateIfStatusesReturnPrevWith(taskID, []string{"in_progress", "blocked"},
+				func(current ledger.Task) (map[string]any, error) {
+					if callerWorkerID != "" && current.WorkerID != callerWorkerID {
+						return nil, fmt.Errorf("worker %q is not assigned to task %s (assigned to %q)",
+							callerWorkerID, taskID, current.WorkerID)
+					}
+					fields := map[string]any{"status": "blocked"}
+					if reason != "" {
+						fields["reason"] = reason
+					}
+					return fields, nil
+				},
+			); err != nil {
 				return nil, err
 			}
 
@@ -928,30 +943,28 @@ func handleNotify(deps *Deps) ToolHandler {
 			}
 
 			// Update parent to split after children are safely written.
-			// Use UpdateReturnPrev to detect if a concurrent notify(completed)
-			// won the race and already moved the task to a terminal state.
 			srChildIDs := make([]string, len(srChildren))
 			for i, c := range srChildren {
 				srChildIDs[i] = c.id
 			}
-			prevTask, updateErr := deps.Ledger.UpdateReturnPrev(taskID, map[string]any{
-				"status":    "split",
-				"worker_id": "",
-				"branch":    "",
-				"harness":   "",
-				"reason":    reason,
-			})
+			prevTask, updateErr := deps.Ledger.UpdateIfStatusesReturnPrevWith(taskID, []string{"in_progress", "blocked"},
+				func(current ledger.Task) (map[string]any, error) {
+					if callerWorkerID != "" && current.WorkerID != callerWorkerID {
+						return nil, fmt.Errorf("worker %q is not assigned to task %s (assigned to %q)",
+							callerWorkerID, taskID, current.WorkerID)
+					}
+					return map[string]any{
+						"status":    "split",
+						"worker_id": "",
+						"branch":    "",
+						"harness":   "",
+						"reason":    reason,
+					}, nil
+				},
+			)
 			if updateErr != nil {
 				_ = deps.Ledger.DeleteTasks(srChildIDs)
 				return nil, updateErr
-			}
-			// Also guard "unstarted": a concurrent stop_worker may have reset the task
-			// between the preflight check and UpdateReturnPrev, leaving prevTask.WorkerID
-			// empty and cleanup a no-op while children are permanently orphaned.
-			switch prevTask.Status {
-			case "completed", "split", "unstarted":
-				_ = deps.Ledger.DeleteTasks(srChildIDs)
-				return nil, fmt.Errorf("cannot split task %s: it reached status %q concurrently", taskID, prevTask.Status)
 			}
 
 			// Cleanup resources using prevTask snapshot (not stale task load) so that
@@ -1071,7 +1084,7 @@ func rollbackSpawnAfterLedgerUpdate(deps *Deps, workerID, branch, taskID, repoPa
 		"branch":    "",
 		"harness":   "",
 	}); rollbackErr != nil {
-		log.Printf("error: spawn_worker rollback failed for task %s: %v — task may be stuck in_progress", taskID, rollbackErr)
+		log.Printf("warn: spawn_worker ledger rollback skipped for task %s: %v (concurrent modification already resolved the state)", taskID, rollbackErr)
 	}
 	deps.Registry.Remove(workerID)
 }

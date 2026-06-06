@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	shellquote "github.com/kballard/go-shellquote"
 	"gopkg.in/yaml.v3"
 )
 
@@ -189,6 +190,9 @@ func validateHarness(cfg *Config, name string, checkBinary bool) error {
 	}
 	if !strings.Contains(h.McpArgs, "{url}") {
 		return fmt.Errorf("mcp_args must contain the {url} placeholder")
+	}
+	if _, err := shellquote.Split(h.McpArgs); err != nil {
+		return fmt.Errorf("mcp_args has invalid shell syntax: %w", err)
 	}
 	if cfg.Server.McpSecret != "" && !strings.Contains(h.McpArgs, "{secret}") {
 		return fmt.Errorf("mcp_secret is configured but mcp_args does not contain {secret}; the harness will receive 401 on every MCP call")

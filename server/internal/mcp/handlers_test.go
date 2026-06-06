@@ -1,13 +1,17 @@
 package mcp
 
 import (
+	"context"
 	"os/exec"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 
 	shellquote "github.com/kballard/go-shellquote"
+	"github.com/xpadev/ccx-t2/internal/config"
 	"github.com/xpadev/ccx-t2/internal/ledger"
+	"github.com/xpadev/ccx-t2/internal/worker"
 )
 
 func TestBuildHarnessCommandPreservesExpandedMCPValuesAsSingleArgs(t *testing.T) {
@@ -101,6 +105,88 @@ func TestBuildWorkerPromptFromTaskUsesTaskRestrictions(t *testing.T) {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("prompt does not contain %q:\n%s", want, prompt)
 		}
+	}
+}
+
+func TestHandleNotifyCompletedRejectsStaleWorkerIDUnderLedgerLock(t *testing.T) {
+	testHandleNotifyRejectsStaleWorkerID(t, "completed", map[string]any{
+		"pr_url":       "https://example.test/pr/1",
+		"merge_commit": "abc123",
+	})
+}
+
+func TestHandleNotifyBlockedRejectsStaleWorkerIDUnderLedgerLock(t *testing.T) {
+	testHandleNotifyRejectsStaleWorkerID(t, "blocked", map[string]any{
+		"reason": "blocked",
+	})
+}
+
+func TestHandleNotifySplitRequestRejectsStaleWorkerIDUnderLedgerLock(t *testing.T) {
+	testHandleNotifyRejectsStaleWorkerID(t, "split_request", map[string]any{
+		"reason": "split",
+		"proposed_slices": []any{
+			map[string]any{
+				"title":         "Child",
+				"allowed_files": []any{"server/internal/mcp"},
+			},
+		},
+	})
+}
+
+func testHandleNotifyRejectsStaleWorkerID(t *testing.T, notifyType string, extraPayload map[string]any) {
+	t.Helper()
+	dir := t.TempDir()
+	l := ledger.NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
+	if err := l.Add(ledger.Task{
+		ID:       "task-001",
+		Title:    "Task",
+		Status:   "in_progress",
+		WorkerID: "worker-current",
+		Body:     "current body",
+	}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	deps := &Deps{
+		Ledger:   l,
+		Registry: worker.NewRegistry(),
+		Config: &config.Config{
+			Project: config.ProjectConfig{
+				Slug:         "proj",
+				RepoPath:     dir,
+				WorktreeBase: dir,
+			},
+		},
+		Session: "missing-session",
+	}
+
+	payload := map[string]any{
+		"task_id":   "task-001",
+		"worker_id": "worker-stale",
+	}
+	for k, v := range extraPayload {
+		payload[k] = v
+	}
+	_, err := handleNotify(deps)(context.Background(), map[string]any{
+		"type":    notifyType,
+		"payload": payload,
+	})
+	if err == nil {
+		t.Fatalf("handleNotify(%s) error = nil, want stale worker ownership error", notifyType)
+	}
+	if !strings.Contains(err.Error(), "worker \"worker-stale\" is not assigned") {
+		t.Fatalf("handleNotify(%s) error = %v, want stale worker ownership error", notifyType, err)
+	}
+
+	tasks, err := l.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if tasks[0].Status != "in_progress" || tasks[0].Body != "current body" || tasks[0].WorkerID != "worker-current" {
+		t.Fatalf("task changed after stale notify rejection: %#v", tasks[0])
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("stale notify left child tasks behind: %#v", tasks)
 	}
 }
 

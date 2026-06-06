@@ -31,8 +31,8 @@ type Task struct {
 
 // Ledger manages the task ledger file.
 type Ledger struct {
-	mu       sync.Mutex
-	filePath string
+	mu         sync.Mutex
+	filePath   string
 	archiveDir string
 	// onChange is called whenever the ledger is modified.
 	onChange func()
@@ -287,11 +287,28 @@ func (l *Ledger) UpdateIfStatus(id, expectedStatus string, fields map[string]any
 // in the allowedStatuses list. Returns an error if the current status is not
 // in the allowed set.
 func (l *Ledger) UpdateIfStatuses(id string, allowedStatuses []string, fields map[string]any) error {
+	_, err := l.UpdateIfStatusesReturnPrev(id, allowedStatuses, fields)
+	return err
+}
+
+// UpdateIfStatusesReturnPrev modifies task fields only when the current status
+// is in the allowed set, and returns the pre-update snapshot under the same lock.
+func (l *Ledger) UpdateIfStatusesReturnPrev(id string, allowedStatuses []string, fields map[string]any) (prev Task, err error) {
+	return l.UpdateIfStatusesReturnPrevWith(id, allowedStatuses, func(current Task) (map[string]any, error) {
+		return fields, nil
+	})
+}
+
+// UpdateIfStatusesReturnPrevWith computes and applies task fields only when the
+// current status is in the allowed set. The updater receives the current task
+// snapshot under the ledger lock, and the method returns that same pre-update
+// snapshot.
+func (l *Ledger) UpdateIfStatusesReturnPrevWith(id string, allowedStatuses []string, updater func(Task) (map[string]any, error)) (prev Task, err error) {
 	l.mu.Lock()
 	tasks, err := l.load()
 	if err != nil {
 		l.mu.Unlock()
-		return err
+		return Task{}, err
 	}
 	found := false
 	for i := range tasks {
@@ -309,19 +326,25 @@ func (l *Ledger) UpdateIfStatuses(id string, allowedStatuses []string, fields ma
 		}
 		if !allowed {
 			l.mu.Unlock()
-			return fmt.Errorf("task %s status is %q, not in allowed set %v", id, current, allowedStatuses)
+			return Task{}, fmt.Errorf("task %s status is %q, not in allowed set %v", id, current, allowedStatuses)
+		}
+		prev = tasks[i]
+		fields, err := updater(prev)
+		if err != nil {
+			l.mu.Unlock()
+			return Task{}, err
 		}
 		t := &tasks[i]
 		if err := applyFields(t, fields); err != nil {
 			l.mu.Unlock()
-			return err
+			return Task{}, err
 		}
 		t.UpdatedAt = time.Now().Format(time.RFC3339)
 		break
 	}
 	if !found {
 		l.mu.Unlock()
-		return fmt.Errorf("task not found: %s", id)
+		return Task{}, fmt.Errorf("task not found: %s", id)
 	}
 	err = l.save(tasks)
 	onChange := l.onChange
@@ -329,7 +352,7 @@ func (l *Ledger) UpdateIfStatuses(id string, allowedStatuses []string, fields ma
 	if err == nil && onChange != nil {
 		onChange()
 	}
-	return err
+	return prev, err
 }
 
 // UpdateReturnPrev applies the field update and returns a snapshot of the task
