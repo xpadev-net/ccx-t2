@@ -172,6 +172,9 @@ func validateHarness(cfg *Config, name string, checkBinary bool) error {
 	if !strings.Contains(h.McpArgs, "{url}") {
 		return fmt.Errorf("mcp_args must contain the {url} placeholder")
 	}
+	if cfg.Server.McpSecret != "" && !strings.Contains(h.McpArgs, "{secret}") {
+		return fmt.Errorf("mcp_secret is configured but mcp_args does not contain {secret}; workers will receive 401 on every notify call")
+	}
 	if checkBinary {
 		if _, err := exec.LookPath(h.Command); err != nil {
 			return fmt.Errorf("binary %q not found in PATH: %w", h.Command, err)

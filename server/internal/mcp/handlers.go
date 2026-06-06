@@ -307,9 +307,14 @@ func handleSplitTask(deps *Deps) ToolHandler {
 			if err := ledger.ValidatePaths(childForbidden); err != nil {
 				return nil, fmt.Errorf("slice forbidden_files: %w", err)
 			}
+			childTitle, _ := sliceMap["title"].(string)
+			if childTitle == "" {
+				return nil, fmt.Errorf("slice %d: title is required", len(pending))
+			}
+			childDesc, _ := sliceMap["description"].(string)
 			pending = append(pending, pendingSlice{
-				title:   sliceMap["title"].(string),
-				desc:    func() string { s, _ := sliceMap["description"].(string); return s }(),
+				title:   childTitle,
+				desc:    childDesc,
 				allowed: childAllowed, forbidden: childForbidden,
 			})
 		}
