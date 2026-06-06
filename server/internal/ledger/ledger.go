@@ -165,10 +165,15 @@ func (l *Ledger) AddNew(task Task) (string, error) {
 	err = l.save(tasks)
 	onChange := l.onChange
 	l.mu.Unlock()
-	if err == nil && onChange != nil {
+	if err != nil {
+		// Return empty id on save failure so callers cannot reference an
+		// ID that was never persisted to disk.
+		return "", err
+	}
+	if onChange != nil {
 		onChange()
 	}
-	return id, err
+	return id, nil
 }
 
 // Add appends a new task to the ledger with updated_at set to now.

@@ -274,9 +274,9 @@ func arrayProp(itemType, description string) map[string]any {
 // {url} is replaced with the MCP endpoint URL.
 // {secret} is replaced with the optional shared secret (empty if not configured).
 func replaceMcpURL(mcpArgs, url, secret string) string {
-	// Replace {secret} first so a URL that contains the literal "{secret}"
-	// string doesn't get the secret injected into an unexpected position.
-	s := strings.ReplaceAll(mcpArgs, "{secret}", secret)
-	s = strings.ReplaceAll(s, "{url}", url)
-	return s
+	// Use strings.NewReplacer for a single-pass substitution so that neither
+	// replacement value is scanned for the other's pattern — prevents a secret
+	// containing "{url}" or a URL containing "{secret}" from triggering
+	// unintended double-expansion.
+	return strings.NewReplacer("{url}", url, "{secret}", secret).Replace(mcpArgs)
 }
