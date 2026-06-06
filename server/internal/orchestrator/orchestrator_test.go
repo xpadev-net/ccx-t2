@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -47,11 +48,19 @@ func (f *fakeTmux) SendKeys(ctx context.Context, session, window, keys string) e
 		return err
 	}
 	f.mu.Lock()
-	defer f.mu.Unlock()
-	if strings.Contains(keys, "You are the Orchestrator agent") {
-		f.prompts = append(f.prompts, keys)
-	} else {
-		f.commands = append(f.commands, keys)
+	f.commands = append(f.commands, keys)
+	f.mu.Unlock()
+	if promptPath := promptFileFromLaunchCommand(keys); promptPath != "" {
+		prompt, err := os.ReadFile(promptPath)
+		if err != nil {
+			return err
+		}
+		if err := os.Remove(promptPath); err != nil {
+			return err
+		}
+		f.mu.Lock()
+		f.prompts = append(f.prompts, string(prompt))
+		f.mu.Unlock()
 	}
 	return nil
 }
@@ -140,19 +149,33 @@ func TestTriggerStartsOrchestratorWithSnapshotAndMCPArgs(t *testing.T) {
 	if got := creates; got != 1 {
 		t.Fatalf("creates = %d, want 1", got)
 	}
+	o.mu.Lock()
+	draining := o.draining
+	o.mu.Unlock()
+	if draining {
+		t.Fatal("draining = true after direct start with empty queue, want false")
+	}
 	if commands != 1 {
 		t.Fatalf("commands count = %d, want 1", commands)
 	}
 	fake.mu.Lock()
 	command := fake.commands[0]
 	fake.mu.Unlock()
-	args, err := shellquote.Split(command)
+	if !strings.Contains(command, "{ rm -f ") || !strings.Contains(command, "; exec ") {
+		t.Fatalf("command = %q, want prompt cleanup before exec", command)
+	}
+	promptPath := promptFileFromLaunchCommand(command)
+	if promptPath == "" {
+		t.Fatalf("prompt path is empty in command %q", command)
+	}
+	harnessCommand := harnessCommandFromLaunchCommand(command)
+	args, err := shellquote.Split(harnessCommand)
 	if err != nil {
 		t.Fatalf("command shell syntax: %v", err)
 	}
 	wantArgs := []string{"sh", "-c", "http://localhost:8080/mcp/orchestrator", "tok en"}
 	if !reflect.DeepEqual(args, wantArgs) {
-		t.Fatalf("command args = %#v, want %#v", args, wantArgs)
+		t.Fatalf("harness args = %#v, want %#v", args, wantArgs)
 	}
 	_, _, prompts := fake.counts()
 	if prompts != 1 {
@@ -437,7 +460,7 @@ func TestTriggerMidCallCancellationDrainsLaterQueuedWork(t *testing.T) {
 	go func() {
 		errCh <- o.Trigger(ctx, "canceled owner")
 	}()
-	<-startedSecond
+	waitForSignal(t, startedSecond, "startedSecond")
 	if err := o.Trigger(context.Background(), "later"); err != nil {
 		t.Fatalf("Trigger later: %v", err)
 	}
@@ -523,9 +546,9 @@ func TestTriggerRestartsTimedOutActiveWindow(t *testing.T) {
 	}
 }
 
-func TestRunStartMarkedOnlyAfterPromptSent(t *testing.T) {
+func TestRunStartMarkedOnlyAfterLaunchSent(t *testing.T) {
 	l, cfg := newTestDeps(t)
-	fake := &failingSendTmux{fakeTmux: fakeTmux{}, failAfter: 2}
+	fake := &failingSendTmux{fakeTmux: fakeTmux{}, failAfter: 1}
 	o := New(l, cfg, "proj", "http://localhost:8080")
 	o.tmux = fake
 
@@ -543,10 +566,10 @@ func TestRunStartMarkedOnlyAfterPromptSent(t *testing.T) {
 	}
 }
 
-func TestPromptSendCancellationStillCleansWindow(t *testing.T) {
+func TestLaunchSendCancellationStillCleansWindow(t *testing.T) {
 	l, cfg := newTestDeps(t)
 	ctx, cancel := context.WithCancel(context.Background())
-	fake := &cancelingPromptSendTmux{
+	fake := &cancelingSendTmux{
 		fakeTmux: fakeTmux{},
 		cancel:   cancel,
 	}
@@ -628,7 +651,7 @@ func TestCloseWaitsForInFlightDirectStart(t *testing.T) {
 	go func() {
 		errCh <- o.Trigger(context.Background(), "direct")
 	}()
-	<-insideCreate
+	waitForSignal(t, insideCreate, "insideCreate")
 	closed := make(chan struct{})
 	go func() {
 		o.Close()
@@ -672,7 +695,7 @@ func TestCloseStopsInFlightDrainBeforeStart(t *testing.T) {
 	}
 	fake.mu.Unlock()
 	fake.setIdle(true)
-	<-insideAlive
+	waitForSignal(t, insideAlive, "insideAlive")
 	o.Close()
 	close(releaseAlive)
 	assertNoTmuxActivity(t, fake, 100*time.Millisecond)
@@ -703,6 +726,23 @@ func TestTriggerRejectsMissingOrchestratorHarness(t *testing.T) {
 		t.Fatal("Trigger missing harness error = nil, want error")
 	}
 	if !strings.Contains(err.Error(), `orchestrator harness "missing" not configured`) {
+		t.Fatalf("Trigger error = %v", err)
+	}
+}
+
+func TestTriggerRejectsWhitespaceInOrchestratorHarnessCommand(t *testing.T) {
+	l, cfg := newTestDeps(t)
+	h := cfg.Harnesses[cfg.Orchestrator.Harness]
+	h.Command = "codex exec"
+	cfg.Harnesses[cfg.Orchestrator.Harness] = h
+	o := New(l, cfg, "proj", "http://localhost:8080")
+	o.tmux = &fakeTmux{}
+
+	err := o.Trigger(context.Background(), "bad command")
+	if err == nil {
+		t.Fatal("Trigger whitespace command error = nil, want error")
+	}
+	if !strings.Contains(err.Error(), "single binary name or path with no whitespace") {
 		t.Fatalf("Trigger error = %v", err)
 	}
 }
@@ -780,17 +820,14 @@ func (f *failingSendTmux) SendKeys(ctx context.Context, session, window, keys st
 	return f.fakeTmux.SendKeys(ctx, session, window, keys)
 }
 
-type cancelingPromptSendTmux struct {
+type cancelingSendTmux struct {
 	fakeTmux
 	cancel func()
 }
 
-func (c *cancelingPromptSendTmux) SendKeys(ctx context.Context, session, window, keys string) error {
-	if strings.Contains(keys, "You are the Orchestrator agent") {
-		c.cancel()
-		return context.Canceled
-	}
-	return c.fakeTmux.SendKeys(ctx, session, window, keys)
+func (c *cancelingSendTmux) SendKeys(ctx context.Context, session, window, keys string) error {
+	c.cancel()
+	return context.Canceled
 }
 
 func queuedSnapshot(o *Orchestrator) []string {
@@ -816,6 +853,51 @@ func assertNoTmuxActivity(t *testing.T, fake *fakeTmux, window time.Duration) {
 		case <-ticker.C:
 		}
 	}
+}
+
+func waitForSignal(t *testing.T, ch <-chan struct{}, name string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for %s", name)
+	}
+}
+
+func promptFileFromLaunchCommand(command string) string {
+	i := strings.LastIndex(command, " < ")
+	if i < 0 {
+		return ""
+	}
+	return singleQuotedValue(command[i+3:])
+}
+
+func harnessCommandFromLaunchCommand(command string) string {
+	_, rest, ok := strings.Cut(command, "; exec ")
+	if !ok {
+		return ""
+	}
+	harnessCommand, _, _ := strings.Cut(rest, "; } < ")
+	return harnessCommand
+}
+
+func singleQuotedValue(s string) string {
+	if !strings.HasPrefix(s, "'") {
+		return ""
+	}
+	var sb strings.Builder
+	for i := 1; i < len(s); i++ {
+		if s[i] == '\'' {
+			if strings.HasPrefix(s[i:], "'\\''") {
+				sb.WriteByte('\'')
+				i += 3
+				continue
+			}
+			return sb.String()
+		}
+		sb.WriteByte(s[i])
+	}
+	return ""
 }
 
 func TestBuildMCPTokensRejectsInvalidTemplateShellSyntax(t *testing.T) {

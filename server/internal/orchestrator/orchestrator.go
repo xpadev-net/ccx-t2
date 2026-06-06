@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	shellquote "github.com/kballard/go-shellquote"
 	"github.com/xpadev/ccx-t2/internal/config"
@@ -129,7 +131,13 @@ func (o *Orchestrator) Trigger(ctx context.Context, reason string) error {
 		}
 		return err
 	}
-	go o.drain()
+	o.mu.Lock()
+	hasRemaining := len(o.queued) > 0
+	o.draining = hasRemaining
+	o.mu.Unlock()
+	if hasRemaining {
+		go o.drain()
+	}
 	return nil
 }
 
@@ -140,7 +148,7 @@ func normalizeReason(reason string) string {
 	}
 	var sb strings.Builder
 	for _, r := range normalized {
-		if sb.Len()+len(string(r)) > maxReasonLen {
+		if sb.Len()+utf8.RuneLen(r) > maxReasonLen {
 			break
 		}
 		sb.WriteRune(r)
@@ -449,16 +457,36 @@ func (o *Orchestrator) start(ctx context.Context, reason string) (bool, error) {
 	if err := o.tmux.CreateWindow(ctx, o.session, windowName, o.cfg.Project.RepoPath); err != nil {
 		return false, fmt.Errorf("create orchestrator window: %w", err)
 	}
-	if err := o.tmux.SendKeys(ctx, o.session, windowName, buildHarnessCommand(hCfg.Command, tokens)); err != nil {
+	promptPath, err := o.writePromptFile(prompt)
+	if err != nil {
+		o.cleanupStartedWindow()
+		return false, fmt.Errorf("write orchestrator prompt: %w", err)
+	}
+	if err := o.tmux.SendKeys(ctx, o.session, windowName, buildHarnessLaunchCommand(hCfg.Command, tokens, promptPath)); err != nil {
+		_ = os.Remove(promptPath)
 		o.cleanupStartedWindow()
 		return false, fmt.Errorf("send orchestrator command: %w", err)
 	}
-	if err := o.tmux.SendKeys(ctx, o.session, windowName, prompt); err != nil {
-		o.cleanupStartedWindow()
-		return false, fmt.Errorf("send orchestrator prompt: %w", err)
-	}
 	o.markRunStarted()
 	return true, nil
+}
+
+func (o *Orchestrator) writePromptFile(prompt string) (string, error) {
+	f, err := os.CreateTemp("", "ccx-orchestrator-prompt-*")
+	if err != nil {
+		return "", err
+	}
+	path := f.Name()
+	if _, err := f.WriteString(prompt); err != nil {
+		_ = f.Close()
+		_ = os.Remove(path)
+		return "", err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(path)
+		return "", err
+	}
+	return path, nil
 }
 
 func (o *Orchestrator) cleanupStartedWindow() {
@@ -524,8 +552,12 @@ func (o *Orchestrator) validate() error {
 	if strings.TrimSpace(o.baseURL) == "" {
 		return fmt.Errorf("orchestrator base URL is required")
 	}
-	if _, ok := o.cfg.Harnesses[o.cfg.Orchestrator.Harness]; !ok {
+	hCfg, ok := o.cfg.Harnesses[o.cfg.Orchestrator.Harness]
+	if !ok {
 		return fmt.Errorf("orchestrator harness %q not configured", o.cfg.Orchestrator.Harness)
+	}
+	if strings.ContainsAny(hCfg.Command, " \t\n") {
+		return fmt.Errorf("orchestrator harness command must be a single binary name or path with no whitespace; got %q", hCfg.Command)
 	}
 	return nil
 }
@@ -550,6 +582,11 @@ func buildHarnessCommand(command string, mcpTokens []string) string {
 		parts = append(parts, shellQuoteArg(tok))
 	}
 	return strings.Join(parts, " ")
+}
+
+func buildHarnessLaunchCommand(command string, mcpTokens []string, promptPath string) string {
+	quotedPromptPath := shellQuoteArg(promptPath)
+	return "{ rm -f " + quotedPromptPath + "; exec " + buildHarnessCommand(command, mcpTokens) + "; } < " + quotedPromptPath
 }
 
 func shellQuoteArg(s string) string {
