@@ -517,21 +517,23 @@ func handleStopWorker(deps *Deps) ToolHandler {
 		}
 
 		// Find task in registry or ledger.
+		// Always load branch from the ledger: the registry does not store it.
 		var taskID, branch string
 		if info, ok := deps.Registry.Get(workerID); ok {
 			taskID = info.TaskID
-		} else {
-			// Fall back to ledger search.
-			tasks, err := deps.Ledger.Load()
-			if err != nil {
-				return nil, err
-			}
-			for _, t := range tasks {
-				if t.WorkerID == workerID {
+		}
+		// Ledger search fills branch (and taskID as fallback when not in registry).
+		tasks, err := deps.Ledger.Load()
+		if err != nil {
+			return nil, err
+		}
+		for _, t := range tasks {
+			if t.WorkerID == workerID {
+				if taskID == "" {
 					taskID = t.ID
-					branch = t.Branch
-					break
 				}
+				branch = t.Branch
+				break
 			}
 		}
 
@@ -678,7 +680,14 @@ func handleNotify(deps *Deps) ToolHandler {
 			}
 			if mergeCommit != "" {
 				// Append merge_commit comment to body so archive_task can read it.
-				body := task.Body + "\n<!-- merge_commit: " + mergeCommit + " -->"
+				// Avoid a leading newline when body is empty.
+				comment := "<!-- merge_commit: " + mergeCommit + " -->"
+				var body string
+				if task.Body == "" {
+					body = comment
+				} else {
+					body = task.Body + "\n" + comment
+				}
 				fields["body"] = body
 			}
 			if err := deps.Ledger.Update(taskID, fields); err != nil {
