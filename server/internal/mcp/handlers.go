@@ -367,10 +367,13 @@ func handleSplitTask(deps *Deps) ToolHandler {
 		}
 
 		// Update parent to split only after all children are safely written.
-		// Use UpdateReturnPrev to capture the actual pre-update task snapshot
-		// atomically: a concurrent spawn_worker could have changed status from
-		// "unstarted" to "in_progress" between our preflight read and this write.
-		prevTask, err := deps.Ledger.UpdateReturnPrev(id, map[string]any{
+		// Keep the allowed status set tied to the preflight state so concurrent
+		// terminal transitions or stop_worker resets are not overwritten.
+		allowedStatuses := []string{original.Status}
+		if original.Status == "in_progress" || original.Status == "blocked" {
+			allowedStatuses = []string{"in_progress", "blocked"}
+		}
+		prevTask, err := deps.Ledger.UpdateIfStatusesReturnPrev(id, allowedStatuses, map[string]any{
 			"status":    "split",
 			"reason":    reason,
 			"worker_id": "",
@@ -381,23 +384,6 @@ func handleSplitTask(deps *Deps) ToolHandler {
 			// Roll back the children to avoid orphans on retry.
 			_ = deps.Ledger.DeleteTasks(childIDs)
 			return nil, err
-		}
-
-		// Guard against concurrent transitions winning the race between our preflight
-		// and the UpdateReturnPrev write.
-		switch prevTask.Status {
-		case "completed", "split":
-			// Always a race — task reached a terminal state before our write.
-			_ = deps.Ledger.DeleteTasks(childIDs)
-			return nil, fmt.Errorf("cannot split task %s: it reached status %q concurrently", id, prevTask.Status)
-		case "unstarted":
-			// "unstarted" is expected when the original status was already "unstarted".
-			// It's a race only when a concurrent stop_worker reset the task from
-			// in_progress/blocked to "unstarted" before our UpdateReturnPrev.
-			if original.Status != "unstarted" {
-				_ = deps.Ledger.DeleteTasks(childIDs)
-				return nil, fmt.Errorf("cannot split task %s: it reached status %q concurrently", id, prevTask.Status)
-			}
 		}
 
 		// Clean up worker resources based on the actual previous status and
