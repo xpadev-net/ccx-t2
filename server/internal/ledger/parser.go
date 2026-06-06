@@ -139,7 +139,7 @@ func marshalFrontMatter(t Task) ([]byte, error) {
 	scanner := bufio.NewScanner(bytes.NewReader(rest))
 	for scanner.Scan() {
 		line := scanner.Text()
-		if strings.HasPrefix(line, "id:") {
+		if line == "id:" || strings.HasPrefix(line, "id: ") {
 			continue
 		}
 		buf.WriteString(line)
