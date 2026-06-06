@@ -823,6 +823,14 @@ func handleNotify(deps *Deps) ToolHandler {
 			return nil, fmt.Errorf("worker %q is not assigned to task %s (assigned to %q)",
 				callerWorkerID, taskID, task.WorkerID)
 		}
+		// Validate the notify type before the status early-return so an unknown
+		// type always returns an error, even for non-active tasks.
+		switch notifyType {
+		case "completed", "blocked", "split_request":
+		default:
+			return nil, fmt.Errorf("unknown notify type: %s", notifyType)
+		}
+
 		if task.Status != "in_progress" && task.Status != "blocked" {
 			// Silently ignore notifications for non-active tasks.
 			log.Printf("warn: notify %s for task %s with status %q — ignored",
@@ -998,8 +1006,6 @@ func handleNotify(deps *Deps) ToolHandler {
 			}
 			deps.Registry.Remove(wid)
 
-		default:
-			return nil, fmt.Errorf("unknown notify type: %s", notifyType)
 		}
 
 		return map[string]any{"ok": true}, nil
