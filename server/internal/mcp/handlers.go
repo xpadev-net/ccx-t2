@@ -850,7 +850,7 @@ func handleNotify(deps *Deps) ToolHandler {
 				}
 				fields["body"] = body
 			}
-			if err := deps.Ledger.Update(taskID, fields); err != nil {
+			if err := deps.Ledger.UpdateIfStatuses(taskID, []string{"in_progress", "blocked"}, fields); err != nil {
 				return nil, err
 			}
 
