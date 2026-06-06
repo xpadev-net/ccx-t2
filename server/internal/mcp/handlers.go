@@ -511,6 +511,9 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 		if err := ledger.ValidatePaths(forbiddenFiles); err != nil {
 			return nil, fmt.Errorf("forbidden_files: %w", err)
 		}
+		if err := validateGitBranchName(branch); err != nil {
+			return nil, err
+		}
 
 		// Resolve harness.
 		resolvedHarness, hCfg, err := harness.Resolve(deps.Config, harnessName)
@@ -527,31 +530,12 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 			return nil, fmt.Errorf("invalid mcp_args shell syntax: %w", err)
 		}
 
-		// Check branch uniqueness via literal name lookup (not glob).
-		// Check gitErr first: exit 0 means found, exit 128 means not found,
-		// any other error means a real git failure.
-		{
-			cmd := exec.Command("git", "-C", deps.Config.Project.RepoPath,
-				"rev-parse", "--verify", "refs/heads/"+branch)
-			out, gitErr := cmd.Output()
-			if gitErr != nil {
-				exitErr, ok := gitErr.(*exec.ExitError)
-				if !ok || exitErr.ExitCode() != 128 {
-					return nil, fmt.Errorf("check branch existence: %w", gitErr)
-				}
-				// Exit 128 covers both "ref not found" and other fatal git errors.
-				// Distinguish via Stderr: "not a git repository" is a real error,
-				// "Needed a single revision" or similar means the ref just doesn't exist.
-				stderr := strings.ToLower(string(exitErr.Stderr))
-				if strings.Contains(stderr, "not a git repository") ||
-					strings.Contains(stderr, "not a git repo") {
-					return nil, fmt.Errorf("check branch existence: %w", gitErr)
-				}
-				// Otherwise, ref not found — branch name is available.
-			} else if strings.TrimSpace(string(out)) != "" {
-				// Exit 0 with output = branch already exists.
-				return nil, fmt.Errorf("branch %q already exists", branch)
-			}
+		branchExists, err := gitBranchExists(deps.Config.Project.RepoPath, branch)
+		if err != nil {
+			return nil, err
+		}
+		if branchExists {
+			return nil, fmt.Errorf("branch %q already exists", branch)
 		}
 
 		// Build paths.
@@ -597,6 +581,11 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 			_ = exec.Command("git", "-C", repoPath, "branch", "-D", branch).Run()
 			return nil, fmt.Errorf("update ledger: %w", updateErr)
 		}
+		promptTask, err := loadTaskByID(deps.Ledger, taskID)
+		if err != nil {
+			rollbackSpawnAfterLedgerUpdate(deps, workerID, branch, taskID, repoPath, worktreePath)
+			return nil, fmt.Errorf("reload task after update: %w", err)
+		}
 
 		// Register worker.
 		deps.Registry.Register(worker.Info{
@@ -611,31 +600,14 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 		// URL/secret values with shell metacharacters are not interpreted by the shell.
 		harnessCmd := buildHarnessCommand(hCfg.Command, mcpTokens)
 		if err := tmux.SendKeys(deps.Session, workerID, harnessCmd); err != nil {
-			// Harness failed to launch — roll back all resources so the task
-			// can be retried with stop_worker or a new spawn_worker call.
-			_ = tmux.KillWindow(deps.Session, workerID)
-			_ = worktree.Remove(repoPath, worktreePath)
-			_ = exec.Command("git", "-C", repoPath, "branch", "-D", branch).Run()
-			// Reset lifecycle fields only — do not restore allowed/forbidden_files
-			// to avoid overwriting concurrent update_task edits.
-			// Use UpdateIfStatuses so a concurrent split_task that already committed
-			// (moving the parent to "split") is not overwritten by this rollback.
-			if rollbackErr := deps.Ledger.UpdateIfStatuses(taskID, []string{"in_progress"}, map[string]any{
-				"status":    "unstarted",
-				"worker_id": "",
-				"branch":    "",
-				"harness":   "",
-			}); rollbackErr != nil {
-				log.Printf("error: spawn_worker rollback failed for task %s: %v — task may be stuck in_progress", taskID, rollbackErr)
-			}
-			deps.Registry.Remove(workerID)
+			rollbackSpawnAfterLedgerUpdate(deps, workerID, branch, taskID, repoPath, worktreePath)
 			return nil, fmt.Errorf("send harness command: %w", err)
 		}
 
 		// Step 5: Send task prompt (best-effort — worker is already running).
 		// If this fails, include prompt_sent:false in the response so the orchestrator
 		// knows to call followup_worker to deliver the task description.
-		prompt := buildWorkerPrompt(task, taskID, workerID, branch, allowedFiles, forbiddenFiles,
+		prompt := buildWorkerPromptFromTask(promptTask, taskID, workerID, branch,
 			worktreePath, deps.Config.Project.ValidationCommand)
 		promptSent := true
 		if err := tmux.SendKeys(deps.Session, workerID, prompt); err != nil {
@@ -1044,6 +1016,66 @@ func extractMergeCommit(body string) string {
 	return strings.TrimSpace(rest[:end])
 }
 
+func validateGitBranchName(branch string) error {
+	out, err := exec.Command("git", "check-ref-format", "--branch", branch).CombinedOutput()
+	if err != nil {
+		msg := strings.TrimSpace(string(out))
+		if msg == "" {
+			msg = err.Error()
+		}
+		return fmt.Errorf("invalid branch %q: %s", branch, msg)
+	}
+	return nil
+}
+
+func gitBranchExists(repoPath, branch string) (bool, error) {
+	out, err := exec.Command("git", "-C", repoPath, "show-ref", "--verify", "--quiet", "refs/heads/"+branch).CombinedOutput()
+	if err == nil {
+		return true, nil
+	}
+	exitErr, ok := err.(*exec.ExitError)
+	if ok && exitErr.ExitCode() == 1 {
+		return false, nil
+	}
+	msg := strings.TrimSpace(string(out))
+	if msg == "" {
+		msg = err.Error()
+	}
+	return false, fmt.Errorf("check branch existence: %s", msg)
+}
+
+func loadTaskByID(l *ledger.Ledger, taskID string) (*ledger.Task, error) {
+	tasks, err := l.Load()
+	if err != nil {
+		return nil, err
+	}
+	for i := range tasks {
+		if tasks[i].ID == taskID {
+			return &tasks[i], nil
+		}
+	}
+	return nil, fmt.Errorf("task not found: %s", taskID)
+}
+
+func rollbackSpawnAfterLedgerUpdate(deps *Deps, workerID, branch, taskID, repoPath, worktreePath string) {
+	_ = tmux.KillWindow(deps.Session, workerID)
+	_ = worktree.Remove(repoPath, worktreePath)
+	_ = exec.Command("git", "-C", repoPath, "branch", "-D", branch).Run()
+	// Reset lifecycle fields only — do not restore allowed/forbidden_files
+	// to avoid overwriting concurrent update_task edits. Use UpdateIfStatuses
+	// so a concurrent split_task that already committed (moving the parent to
+	// "split") is not overwritten by this rollback.
+	if rollbackErr := deps.Ledger.UpdateIfStatuses(taskID, []string{"in_progress"}, map[string]any{
+		"status":    "unstarted",
+		"worker_id": "",
+		"branch":    "",
+		"harness":   "",
+	}); rollbackErr != nil {
+		log.Printf("error: spawn_worker rollback failed for task %s: %v — task may be stuck in_progress", taskID, rollbackErr)
+	}
+	deps.Registry.Remove(workerID)
+}
+
 func buildMCPTokens(template, workerMCPURL, secret string) ([]string, error) {
 	templateTokens, err := shellquote.Split(template)
 	if err != nil {
@@ -1063,6 +1095,11 @@ func buildHarnessCommand(command string, mcpTokens []string) string {
 		parts = append(parts, shellQuoteArg(tok))
 	}
 	return strings.Join(parts, " ")
+}
+
+func buildWorkerPromptFromTask(task *ledger.Task, taskID, workerID, branch, worktreePath, validationCmd string) string {
+	return buildWorkerPrompt(task, taskID, workerID, branch, task.AllowedFiles, task.ForbiddenFiles,
+		worktreePath, validationCmd)
 }
 
 // buildWorkerPrompt constructs the stdin prompt sent to the worker harness.
