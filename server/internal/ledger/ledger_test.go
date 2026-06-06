@@ -477,6 +477,31 @@ func TestAddNewNoConflictWithArchive(t *testing.T) {
 	}
 }
 
+func TestAddAllNewGeneratesIDsAndAppendsAtomically(t *testing.T) {
+	dir := t.TempDir()
+	archiveDir := filepath.Join(dir, "archive")
+	l := NewLedger(filepath.Join(dir, "ledger.md"), archiveDir)
+
+	ids, err := l.AddAllNew([]Task{
+		{Title: "First", Status: "unstarted"},
+		{Title: "Second", Status: "unstarted"},
+	})
+	if err != nil {
+		t.Fatalf("AddAllNew: %v", err)
+	}
+	if len(ids) != 2 || ids[0] == "" || ids[1] == "" || ids[0] == ids[1] {
+		t.Fatalf("ids = %#v, want two distinct ids", ids)
+	}
+
+	tasks, err := l.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(tasks) != 2 || tasks[0].ID != ids[0] || tasks[1].ID != ids[1] {
+		t.Fatalf("tasks = %#v, ids = %#v", tasks, ids)
+	}
+}
+
 func TestUpdateIfStatusesReturnPrevReturnsSnapshotAndRejectsDisallowedStatus(t *testing.T) {
 	dir := t.TempDir()
 	l := NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))

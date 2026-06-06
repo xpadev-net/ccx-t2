@@ -2,10 +2,12 @@ package event
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"reflect"
 	"sort"
 	"testing"
+	"time"
 
 	"github.com/xpadev/ccx-t2/internal/ledger"
 )
@@ -62,6 +64,106 @@ func TestQueueRunProcessesEventsFIFOAndTriggers(t *testing.T) {
 	wantReasons := []string{"worker blocked: task-001", "worker completed: task-002"}
 	if !reflect.DeepEqual(trigger.reasons, wantReasons) {
 		t.Fatalf("trigger reasons = %#v, want %#v", trigger.reasons, wantReasons)
+	}
+}
+
+func TestQueueRunContinuesAfterProcessError(t *testing.T) {
+	l := newTestLedger(t)
+	if err := l.Add(ledger.Task{ID: "task-001", Title: "First", Status: "in_progress", WorkerID: "worker-1"}); err != nil {
+		t.Fatalf("Add task-001: %v", err)
+	}
+	if err := l.Add(ledger.Task{ID: "task-002", Title: "Second", Status: "in_progress", WorkerID: "worker-2"}); err != nil {
+		t.Fatalf("Add task-002: %v", err)
+	}
+	trigger := &fakeTrigger{}
+	q := NewQueue(l, trigger, 3)
+
+	ctx := context.Background()
+	if err := q.Enqueue(ctx, Event{Type: Completed, TaskID: "task-001", WorkerID: "worker-stale"}); err != nil {
+		t.Fatalf("Enqueue stale: %v", err)
+	}
+	if err := q.Enqueue(ctx, Event{Type: Completed, TaskID: "task-002", WorkerID: "worker-2"}); err != nil {
+		t.Fatalf("Enqueue valid: %v", err)
+	}
+	q.Close()
+	if err := q.Run(ctx); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	tasksByID := loadTasksByID(t, l)
+	if got := tasksByID["task-001"].Status; got != "in_progress" {
+		t.Fatalf("task-001 status = %q, want in_progress", got)
+	}
+	if got := tasksByID["task-002"].Status; got != "completed" {
+		t.Fatalf("task-002 status = %q, want completed", got)
+	}
+	if !reflect.DeepEqual(trigger.reasons, []string{"worker completed: task-002"}) {
+		t.Fatalf("trigger reasons = %#v", trigger.reasons)
+	}
+}
+
+func TestQueueCloseIsIdempotentAndEnqueueAfterCloseFails(t *testing.T) {
+	q := NewQueue(newTestLedger(t), nil, 1)
+	q.Close()
+	q.Close()
+
+	err := q.Enqueue(context.Background(), Event{Type: Completed, TaskID: "task-001", WorkerID: "worker-1"})
+	if err == nil {
+		t.Fatal("Enqueue after Close error = nil, want error")
+	}
+}
+
+func TestQueueCloseUnblocksPendingEnqueue(t *testing.T) {
+	q := NewQueue(newTestLedger(t), nil, 0)
+	started := make(chan struct{})
+	errCh := make(chan error, 1)
+	go func() {
+		close(started)
+		errCh <- q.Enqueue(context.Background(), Event{Type: Completed, TaskID: "task-001", WorkerID: "worker-1"})
+	}()
+	<-started
+	time.Sleep(10 * time.Millisecond)
+
+	closed := make(chan struct{})
+	go func() {
+		q.Close()
+		close(closed)
+	}()
+
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("Close blocked behind pending Enqueue")
+	}
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, ErrQueueClosed) {
+			t.Fatalf("Enqueue error = %v, want ErrQueueClosed", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Enqueue did not unblock after Close")
+	}
+}
+
+func TestQueueRunDoesNotProcessBufferedEventAfterCancellation(t *testing.T) {
+	l := newTestLedger(t)
+	if err := l.Add(ledger.Task{ID: "task-001", Title: "Task", Status: "in_progress", WorkerID: "worker-1"}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	q := NewQueue(l, &fakeTrigger{}, 1)
+	if err := q.Enqueue(context.Background(), Event{Type: Completed, TaskID: "task-001", WorkerID: "worker-1"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := q.Run(ctx); err == nil {
+		t.Fatal("Run canceled context error = nil, want error")
+	}
+
+	task := loadTasksByID(t, l)["task-001"]
+	if task.Status != "in_progress" {
+		t.Fatalf("task status = %q, want in_progress", task.Status)
 	}
 }
 

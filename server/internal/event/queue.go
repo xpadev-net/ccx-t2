@@ -4,9 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
+	"sync"
 
 	"github.com/xpadev/ccx-t2/internal/ledger"
 )
+
+var ErrQueueClosed = errors.New("event queue is closed")
 
 // Type identifies the worker event kind.
 type Type string
@@ -46,7 +50,12 @@ type Triggerer interface {
 type Queue struct {
 	ledger  *ledger.Ledger
 	trigger Triggerer
-	events  chan Event
+	buffer  int
+	events  []Event
+	mu      sync.Mutex
+	cond    *sync.Cond
+	closed  bool
+	waiting int
 }
 
 // NewQueue creates a FIFO queue with the given buffer size.
@@ -54,43 +63,119 @@ func NewQueue(l *ledger.Ledger, trigger Triggerer, buffer int) *Queue {
 	if buffer < 0 {
 		buffer = 0
 	}
-	return &Queue{
+	q := &Queue{
 		ledger:  l,
 		trigger: trigger,
-		events:  make(chan Event, buffer),
+		buffer:  buffer,
 	}
+	q.cond = sync.NewCond(&q.mu)
+	return q
 }
 
 // Enqueue appends an event to the FIFO queue or returns ctx.Err if canceled.
 func (q *Queue) Enqueue(ctx context.Context, e Event) error {
-	select {
-	case q.events <- e:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	cancelWake := q.wakeOnCancel(ctx)
+	defer cancelWake()
+
+	for {
+		if q.closed {
+			return ErrQueueClosed
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if q.canAcceptLocked() {
+			q.events = append(q.events, e)
+			q.cond.Signal()
+			return nil
+		}
+		q.cond.Wait()
 	}
+}
+
+func (q *Queue) canAcceptLocked() bool {
+	if q.buffer == 0 {
+		return q.waiting > 0 && len(q.events) == 0
+	}
+	return len(q.events) < q.buffer
 }
 
 // Close closes the queue. Run exits after already queued events are processed.
 func (q *Queue) Close() {
-	close(q.events)
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.closed {
+		return
+	}
+	q.closed = true
+	q.cond.Broadcast()
 }
 
 // Run processes queued events one at a time until the queue is closed or ctx is
-// canceled. The first processing error stops the loop and is returned.
+// canceled. Processing errors are logged and do not stop later events.
 func (q *Queue) Run(ctx context.Context) error {
 	for {
+		e, ok, err := q.next(ctx)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return nil
+		}
+		q.processAndLog(ctx, e)
+	}
+}
+
+func (q *Queue) next(ctx context.Context) (Event, bool, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	cancelWake := q.wakeOnCancel(ctx)
+	defer cancelWake()
+
+	for len(q.events) == 0 && !q.closed {
+		if err := ctx.Err(); err != nil {
+			return Event{}, false, err
+		}
+		q.waiting++
+		q.cond.Broadcast()
+		q.cond.Wait()
+		q.waiting--
+	}
+	if err := ctx.Err(); err != nil {
+		return Event{}, false, err
+	}
+	if len(q.events) == 0 && q.closed {
+		return Event{}, false, nil
+	}
+	e := q.events[0]
+	copy(q.events, q.events[1:])
+	q.events = q.events[:len(q.events)-1]
+	q.cond.Signal()
+	return e, true, nil
+}
+
+func (q *Queue) wakeOnCancel(ctx context.Context) func() {
+	done := make(chan struct{})
+	go func() {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
-		case e, ok := <-q.events:
-			if !ok {
-				return nil
-			}
-			if err := q.Process(ctx, e); err != nil {
-				return err
-			}
+			q.mu.Lock()
+			q.cond.Broadcast()
+			q.mu.Unlock()
+		case <-done:
 		}
+	}()
+	return func() { close(done) }
+}
+
+func (q *Queue) processAndLog(ctx context.Context, e Event) {
+	if err := q.Process(ctx, e); err != nil {
+		log.Printf("warn: event queue failed to process event type=%s task_id=%s worker_id=%s: %v",
+			e.Type, e.TaskID, e.WorkerID, err)
 	}
 }
 
@@ -145,7 +230,7 @@ func (q *Queue) Process(ctx context.Context, e Event) error {
 			},
 		)
 	case SplitRequest:
-		err = q.processSplitRequest(e)
+		err = q.processSplitRequest(ctx, e)
 	default:
 		return fmt.Errorf("unknown event type: %s", e.Type)
 	}
@@ -158,15 +243,14 @@ func (q *Queue) Process(ctx context.Context, e Event) error {
 	return nil
 }
 
-func (q *Queue) processSplitRequest(e Event) error {
+func (q *Queue) processSplitRequest(ctx context.Context, e Event) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if len(e.ProposedSlices) == 0 {
 		return fmt.Errorf("proposed_slices must not be empty for split_request")
 	}
 	children := make([]ledger.Task, len(e.ProposedSlices))
-	ids, err := q.ledger.GenerateIDs(len(e.ProposedSlices))
-	if err != nil {
-		return err
-	}
 	for i, s := range e.ProposedSlices {
 		if s.Title == "" {
 			return fmt.Errorf("proposed_slices[%d]: title is required", i)
@@ -178,7 +262,6 @@ func (q *Queue) processSplitRequest(e Event) error {
 			return fmt.Errorf("proposed_slices[%d] forbidden_files: %w", i, err)
 		}
 		children[i] = ledger.Task{
-			ID:             ids[i],
 			Title:          s.Title,
 			Status:         "unstarted",
 			AllowedFiles:   s.AllowedFiles,
@@ -186,7 +269,14 @@ func (q *Queue) processSplitRequest(e Event) error {
 			Body:           s.Description,
 		}
 	}
-	if err := q.ledger.AddAll(children); err != nil {
+	ids, err := q.ledger.AddAllNew(children)
+	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		if rollbackErr := q.ledger.DeleteTasks(ids); rollbackErr != nil {
+			return errors.Join(err, fmt.Errorf("rollback split children: %w", rollbackErr))
+		}
 		return err
 	}
 	if _, err := q.ledger.UpdateIfStatusesReturnPrevWith(e.TaskID, []string{"in_progress", "blocked"},
