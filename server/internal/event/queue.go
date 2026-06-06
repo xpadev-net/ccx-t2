@@ -152,8 +152,8 @@ func (q *Queue) next(ctx context.Context) (Event, bool, error) {
 		return Event{}, false, nil
 	}
 	e := q.events[0]
-	copy(q.events, q.events[1:])
-	q.events = q.events[:len(q.events)-1]
+	q.events[0] = Event{}
+	q.events = q.events[1:]
 	q.cond.Signal()
 	return e, true, nil
 }
@@ -239,7 +239,7 @@ func (q *Queue) Process(ctx context.Context, e Event) error {
 		return err
 	}
 	if q.trigger != nil {
-		return q.trigger.Trigger(ctx, triggerReason(e))
+		return q.trigger.Trigger(context.WithoutCancel(ctx), triggerReason(e))
 	}
 	return nil
 }

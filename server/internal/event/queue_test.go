@@ -21,6 +21,17 @@ func (f *fakeTrigger) Trigger(ctx context.Context, reason string) error {
 	return nil
 }
 
+type contextCheckingTrigger struct {
+	called bool
+	err    error
+}
+
+func (c *contextCheckingTrigger) Trigger(ctx context.Context, reason string) error {
+	c.called = true
+	c.err = ctx.Err()
+	return c.err
+}
+
 func TestQueueRunProcessesEventsFIFOAndTriggers(t *testing.T) {
 	l := newTestLedger(t)
 	if err := l.Add(ledger.Task{ID: "task-001", Title: "First", Status: "in_progress", WorkerID: "worker-1"}); err != nil {
@@ -67,6 +78,32 @@ func TestQueueRunProcessesEventsFIFOAndTriggers(t *testing.T) {
 	wantReasons := []string{"worker blocked: task-001", "worker completed: task-002"}
 	if !reflect.DeepEqual(trigger.reasons, wantReasons) {
 		t.Fatalf("trigger reasons = %#v, want %#v", trigger.reasons, wantReasons)
+	}
+}
+
+func TestQueueProcessTriggersAfterMutationWithCanceledContext(t *testing.T) {
+	l := newTestLedger(t)
+	if err := l.Add(ledger.Task{ID: "task-001", Title: "Task", Status: "in_progress", WorkerID: "worker-1"}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	trigger := &contextCheckingTrigger{}
+	q := NewQueue(l, trigger, 0)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := q.Process(ctx, Event{Type: Completed, TaskID: "task-001", WorkerID: "worker-1"}); err != nil {
+		t.Fatalf("Process completed: %v", err)
+	}
+
+	if !trigger.called {
+		t.Fatal("trigger was not called")
+	}
+	if trigger.err != nil {
+		t.Fatalf("trigger ctx err = %v, want nil", trigger.err)
+	}
+	task := loadTasksByID(t, l)["task-001"]
+	if task.Status != "completed" {
+		t.Fatalf("task status = %q, want completed", task.Status)
 	}
 }
 
