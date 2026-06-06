@@ -293,7 +293,12 @@ func (l *Ledger) Archive(id, mergeCommit string) error {
 	// If the archive file already exists we crashed between the last archive
 	// write and the ledger save; skip re-writing and proceed to remove the
 	// task from the ledger (idempotent recovery).
-	if _, statErr := os.Stat(archiveFile); os.IsNotExist(statErr) {
+	_, statErr := os.Stat(archiveFile)
+	if statErr != nil && !os.IsNotExist(statErr) {
+		l.mu.Unlock()
+		return fmt.Errorf("stat archive file: %w", statErr)
+	}
+	if os.IsNotExist(statErr) {
 		fm, err := marshalFrontMatter(t)
 		if err != nil {
 			l.mu.Unlock()
