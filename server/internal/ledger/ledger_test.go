@@ -303,6 +303,42 @@ func TestArchiveStripsMergeCommitComment(t *testing.T) {
 	}
 }
 
+func TestArchiveIdempotentRecovery(t *testing.T) {
+	// Simulate crash between archive write and ledger save: archive file exists
+	// but task is still in ledger. Re-calling Archive should succeed without
+	// re-writing the archive and should remove the task from the ledger.
+	dir := t.TempDir()
+	archiveDir := filepath.Join(dir, "archive")
+	l := NewLedger(filepath.Join(dir, "ledger.md"), archiveDir)
+
+	if err := l.Add(Task{ID: "task-001", Title: "Do thing", Status: "completed", Body: "body"}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if err := l.Archive("task-001", "abc123"); err != nil {
+		t.Fatalf("first Archive: %v", err)
+	}
+
+	// Simulate crash recovery: re-add the task (as if ledger save had failed).
+	if err := l.Add(Task{ID: "task-001", Title: "Do thing", Status: "completed", Body: "body"}); err != nil {
+		t.Fatalf("re-Add: %v", err)
+	}
+
+	// Second archive call should succeed and remove from ledger.
+	if err := l.Archive("task-001", "abc123"); err != nil {
+		t.Fatalf("second Archive (idempotent): %v", err)
+	}
+
+	tasks, err := l.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	for _, t2 := range tasks {
+		if t2.ID == "task-001" {
+			t.Error("task still in ledger after idempotent archive")
+		}
+	}
+}
+
 // ---- GenerateID tests ----
 
 func TestGenerateIDUnique(t *testing.T) {

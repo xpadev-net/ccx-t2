@@ -290,43 +290,48 @@ func (l *Ledger) Archive(id, mergeCommit string) error {
 		return err
 	}
 
-	fm, err := marshalFrontMatter(t)
-	if err != nil {
-		l.mu.Unlock()
-		return err
-	}
-	var ab strings.Builder
-	ab.WriteString("---\n")
-	ab.Write(fm)
-	ab.WriteString("---\n")
-	if t.Body != "" {
-		ab.WriteString("\n")
-		ab.WriteString(t.Body)
-		ab.WriteString("\n")
-	}
+	// If the archive file already exists we crashed between the last archive
+	// write and the ledger save; skip re-writing and proceed to remove the
+	// task from the ledger (idempotent recovery).
+	if _, statErr := os.Stat(archiveFile); os.IsNotExist(statErr) {
+		fm, err := marshalFrontMatter(t)
+		if err != nil {
+			l.mu.Unlock()
+			return err
+		}
+		var ab strings.Builder
+		ab.WriteString("---\n")
+		ab.Write(fm)
+		ab.WriteString("---\n")
+		if t.Body != "" {
+			ab.WriteString("\n")
+			ab.WriteString(t.Body)
+			ab.WriteString("\n")
+		}
 
-	// Write archive file atomically via temp file + rename.
-	tmpArchive, err := os.CreateTemp(l.archiveDir, ".archive-*.tmp")
-	if err != nil {
-		l.mu.Unlock()
-		return err
-	}
-	tmpArchiveName := tmpArchive.Name()
-	if _, err := tmpArchive.WriteString(ab.String()); err != nil {
-		tmpArchive.Close()
-		os.Remove(tmpArchiveName)
-		l.mu.Unlock()
-		return err
-	}
-	if err := tmpArchive.Close(); err != nil {
-		os.Remove(tmpArchiveName)
-		l.mu.Unlock()
-		return err
-	}
-	if err := os.Rename(tmpArchiveName, archiveFile); err != nil {
-		os.Remove(tmpArchiveName)
-		l.mu.Unlock()
-		return err
+		// Write archive file atomically via temp file + rename.
+		tmpArchive, err := os.CreateTemp(l.archiveDir, ".archive-*.tmp")
+		if err != nil {
+			l.mu.Unlock()
+			return err
+		}
+		tmpArchiveName := tmpArchive.Name()
+		if _, err := tmpArchive.WriteString(ab.String()); err != nil {
+			tmpArchive.Close()
+			os.Remove(tmpArchiveName)
+			l.mu.Unlock()
+			return err
+		}
+		if err := tmpArchive.Close(); err != nil {
+			os.Remove(tmpArchiveName)
+			l.mu.Unlock()
+			return err
+		}
+		if err := os.Rename(tmpArchiveName, archiveFile); err != nil {
+			os.Remove(tmpArchiveName)
+			l.mu.Unlock()
+			return err
+		}
 	}
 
 	// Build remaining slice without aliasing the original backing array.
