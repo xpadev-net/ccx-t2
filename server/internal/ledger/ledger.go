@@ -283,6 +283,55 @@ func (l *Ledger) UpdateIfStatus(id, expectedStatus string, fields map[string]any
 	return l.updateWithCheck(id, expectedStatus, fields)
 }
 
+// UpdateIfStatuses modifies task fields only when the task's current status is
+// in the allowedStatuses list. Returns an error if the current status is not
+// in the allowed set.
+func (l *Ledger) UpdateIfStatuses(id string, allowedStatuses []string, fields map[string]any) error {
+	l.mu.Lock()
+	tasks, err := l.load()
+	if err != nil {
+		l.mu.Unlock()
+		return err
+	}
+	found := false
+	for i := range tasks {
+		if tasks[i].ID != id {
+			continue
+		}
+		found = true
+		current := tasks[i].Status
+		allowed := false
+		for _, s := range allowedStatuses {
+			if s == current {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			l.mu.Unlock()
+			return fmt.Errorf("task %s status is %q, not in allowed set %v", id, current, allowedStatuses)
+		}
+		t := &tasks[i]
+		if err := applyFields(t, fields); err != nil {
+			l.mu.Unlock()
+			return err
+		}
+		t.UpdatedAt = time.Now().Format(time.RFC3339)
+		break
+	}
+	if !found {
+		l.mu.Unlock()
+		return fmt.Errorf("task not found: %s", id)
+	}
+	err = l.save(tasks)
+	onChange := l.onChange
+	l.mu.Unlock()
+	if err == nil && onChange != nil {
+		onChange()
+	}
+	return err
+}
+
 // UpdateReturnPrev applies the field update and returns a snapshot of the task
 // from before the write, all within a single mutex lock. The caller can compare
 // the returned prev task with its earlier read to detect concurrent transitions

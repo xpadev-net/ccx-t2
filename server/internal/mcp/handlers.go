@@ -399,10 +399,18 @@ func handleSplitTask(deps *Deps) ToolHandler {
 			return nil, err
 		}
 
+		// Guard against concurrent terminal transitions (notify(completed)/notify(split_request)
+		// winning the race between our preflight and the UpdateReturnPrev write).
+		switch prevTask.Status {
+		case "completed", "split":
+			// The task reached a terminal state before we could commit the split.
+			// Roll back the children to keep the ledger consistent.
+			_ = deps.Ledger.DeleteTasks(childIDs)
+			return nil, fmt.Errorf("cannot split task %s: it reached status %q concurrently", id, prevTask.Status)
+		}
+
 		// Clean up worker resources based on the actual previous status and
 		// worker_id/branch from the atomic snapshot, not the stale preflight read.
-		// This handles the race where spawn_worker won and moved the task to
-		// in_progress with a new worker before our Update committed.
 		if prevTask.Status == "in_progress" || prevTask.Status == "blocked" {
 			stopWorkerCleanup(deps, prevTask.WorkerID, prevTask.Branch, id)
 		}
@@ -683,15 +691,19 @@ func handleStopWorker(deps *Deps) ToolHandler {
 			return nil, fmt.Errorf("worker %q not found in registry or ledger", workerID)
 		}
 
-		// Commit ledger first so the task is always recoverable, then clean
-		// up resources best-effort (same ordering as split_task and split_request).
-		if err := deps.Ledger.Update(taskID, map[string]any{
-			"status":    "unstarted",
-			"worker_id": "",
-			"branch":    "",
-			"harness":   "",
-			"reason":    "",
-		}); err != nil {
+		// Commit ledger first, only when the task is in a recoverable state.
+		// Reject if the task is already terminal to prevent overwriting
+		// "completed" or "split" tasks back to "unstarted" in a narrow race
+		// with notify(completed) or split_request cleanup.
+		if err := deps.Ledger.UpdateIfStatuses(taskID,
+			[]string{"in_progress", "blocked", "unstarted"},
+			map[string]any{
+				"status":    "unstarted",
+				"worker_id": "",
+				"branch":    "",
+				"harness":   "",
+				"reason":    "",
+			}); err != nil {
 			return nil, err
 		}
 		stopWorkerCleanup(deps, workerID, branch, taskID)
@@ -940,20 +952,26 @@ func handleNotify(deps *Deps) ToolHandler {
 			}
 
 			// Update parent to split after children are safely written.
+			// Use UpdateReturnPrev to detect if a concurrent notify(completed)
+			// won the race and already moved the task to a terminal state.
 			srChildIDs := make([]string, len(srChildren))
 			for i, c := range srChildren {
 				srChildIDs[i] = c.id
 			}
-			if err := deps.Ledger.Update(taskID, map[string]any{
+			prevTask, updateErr := deps.Ledger.UpdateReturnPrev(taskID, map[string]any{
 				"status":    "split",
 				"worker_id": "",
 				"branch":    "",
 				"harness":   "",
 				"reason":    reason,
-			}); err != nil {
-				// Roll back the children to avoid orphans on retry.
+			})
+			if updateErr != nil {
 				_ = deps.Ledger.DeleteTasks(srChildIDs)
-				return nil, err
+				return nil, updateErr
+			}
+			if prevTask.Status == "completed" || prevTask.Status == "split" {
+				_ = deps.Ledger.DeleteTasks(srChildIDs)
+				return nil, fmt.Errorf("cannot split task %s: it reached status %q concurrently", taskID, prevTask.Status)
 			}
 
 			// Cleanup resources (best-effort, parent already committed as split).
