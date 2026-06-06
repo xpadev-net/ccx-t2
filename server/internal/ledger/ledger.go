@@ -161,6 +161,30 @@ func (l *Ledger) Add(task Task) error {
 	return err
 }
 
+// AddAll atomically appends multiple tasks in a single file write.
+// All tasks get the same updated_at timestamp. This prevents partial
+// child-task writes that would leave orphaned tasks on retry.
+func (l *Ledger) AddAll(newTasks []Task) error {
+	l.mu.Lock()
+	tasks, err := l.load()
+	if err != nil {
+		l.mu.Unlock()
+		return err
+	}
+	now := time.Now().Format(time.RFC3339)
+	for i := range newTasks {
+		newTasks[i].UpdatedAt = now
+	}
+	tasks = append(tasks, newTasks...)
+	err = l.save(tasks)
+	onChange := l.onChange
+	l.mu.Unlock()
+	if err == nil && onChange != nil {
+		onChange()
+	}
+	return err
+}
+
 // Update modifies fields of an existing task by ID, updating updated_at.
 func (l *Ledger) Update(id string, fields map[string]any) error {
 	l.mu.Lock()

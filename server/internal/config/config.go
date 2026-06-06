@@ -26,7 +26,8 @@ type ProjectConfig struct {
 
 // ServerConfig holds HTTP server settings.
 type ServerConfig struct {
-	Port int `yaml:"port"`
+	Port      int    `yaml:"port"`
+	McpSecret string `yaml:"mcp_secret"` // optional Bearer token for MCP endpoints
 }
 
 // OrchestratorConfig holds Orchestrator settings.

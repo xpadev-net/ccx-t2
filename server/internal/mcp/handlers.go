@@ -322,21 +322,23 @@ func handleSplitTask(deps *Deps) ToolHandler {
 			stopWorkerCleanup(deps, original.WorkerID, original.Branch, id)
 		}
 
-		// Add children before marking parent as split — if Add fails, parent
-		// remains in its original status and can be retried.
-		childIDs := make([]string, 0, len(children))
-		for _, c := range children {
-			if err := deps.Ledger.Add(ledger.Task{
+		// Atomically add all children in one write — prevents partial orphans
+		// if a failure occurs mid-way through adding individual children.
+		childTasks := make([]ledger.Task, len(children))
+		childIDs := make([]string, len(children))
+		for i, c := range children {
+			childTasks[i] = ledger.Task{
 				ID:             c.id,
 				Title:          c.title,
 				Status:         "unstarted",
 				AllowedFiles:   c.allowedFiles,
 				ForbiddenFiles: c.forbiddenFiles,
 				Body:           c.desc,
-			}); err != nil {
-				return nil, err
 			}
-			childIDs = append(childIDs, c.id)
+			childIDs[i] = c.id
+		}
+		if err := deps.Ledger.AddAll(childTasks); err != nil {
+			return nil, err
 		}
 
 		// Update parent to split only after all children are written.
@@ -775,19 +777,22 @@ func handleNotify(deps *Deps) ToolHandler {
 				return nil, fmt.Errorf("proposed_slices produced no valid child tasks")
 			}
 
-			// Add children BEFORE marking parent split — same as handleSplitTask.
-			// If Add fails, parent remains in_progress/blocked and can be retried.
-			for _, c := range srChildren {
-				if err := deps.Ledger.Add(ledger.Task{
+			// Atomically add all children before marking parent split.
+			// AddAll writes all tasks in a single file operation, preventing
+			// partial orphans on failure — parent stays in_progress so retry works.
+			childTasks := make([]ledger.Task, len(srChildren))
+			for i, c := range srChildren {
+				childTasks[i] = ledger.Task{
 					ID:             c.id,
 					Title:          c.title,
 					Status:         "unstarted",
 					AllowedFiles:   c.allowed,
 					ForbiddenFiles: c.forbidden,
 					Body:           c.desc,
-				}); err != nil {
-					return nil, err
 				}
+			}
+			if err := deps.Ledger.AddAll(childTasks); err != nil {
+				return nil, err
 			}
 
 			// Update parent to split after children are safely written.

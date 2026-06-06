@@ -39,15 +39,19 @@ type ToolDef struct {
 // Server handles MCP over HTTP for a single role (orchestrator or worker).
 type Server struct {
 	role     string
+	secret   string // optional Bearer token; empty means no auth required
 	tools    map[string]ToolHandler
 	toolDefs []ToolDef
 }
 
 // NewServer creates a new MCP server for the given role.
-func NewServer(role string) *Server {
+// secret is an optional shared secret; if non-empty every request must carry
+// "Authorization: Bearer {secret}".
+func NewServer(role, secret string) *Server {
 	return &Server{
-		role:  role,
-		tools: make(map[string]ToolHandler),
+		role:   role,
+		secret: secret,
+		tools:  make(map[string]ToolHandler),
 	}
 }
 
@@ -62,6 +66,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
+	}
+
+	if s.secret != "" {
+		auth := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if auth != s.secret {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
 	}
 
 	var req jsonrpcRequest
