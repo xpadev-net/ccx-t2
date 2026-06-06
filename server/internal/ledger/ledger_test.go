@@ -339,6 +339,75 @@ func TestArchiveIdempotentRecovery(t *testing.T) {
 	}
 }
 
+func TestArchiveAlreadyArchivedTaskIsIdempotent(t *testing.T) {
+	dir := t.TempDir()
+	archiveDir := filepath.Join(dir, "archive")
+	l := NewLedger(filepath.Join(dir, "ledger.md"), archiveDir)
+
+	if err := l.Add(Task{ID: "task-001", Title: "Do thing", Status: "completed", Body: "body"}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if err := l.Archive("task-001", "abc123"); err != nil {
+		t.Fatalf("first Archive: %v", err)
+	}
+	if err := l.Archive("task-001", "abc123"); err != nil {
+		t.Fatalf("second Archive for already archived task: %v", err)
+	}
+}
+
+func TestArchivedTaskReturnsArchivedMetadata(t *testing.T) {
+	dir := t.TempDir()
+	archiveDir := filepath.Join(dir, "archive")
+	l := NewLedger(filepath.Join(dir, "ledger.md"), archiveDir)
+
+	if err := l.Add(Task{ID: "task-001", Title: "Do thing", Status: "completed", Branch: "feature/done"}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if err := l.Archive("task-001", "abc123"); err != nil {
+		t.Fatalf("Archive: %v", err)
+	}
+	task, ok, err := l.ArchivedTask("task-001")
+	if err != nil {
+		t.Fatalf("ArchivedTask: %v", err)
+	}
+	if !ok {
+		t.Fatal("ArchivedTask ok = false, want true")
+	}
+	if task.Branch != "feature/done" {
+		t.Fatalf("ArchivedTask branch = %q, want feature/done", task.Branch)
+	}
+}
+
+func TestArchiveAlreadyArchivedRequiresExactID(t *testing.T) {
+	dir := t.TempDir()
+	archiveDir := filepath.Join(dir, "archive")
+	if err := os.MkdirAll(archiveDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(archiveDir, "task-20260607-0001-title.md"), []byte("content"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	l := NewLedger(filepath.Join(dir, "ledger.md"), archiveDir)
+	if err := l.Archive("task-20260607", ""); err == nil {
+		t.Fatal("Archive partial archived ID error = nil, want task not found")
+	}
+	archived, err := l.IsArchived("task-20260607")
+	if err != nil {
+		t.Fatalf("IsArchived(partial ID): %v", err)
+	}
+	if archived {
+		t.Fatal("IsArchived(partial ID) = true, want false")
+	}
+	archived, err = l.IsArchived("task-20260607-0001")
+	if err != nil {
+		t.Fatalf("IsArchived(exact ID): %v", err)
+	}
+	if !archived {
+		t.Fatal("IsArchived(exact ID) = false, want true")
+	}
+}
+
 // ---- GenerateID tests ----
 
 func TestGenerateIDUnique(t *testing.T) {
@@ -382,6 +451,118 @@ func TestGenerateIDNoConflictWithArchive(t *testing.T) {
 	}
 	if id == existingID {
 		t.Errorf("GenerateID returned conflicting ID %s", id)
+	}
+}
+
+func TestAddNewNoConflictWithArchive(t *testing.T) {
+	dir := t.TempDir()
+	archiveDir := filepath.Join(dir, "archive")
+	if err := os.MkdirAll(archiveDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+
+	date := time.Now().Format("20060102")
+	existingID := "task-" + date + "-0001"
+	if err := os.WriteFile(filepath.Join(archiveDir, existingID+"-archived.md"), []byte("content"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	l := NewLedger(filepath.Join(dir, "ledger.md"), archiveDir)
+	id, err := l.AddNew(Task{Title: "New", Status: "unstarted"})
+	if err != nil {
+		t.Fatalf("AddNew: %v", err)
+	}
+	if id == existingID {
+		t.Errorf("AddNew returned archived ID %s", id)
+	}
+}
+
+func TestUpdateIfStatusesReturnPrevReturnsSnapshotAndRejectsDisallowedStatus(t *testing.T) {
+	dir := t.TempDir()
+	l := NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
+
+	if err := l.Add(Task{
+		ID:       "task-001",
+		Title:    "Before",
+		Status:   "in_progress",
+		WorkerID: "worker-old",
+	}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	prev, err := l.UpdateIfStatusesReturnPrev("task-001", []string{"in_progress"}, map[string]any{
+		"status":    "completed",
+		"title":     "After",
+		"worker_id": "",
+	})
+	if err != nil {
+		t.Fatalf("UpdateIfStatusesReturnPrev: %v", err)
+	}
+	if prev.Status != "in_progress" || prev.WorkerID != "worker-old" || prev.Title != "Before" {
+		t.Fatalf("prev snapshot mismatch: %#v", prev)
+	}
+
+	if _, err := l.UpdateIfStatusesReturnPrev("task-001", []string{"in_progress"}, map[string]any{
+		"status": "blocked",
+	}); err == nil {
+		t.Fatal("UpdateIfStatusesReturnPrev with disallowed status error = nil, want error")
+	}
+
+	tasks, err := l.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if tasks[0].Status != "completed" || tasks[0].Title != "After" {
+		t.Fatalf("task changed after rejected update or first update failed: %#v", tasks[0])
+	}
+}
+
+func TestUpdateIfStatusesReturnPrevWithComputesFieldsFromCurrentSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	l := NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
+
+	if err := l.Add(Task{
+		ID:     "task-001",
+		Title:  "Task",
+		Status: "in_progress",
+		Body:   "current body",
+	}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	prev, err := l.UpdateIfStatusesReturnPrevWith("task-001", []string{"in_progress"}, func(current Task) (map[string]any, error) {
+		if current.Body != "current body" {
+			t.Fatalf("updater saw body %q, want current body", current.Body)
+		}
+		return map[string]any{
+			"status": "completed",
+			"body":   current.Body + "\n<!-- merge_commit: abc123 -->",
+		}, nil
+	})
+	if err != nil {
+		t.Fatalf("UpdateIfStatusesReturnPrevWith: %v", err)
+	}
+	if prev.Body != "current body" || prev.Status != "in_progress" {
+		t.Fatalf("prev snapshot mismatch: %#v", prev)
+	}
+
+	called := false
+	if _, err := l.UpdateIfStatusesReturnPrevWith("task-001", []string{"in_progress"}, func(current Task) (map[string]any, error) {
+		called = true
+		return map[string]any{"status": "blocked"}, nil
+	}); err == nil {
+		t.Fatal("UpdateIfStatusesReturnPrevWith disallowed status error = nil, want error")
+	}
+	if called {
+		t.Fatal("updater was called for disallowed status")
+	}
+
+	tasks, err := l.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if tasks[0].Body != "current body\n<!-- merge_commit: abc123 -->" {
+		t.Fatalf("body mismatch: %q", tasks[0].Body)
 	}
 }
 
