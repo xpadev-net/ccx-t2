@@ -247,6 +247,27 @@ func handleUpdateTask(deps *Deps) ToolHandler {
 			return nil, fmt.Errorf("status cannot be changed via update_task")
 		}
 
+		// Reject updates to terminal tasks (completed, split) to prevent stale
+		// orchestrator calls from silently overwriting ledger state.
+		tasks, err := deps.Ledger.Load()
+		if err != nil {
+			return nil, err
+		}
+		var t *ledger.Task
+		for i := range tasks {
+			if tasks[i].ID == id {
+				t = &tasks[i]
+				break
+			}
+		}
+		if t == nil {
+			return nil, fmt.Errorf("task not found: %s", id)
+		}
+		switch t.Status {
+		case "completed", "split":
+			return nil, fmt.Errorf("cannot update task %s with status %q", id, t.Status)
+		}
+
 		return nil, deps.Ledger.Update(id, fields)
 	}
 }
@@ -356,7 +377,6 @@ func handleSplitTask(deps *Deps) ToolHandler {
 				ForbiddenFiles: c.forbiddenFiles,
 				Body:           c.desc,
 			}
-			childIDs[i] = c.id
 		}
 		if err := deps.Ledger.AddAll(childTasks); err != nil {
 			return nil, err
