@@ -262,7 +262,9 @@ func TestTriggerMidCallCancellationKeepsOlderQueuedWork(t *testing.T) {
 	}
 	o := New(l, cfg, "proj", "http://localhost:8080")
 	o.tmux = fake
+	o.mu.Lock()
 	o.queued = []string{"same"}
+	o.mu.Unlock()
 	t.Cleanup(o.Close)
 
 	if err := o.Trigger(ctx, "same"); err == nil {
@@ -314,6 +316,22 @@ func TestTriggerActiveWindowWithZeroTimeoutWaits(t *testing.T) {
 	}
 	if queued := queuedSnapshot(o); !reflect.DeepEqual(queued, []string{"active"}) {
 		t.Fatalf("queued = %#v, want active trigger preserved", queued)
+	}
+	o.mu.Lock()
+	warned := o.warnedNoTimeout
+	o.mu.Unlock()
+	if !warned {
+		t.Fatal("warnedNoTimeout = false, want warning state recorded")
+	}
+	fake.setIdle(true)
+	if _, err := o.isActive(); err != nil {
+		t.Fatalf("isActive idle: %v", err)
+	}
+	o.mu.Lock()
+	warned = o.warnedNoTimeout
+	o.mu.Unlock()
+	if warned {
+		t.Fatal("warnedNoTimeout = true after idle, want reset")
 	}
 }
 

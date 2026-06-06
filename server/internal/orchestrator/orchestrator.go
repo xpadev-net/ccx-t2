@@ -61,12 +61,13 @@ type Orchestrator struct {
 	closeOnce    sync.Once
 	cond         *sync.Cond
 
-	mu       sync.Mutex
-	queued   []string
-	draining bool
-	closed   bool
-	starting bool
-	runStart time.Time
+	mu              sync.Mutex
+	queued          []string
+	draining        bool
+	closed          bool
+	starting        bool
+	runStart        time.Time
+	warnedNoTimeout bool
 }
 
 // New creates an Orchestrator triggerer.
@@ -185,6 +186,15 @@ func (o *Orchestrator) drain() {
 				o.mu.Unlock()
 				return
 			}
+			o.mu.Lock()
+			closed := o.closed
+			if closed {
+				o.draining = false
+			}
+			o.mu.Unlock()
+			if closed {
+				return
+			}
 			// Keep the request queued and retry on the next tick.
 			log.Printf("warn: orchestrator trigger drain retrying after error: %v", err)
 			continue
@@ -232,9 +242,7 @@ func (o *Orchestrator) tryStartNext(ctx context.Context) (bool, error) {
 		return false, context.Canceled
 	}
 	if active && !o.activeTimedOut() {
-		if o.cfg.Orchestrator.Timeout <= 0 {
-			log.Printf("warn: orchestrator window is active and no timeout is configured; queued triggers will wait indefinitely")
-		}
+		o.warnNoTimeoutOnce()
 		return true, nil
 	}
 	if err := o.claimStart(); err != nil {
@@ -317,6 +325,7 @@ func (o *Orchestrator) isActive() (bool, error) {
 	}
 	if !alive {
 		o.clearRunStart()
+		o.clearNoTimeoutWarning()
 		return false, nil
 	}
 	idle, err := o.tmux.IsPaneIdle(o.session, windowName)
@@ -325,6 +334,7 @@ func (o *Orchestrator) isActive() (bool, error) {
 	}
 	if idle {
 		o.clearRunStart()
+		o.clearNoTimeoutWarning()
 		return false, nil
 	}
 	o.markRunObserved()
@@ -349,6 +359,27 @@ func (o *Orchestrator) clearRunStart() {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.runStart = time.Time{}
+}
+
+func (o *Orchestrator) warnNoTimeoutOnce() {
+	if o.cfg.Orchestrator.Timeout > 0 {
+		return
+	}
+	o.mu.Lock()
+	alreadyWarned := o.warnedNoTimeout
+	if !alreadyWarned {
+		o.warnedNoTimeout = true
+	}
+	o.mu.Unlock()
+	if !alreadyWarned {
+		log.Printf("warn: orchestrator window is active and no timeout is configured; queued triggers will wait indefinitely")
+	}
+}
+
+func (o *Orchestrator) clearNoTimeoutWarning() {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.warnedNoTimeout = false
 }
 
 func (o *Orchestrator) activeTimedOut() bool {
