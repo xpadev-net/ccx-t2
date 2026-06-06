@@ -51,6 +51,18 @@ func Resolve(cfg *config.Config, harnessName string) (string, config.HarnessConf
 		}
 	}
 
+	// Ensure the harness is in the worker_harnesses allowlist.
+	allowed := false
+	for _, name := range cfg.WorkerHarnesses {
+		if name == harnessName {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		return "", config.HarnessConfig{}, fmt.Errorf("harness %q is not in worker_harnesses", harnessName)
+	}
+
 	h, ok := cfg.Harnesses[harnessName]
 	if !ok {
 		return "", config.HarnessConfig{}, fmt.Errorf("harness %q not found in harnesses config", harnessName)

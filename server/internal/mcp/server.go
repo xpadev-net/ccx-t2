@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"strings"
 )
@@ -64,7 +65,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req jsonrpcRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	limited := http.MaxBytesReader(w, r.Body, 4<<20) // 4 MB limit
+	if err := json.NewDecoder(limited).Decode(&req); err != nil {
 		writeError(w, nil, -32700, "parse error: "+err.Error())
 		return
 	}
@@ -196,7 +198,8 @@ func stringSliceArg(args map[string]any, key string) ([]string, error) {
 	return nil, fmt.Errorf("argument %q must be an array of strings", key)
 }
 
-// intArg extracts a required int argument (JSON numbers come as float64).
+// intArg extracts a required integer argument. JSON numbers arrive as float64;
+// fractional values and out-of-range values are rejected.
 func intArg(args map[string]any, key string) (int, error) {
 	v, ok := args[key]
 	if !ok {
@@ -204,13 +207,22 @@ func intArg(args map[string]any, key string) (int, error) {
 	}
 	switch n := v.(type) {
 	case float64:
+		if n != math.Trunc(n) {
+			return 0, fmt.Errorf("argument %q must be an integer, got %v", key, n)
+		}
+		if n < math.MinInt || n > math.MaxInt {
+			return 0, fmt.Errorf("argument %q out of int range: %v", key, n)
+		}
 		return int(n), nil
 	case int:
 		return n, nil
 	case int64:
+		if n < math.MinInt || n > math.MaxInt {
+			return 0, fmt.Errorf("argument %q out of int range: %v", key, n)
+		}
 		return int(n), nil
 	}
-	return 0, fmt.Errorf("argument %q must be a number", key)
+	return 0, fmt.Errorf("argument %q must be an integer", key)
 }
 
 // inSchema returns a JSON Schema object for tools/list.

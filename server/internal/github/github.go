@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"time"
 
 	gh "github.com/google/go-github/v60/github"
 )
@@ -55,7 +56,10 @@ func NewClient(token, owner, repo string) (*Client, error) {
 	if token == "" || owner == "" || repo == "" {
 		return nil, fmt.Errorf("github: token, owner, and repo are required")
 	}
-	httpClient := &http.Client{Transport: &tokenTransport{token: token}}
+	httpClient := &http.Client{
+		Transport: &tokenTransport{token: token},
+		Timeout:   30 * time.Second,
+	}
 	return &Client{
 		owner:  owner,
 		repo:   repo,

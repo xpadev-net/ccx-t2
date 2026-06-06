@@ -114,16 +114,27 @@ func applyDefaults(cfg *Config) {
 
 // validate checks required fields and harness configuration.
 func validate(cfg *Config) error {
-	required := map[string]string{
-		"project.slug":          cfg.Project.Slug,
-		"project.repo_path":     cfg.Project.RepoPath,
-		"project.worktree_base": cfg.Project.WorktreeBase,
-		"orchestrator.harness":  cfg.Orchestrator.Harness,
-	}
-	for field, val := range required {
-		if strings.TrimSpace(val) == "" {
-			return fmt.Errorf("config: required field %q is empty", field)
+	// Check required string fields in a deterministic order.
+	type requiredField struct{ name, val string }
+	for _, f := range []requiredField{
+		{"project.slug", cfg.Project.Slug},
+		{"project.repo_path", cfg.Project.RepoPath},
+		{"project.worktree_base", cfg.Project.WorktreeBase},
+		{"orchestrator.harness", cfg.Orchestrator.Harness},
+	} {
+		if strings.TrimSpace(f.val) == "" {
+			return fmt.Errorf("config: required field %q is empty", f.name)
 		}
+	}
+
+	if cfg.Server.Port < 1 || cfg.Server.Port > 65535 {
+		return fmt.Errorf("config: server.port %d out of range [1, 65535]", cfg.Server.Port)
+	}
+	if cfg.Orchestrator.HeartbeatInterval <= 0 {
+		return fmt.Errorf("config: orchestrator.heartbeat_interval must be positive")
+	}
+	if cfg.Orchestrator.Timeout <= 0 {
+		return fmt.Errorf("config: orchestrator.timeout must be positive")
 	}
 
 	if len(cfg.WorkerHarnesses) == 0 {
@@ -150,10 +161,10 @@ func validateHarness(cfg *Config, name string, checkBinary bool) error {
 	if !ok {
 		return fmt.Errorf("not found in harnesses")
 	}
-	if h.Command == "" {
+	if strings.TrimSpace(h.Command) == "" {
 		return fmt.Errorf("command is empty")
 	}
-	if h.McpArgs == "" {
+	if strings.TrimSpace(h.McpArgs) == "" {
 		return fmt.Errorf("mcp_args is empty")
 	}
 	if checkBinary {

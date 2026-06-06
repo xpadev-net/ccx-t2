@@ -223,7 +223,7 @@ func handleUpdateTask(deps *Deps) ToolHandler {
 			fields["body"] = v
 		}
 		for _, key := range []string{"allowed_files", "forbidden_files"} {
-			if v, ok := args[key]; ok {
+			if _, ok := args[key]; ok {
 				sl, err := stringSliceArg(args, key)
 				if err != nil {
 					return nil, err
@@ -232,7 +232,6 @@ func handleUpdateTask(deps *Deps) ToolHandler {
 					return nil, fmt.Errorf("%s: %w", key, err)
 				}
 				fields[key] = sl
-				_ = v
 			}
 		}
 		// status is not updatable via update_task.
@@ -281,26 +280,15 @@ func handleSplitTask(deps *Deps) ToolHandler {
 			return nil, fmt.Errorf("cannot split task with status %q", original.Status)
 		}
 
-		// If in_progress or blocked, clean up the worker first.
-		if original.Status == "in_progress" || original.Status == "blocked" {
-			if err := stopWorkerCleanup(deps, original.WorkerID, original.Branch, id); err != nil {
-				return nil, fmt.Errorf("cleanup before split: %w", err)
-			}
+		// Build all child tasks first (before any mutations) to validate paths.
+		type childTask struct {
+			id             string
+			title          string
+			desc           string
+			allowedFiles   []string
+			forbiddenFiles []string
 		}
-
-		// Update original to split.
-		if err := deps.Ledger.Update(id, map[string]any{
-			"status":     "split",
-			"reason":     reason,
-			"worker_id":  "",
-			"branch":     "",
-			"harness":    "",
-		}); err != nil {
-			return nil, err
-		}
-
-		// Add child tasks.
-		childIDs := make([]string, 0, len(slicesAny))
+		children := make([]childTask, 0, len(slicesAny))
 		for _, s := range slicesAny {
 			sliceMap, ok := s.(map[string]any)
 			if !ok {
@@ -310,23 +298,58 @@ func handleSplitTask(deps *Deps) ToolHandler {
 			childDesc, _ := sliceMap["description"].(string)
 			childAllowed, _ := stringSliceArg(sliceMap, "allowed_files")
 			childForbidden, _ := stringSliceArg(sliceMap, "forbidden_files")
-
+			if err := ledger.ValidatePaths(childAllowed); err != nil {
+				return nil, fmt.Errorf("slice allowed_files: %w", err)
+			}
+			if err := ledger.ValidatePaths(childForbidden); err != nil {
+				return nil, fmt.Errorf("slice forbidden_files: %w", err)
+			}
 			childID, err := deps.Ledger.GenerateID()
 			if err != nil {
 				return nil, err
 			}
+			children = append(children, childTask{
+				id:             childID,
+				title:          childTitle,
+				desc:           childDesc,
+				allowedFiles:   childAllowed,
+				forbiddenFiles: childForbidden,
+			})
+		}
+
+		// If in_progress or blocked, clean up the worker first.
+		if original.Status == "in_progress" || original.Status == "blocked" {
+			stopWorkerCleanup(deps, original.WorkerID, original.Branch, id)
+		}
+
+		// Add children before marking parent as split — if Add fails, parent
+		// remains in its original status and can be retried.
+		childIDs := make([]string, 0, len(children))
+		for _, c := range children {
 			if err := deps.Ledger.Add(ledger.Task{
-				ID:             childID,
-				Title:          childTitle,
+				ID:             c.id,
+				Title:          c.title,
 				Status:         "unstarted",
-				AllowedFiles:   childAllowed,
-				ForbiddenFiles: childForbidden,
-				Body:           childDesc,
+				AllowedFiles:   c.allowedFiles,
+				ForbiddenFiles: c.forbiddenFiles,
+				Body:           c.desc,
 			}); err != nil {
 				return nil, err
 			}
-			childIDs = append(childIDs, childID)
+			childIDs = append(childIDs, c.id)
 		}
+
+		// Update parent to split only after all children are written.
+		if err := deps.Ledger.Update(id, map[string]any{
+			"status":    "split",
+			"reason":    reason,
+			"worker_id": "",
+			"branch":    "",
+			"harness":   "",
+		}); err != nil {
+			return nil, err
+		}
+
 		return map[string]any{"child_ids": childIDs}, nil
 	}
 }
@@ -543,9 +566,7 @@ func handleStopWorker(deps *Deps) ToolHandler {
 			}
 		}
 
-		if err := stopWorkerCleanup(deps, workerID, branch, taskID); err != nil {
-			return nil, err
-		}
+		stopWorkerCleanup(deps, workerID, branch, taskID)
 
 		if taskID != "" {
 			if err := deps.Ledger.Update(taskID, map[string]any{
@@ -720,9 +741,53 @@ func handleNotify(deps *Deps) ToolHandler {
 				return nil, fmt.Errorf("proposed_slices must not be empty for split_request")
 			}
 
+			// Validate and build children before any mutations.
+			type srChild struct {
+				id, title, desc string
+				allowed, forbidden []string
+			}
+			srChildren := make([]srChild, 0, len(proposedSlices))
+			for _, s := range proposedSlices {
+				sliceMap, ok := s.(map[string]any)
+				if !ok {
+					continue
+				}
+				childAllowed, _ := stringSliceArg(sliceMap, "allowed_files")
+				childForbidden, _ := stringSliceArg(sliceMap, "forbidden_files")
+				if err := ledger.ValidatePaths(childAllowed); err != nil {
+					return nil, fmt.Errorf("slice allowed_files: %w", err)
+				}
+				if err := ledger.ValidatePaths(childForbidden); err != nil {
+					return nil, fmt.Errorf("slice forbidden_files: %w", err)
+				}
+				childID, err := deps.Ledger.GenerateID()
+				if err != nil {
+					return nil, err
+				}
+				childTitle, _ := sliceMap["title"].(string)
+				childDesc, _ := sliceMap["description"].(string)
+				srChildren = append(srChildren, srChild{
+					id: childID, title: childTitle, desc: childDesc,
+					allowed: childAllowed, forbidden: childForbidden,
+				})
+			}
+
+			// Update ledger BEFORE resource cleanup so task is never stuck
+			// in in_progress with no live worker if the update fails.
+			if err := deps.Ledger.Update(taskID, map[string]any{
+				"status":    "split",
+				"worker_id": "",
+				"branch":    "",
+				"harness":   "",
+				"reason":    reason,
+			}); err != nil {
+				return nil, err
+			}
+
+			// Cleanup resources (best-effort after ledger is committed).
 			wid := task.WorkerID
 			if wid == "" {
-				wid = "worker-" + taskID // fallback
+				wid = "worker-" + taskID
 			}
 			_ = tmux.KillWindow(deps.Session, wid)
 			_ = worktree.Remove(deps.Config.Project.RepoPath,
@@ -734,37 +799,14 @@ func handleNotify(deps *Deps) ToolHandler {
 			}
 			deps.Registry.Remove(wid)
 
-			if err := deps.Ledger.Update(taskID, map[string]any{
-				"status":    "split",
-				"worker_id": "",
-				"branch":    "",
-				"harness":   "",
-				"reason":    reason,
-			}); err != nil {
-				return nil, err
-			}
-
-			for _, s := range proposedSlices {
-				sliceMap, ok := s.(map[string]any)
-				if !ok {
-					continue
-				}
-				childTitle, _ := sliceMap["title"].(string)
-				childDesc, _ := sliceMap["description"].(string)
-				childAllowed, _ := stringSliceArg(sliceMap, "allowed_files")
-				childForbidden, _ := stringSliceArg(sliceMap, "forbidden_files")
-
-				childID, err := deps.Ledger.GenerateID()
-				if err != nil {
-					return nil, err
-				}
+			for _, c := range srChildren {
 				if err := deps.Ledger.Add(ledger.Task{
-					ID:             childID,
-					Title:          childTitle,
+					ID:             c.id,
+					Title:          c.title,
 					Status:         "unstarted",
-					AllowedFiles:   childAllowed,
-					ForbiddenFiles: childForbidden,
-					Body:           childDesc,
+					AllowedFiles:   c.allowed,
+					ForbiddenFiles: c.forbidden,
+					Body:           c.desc,
 				}); err != nil {
 					return nil, err
 				}
@@ -780,8 +822,10 @@ func handleNotify(deps *Deps) ToolHandler {
 
 // ---- helpers ----
 
-// stopWorkerCleanup kills the tmux window and removes the worktree/branch.
-func stopWorkerCleanup(deps *Deps, workerID, branch, taskID string) error {
+// stopWorkerCleanup is best-effort cleanup: it kills the tmux window,
+// removes the worktree, deletes the git branch, and evicts the registry entry.
+// All errors are silently ignored; callers must not rely on this returning nil.
+func stopWorkerCleanup(deps *Deps, workerID, branch, taskID string) {
 	if workerID != "" {
 		_ = tmux.KillWindow(deps.Session, workerID)
 	}
@@ -797,7 +841,6 @@ func stopWorkerCleanup(deps *Deps, workerID, branch, taskID string) error {
 	if workerID != "" {
 		deps.Registry.Remove(workerID)
 	}
-	return nil
 }
 
 // extractMergeCommit reads the <!-- merge_commit: ... --> comment from a body.
