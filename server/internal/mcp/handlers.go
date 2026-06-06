@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/kballard/go-shellquote"
+	shellquote "github.com/kballard/go-shellquote"
 	"github.com/xpadev/ccx-t2/internal/config"
 	githubpkg "github.com/xpadev/ccx-t2/internal/github"
 	"github.com/xpadev/ccx-t2/internal/harness"
@@ -20,11 +20,12 @@ import (
 
 // Deps holds the dependencies used by MCP tool handlers.
 type Deps struct {
-	Ledger   *ledger.Ledger
-	Registry *worker.Registry
-	Config   *config.Config
-	Session  string // tmux session name
-	BaseURL  string // e.g. "http://localhost:8080"
+	Ledger       *ledger.Ledger
+	Registry     *worker.Registry
+	Config       *config.Config
+	GitHub       *githubpkg.Client // may be nil if GitHub is not configured
+	Session      string            // tmux session name
+	BaseURL      string            // e.g. "http://localhost:8080"
 }
 
 // RegisterOrchestratorTools registers the 10 Orchestrator tools on s.
@@ -611,17 +612,10 @@ func handleGetPRStatus(deps *Deps) ToolHandler {
 			return nil, err
 		}
 
-		cfg := deps.Config.GitHub
-		if cfg.Token == "" || cfg.Owner == "" || cfg.Repo == "" {
+		if deps.GitHub == nil {
 			return nil, fmt.Errorf("github.token, github.owner, and github.repo must be configured")
 		}
-
-		client, err := githubpkg.NewClient(cfg.Token, cfg.Owner, cfg.Repo)
-		if err != nil {
-			return nil, err
-		}
-
-		return client.GetPRStatus(ctx, prNumber)
+		return deps.GitHub.GetPRStatus(ctx, prNumber)
 	}
 }
 
@@ -694,13 +688,16 @@ func handleNotify(deps *Deps) ToolHandler {
 				return nil, err
 			}
 
-			// Cleanup worker resources.
-			workerID := "worker-" + taskID
-			_ = tmux.KillWindow(deps.Session, workerID)
+			// Cleanup worker resources using the ledger's worker_id (not reconstructed).
+			wid := task.WorkerID
+			if wid == "" {
+				wid = "worker-" + taskID // fallback
+			}
+			_ = tmux.KillWindow(deps.Session, wid)
 			_ = worktree.Remove(deps.Config.Project.RepoPath,
 				filepath.Join(deps.Config.Project.WorktreeBase,
 					deps.Config.Project.Slug+"-"+taskID))
-			deps.Registry.Remove(workerID)
+			deps.Registry.Remove(wid)
 
 		case "blocked":
 			reason, _ := payload["reason"].(string)
@@ -718,8 +715,11 @@ func handleNotify(deps *Deps) ToolHandler {
 				return nil, fmt.Errorf("proposed_slices must not be empty for split_request")
 			}
 
-			workerID := "worker-" + taskID
-			_ = tmux.KillWindow(deps.Session, workerID)
+			wid := task.WorkerID
+			if wid == "" {
+				wid = "worker-" + taskID // fallback
+			}
+			_ = tmux.KillWindow(deps.Session, wid)
 			_ = worktree.Remove(deps.Config.Project.RepoPath,
 				filepath.Join(deps.Config.Project.WorktreeBase,
 					deps.Config.Project.Slug+"-"+taskID))
@@ -727,7 +727,7 @@ func handleNotify(deps *Deps) ToolHandler {
 				_ = exec.Command("git", "-C", deps.Config.Project.RepoPath,
 					"branch", "-D", task.Branch).Run()
 			}
-			deps.Registry.Remove(workerID)
+			deps.Registry.Remove(wid)
 
 			if err := deps.Ledger.Update(taskID, map[string]any{
 				"status":    "split",

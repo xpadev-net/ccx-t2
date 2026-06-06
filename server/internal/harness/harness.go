@@ -26,10 +26,14 @@ func List(cfg *config.Config) []Info {
 			_, err := exec.LookPath(h.Command)
 			available = err == nil
 		}
+		usage := map[string]any{"note": "unavailable"}
+		if available {
+			usage = map[string]any{"command": h.Command, "mcp_args": h.McpArgs}
+		}
 		out = append(out, Info{
 			Name:      name,
 			Available: available,
-			Usage:     map[string]any{"note": "unavailable"},
+			Usage:     usage,
 		})
 	}
 	return out

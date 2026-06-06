@@ -79,17 +79,22 @@ func (c *Client) GetPRStatus(ctx context.Context, prNumber int) (*PRStatus, erro
 
 	headSHA := pr.GetHead().GetSHA()
 	opts := &gh.ListCheckRunsOptions{ListOptions: gh.ListOptions{PerPage: 100}}
-	runs, _, err := c.client.Checks.ListCheckRunsForRef(ctx, c.owner, c.repo, headSHA, opts)
-	if err != nil {
-		return nil, fmt.Errorf("list check runs: %w", err)
-	}
-
-	checks := make([]Check, 0, len(runs.CheckRuns))
-	for _, run := range runs.CheckRuns {
-		checks = append(checks, Check{
-			Name:   run.GetName(),
-			Status: normalizeCheckStatus(run),
-		})
+	var checks []Check
+	for {
+		runs, resp, err := c.client.Checks.ListCheckRunsForRef(ctx, c.owner, c.repo, headSHA, opts)
+		if err != nil {
+			return nil, fmt.Errorf("list check runs: %w", err)
+		}
+		for _, run := range runs.CheckRuns {
+			checks = append(checks, Check{
+				Name:   run.GetName(),
+				Status: normalizeCheckStatus(run),
+			})
+		}
+		if resp.NextPage == 0 {
+			break
+		}
+		opts.Page = resp.NextPage
 	}
 
 	return &PRStatus{
@@ -108,7 +113,7 @@ func normalizeCheckStatus(run *gh.CheckRun) CheckStatus {
 	switch conclusion {
 	case "success", "neutral", "skipped":
 		return CheckSuccess
-	case "failure", "timed_out", "cancelled", "action_required":
+	case "failure", "timed_out", "cancelled", "action_required", "stale":
 		return CheckFailure
 	}
 	switch status {
