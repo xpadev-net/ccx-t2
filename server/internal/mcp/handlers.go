@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"fmt"
+	"log"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -541,14 +542,14 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 		harnessCmd := hCfg.Command + " " + mcpArgsStr
 		if err := tmux.SendKeys(deps.Session, workerID, harnessCmd); err != nil {
 			// Best-effort: harness may still start.
-			fmt.Printf("warn: send harness command: %v\n", err)
+			log.Printf("warn: send harness command: %v", err)
 		}
 
 		// Step 5: Send task prompt.
 		prompt := buildWorkerPrompt(task, taskID, branch, allowedFiles, forbiddenFiles,
 			worktreePath, deps.Config.Project.ValidationCommand)
 		if err := tmux.SendKeys(deps.Session, workerID, prompt); err != nil {
-			fmt.Printf("warn: send task prompt: %v\n", err)
+			log.Printf("warn: send task prompt: %v", err)
 		}
 
 		return map[string]any{
@@ -785,6 +786,9 @@ func handleNotify(deps *Deps) ToolHandler {
 					return nil, fmt.Errorf("proposed_slices[%d] forbidden_files: %w", i, err)
 				}
 				childTitle, _ := sliceMap["title"].(string)
+				if childTitle == "" {
+					return nil, fmt.Errorf("proposed_slices[%d]: title is required", i)
+				}
 				childDesc, _ := sliceMap["description"].(string)
 				pendingSRs = append(pendingSRs, pendingSR{
 					title: childTitle, desc: childDesc,
