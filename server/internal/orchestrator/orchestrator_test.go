@@ -62,6 +62,11 @@ func (f *fakeTmux) SendKeys(ctx context.Context, session, window, keys string) e
 		f.prompts = append(f.prompts, string(prompt))
 		f.mu.Unlock()
 	}
+	if secretPath := secretFileFromLaunchCommand(keys); secretPath != "" {
+		if err := os.Remove(secretPath); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -168,12 +173,24 @@ func TestTriggerStartsOrchestratorWithSnapshotAndMCPArgs(t *testing.T) {
 	if promptPath == "" {
 		t.Fatalf("prompt path is empty in command %q", command)
 	}
+	if strings.Contains(command, "tok en") {
+		t.Fatalf("command exposes MCP secret: %q", command)
+	}
+	if strings.Contains(command, `"$`+secretEnvName+`"`) {
+		t.Fatalf("command expands MCP secret into argv: %q", command)
+	}
+	if !strings.Contains(command, "export "+secretEnvName) {
+		t.Fatalf("command does not export MCP secret env: %q", command)
+	}
+	if secretPath := secretFileFromLaunchCommand(command); secretPath == "" {
+		t.Fatalf("secret path is empty in command %q", command)
+	}
 	harnessCommand := harnessCommandFromLaunchCommand(command)
 	args, err := shellquote.Split(harnessCommand)
 	if err != nil {
 		t.Fatalf("command shell syntax: %v", err)
 	}
-	wantArgs := []string{"sh", "-c", "http://localhost:8080/mcp/orchestrator", "tok en"}
+	wantArgs := []string{"sh", "-c", "http://localhost:8080/mcp/orchestrator", "$CCX_MCP_SECRET"}
 	if !reflect.DeepEqual(args, wantArgs) {
 		t.Fatalf("harness args = %#v, want %#v", args, wantArgs)
 	}
@@ -533,7 +550,7 @@ func TestDrainRetriesAfterStartError(t *testing.T) {
 	deadline := time.After(time.Second)
 	for {
 		creates, commands, prompts := fake.counts()
-		if creates >= 2 && commands == 1 && prompts == 1 {
+		if creates >= 2 && commands == 1 && prompts == 1 && len(queuedSnapshot(o)) == 0 {
 			break
 		}
 		select {
@@ -733,6 +750,35 @@ func TestCloseStopsInFlightDrainBeforeStart(t *testing.T) {
 	}
 }
 
+func TestCloseCancelsInFlightDrainStart(t *testing.T) {
+	l, cfg := newTestDeps(t)
+	insideCreate := make(chan struct{})
+	fake := &blockingCreateTmux{
+		fakeTmux:      fakeTmux{alive: true, idle: false},
+		insideCreate:  insideCreate,
+		releaseCreate: make(chan struct{}),
+	}
+	o := New(l, cfg, "proj", "http://localhost:8080")
+	o.tmux = fake
+	o.pollInterval = time.Millisecond
+
+	if err := o.Trigger(context.Background(), "queued"); err != nil {
+		t.Fatalf("Trigger queued behind active window: %v", err)
+	}
+	fake.setIdle(true)
+	waitForSignal(t, insideCreate, "insideCreate")
+
+	closed := make(chan struct{})
+	go func() {
+		o.Close()
+		close(closed)
+	}()
+	waitForSignal(t, closed, "Close")
+	if queued := queuedSnapshot(o); !reflect.DeepEqual(queued, []string{"queued"}) {
+		t.Fatalf("queued = %#v, want queued work preserved after canceled drain start", queued)
+	}
+}
+
 func TestNewTrimsSessionAndBaseURL(t *testing.T) {
 	l, cfg := newTestDeps(t)
 	o := New(l, cfg, " proj ", " http://localhost:8080/ ")
@@ -899,6 +945,15 @@ func promptFileFromLaunchCommand(command string) string {
 		return ""
 	}
 	return singleQuotedValue(command[i+3:])
+}
+
+func secretFileFromLaunchCommand(command string) string {
+	prefix := secretEnvName + "=$(cat "
+	if !strings.HasPrefix(command, prefix) {
+		return ""
+	}
+	rest := strings.TrimPrefix(command, prefix)
+	return singleQuotedValue(rest)
 }
 
 func harnessCommandFromLaunchCommand(command string) string {

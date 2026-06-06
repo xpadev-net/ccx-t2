@@ -23,6 +23,9 @@ const (
 	maxReasonLen     = 200
 	maxQueuedReasons = 256
 	cleanupTmuxLimit = 5 * time.Second
+	secretEnvName    = "CCX_MCP_SECRET"
+	secretToken      = "{secret}"
+	secretEnvToken   = "__CCX_MCP_SECRET_ENV__"
 )
 
 type tmuxClient interface {
@@ -164,11 +167,13 @@ func (o *Orchestrator) Close() {
 	o.closeOnce.Do(func() {
 		o.mu.Lock()
 		o.closed = true
+		o.mu.Unlock()
+		close(o.done)
+		o.mu.Lock()
 		for o.starting {
 			o.cond.Wait()
 		}
 		o.mu.Unlock()
-		close(o.done)
 	})
 }
 
@@ -426,7 +431,12 @@ func (o *Orchestrator) start(ctx context.Context, reason string) (bool, error) {
 	if !ok {
 		return false, fmt.Errorf("orchestrator harness %q not configured", o.cfg.Orchestrator.Harness)
 	}
-	tokens, err := buildMCPTokens(hCfg.McpArgs, o.baseURL+"/mcp/orchestrator", o.cfg.Server.McpSecret)
+	secretPath := ""
+	secretReplacement := o.cfg.Server.McpSecret
+	if o.cfg.Server.McpSecret != "" && strings.Contains(hCfg.McpArgs, secretToken) {
+		secretReplacement = secretEnvToken
+	}
+	tokens, err := buildMCPTokens(hCfg.McpArgs, o.baseURL+"/mcp/orchestrator", secretReplacement)
 	if err != nil {
 		return false, fmt.Errorf("orchestrator mcp_args: %w", err)
 	}
@@ -457,12 +467,21 @@ func (o *Orchestrator) start(ctx context.Context, reason string) (bool, error) {
 	if err := o.tmux.CreateWindow(ctx, o.session, windowName, o.cfg.Project.RepoPath); err != nil {
 		return false, fmt.Errorf("create orchestrator window: %w", err)
 	}
+	if secretReplacement == secretEnvToken {
+		secretPath, err = o.writeTempFile("ccx-orchestrator-secret-*", o.cfg.Server.McpSecret)
+		if err != nil {
+			o.cleanupStartedWindow()
+			return false, fmt.Errorf("write orchestrator secret: %w", err)
+		}
+	}
 	promptPath, err := o.writePromptFile(prompt)
 	if err != nil {
+		_ = os.Remove(secretPath)
 		o.cleanupStartedWindow()
 		return false, fmt.Errorf("write orchestrator prompt: %w", err)
 	}
-	if err := o.tmux.SendKeys(ctx, o.session, windowName, buildHarnessLaunchCommand(hCfg.Command, tokens, promptPath)); err != nil {
+	if err := o.tmux.SendKeys(ctx, o.session, windowName, buildHarnessLaunchCommand(hCfg.Command, tokens, promptPath, secretPath)); err != nil {
+		_ = os.Remove(secretPath)
 		_ = os.Remove(promptPath)
 		o.cleanupStartedWindow()
 		return false, fmt.Errorf("send orchestrator command: %w", err)
@@ -472,12 +491,16 @@ func (o *Orchestrator) start(ctx context.Context, reason string) (bool, error) {
 }
 
 func (o *Orchestrator) writePromptFile(prompt string) (string, error) {
-	f, err := os.CreateTemp("", "ccx-orchestrator-prompt-*")
+	return o.writeTempFile("ccx-orchestrator-prompt-*", prompt)
+}
+
+func (o *Orchestrator) writeTempFile(pattern, contents string) (string, error) {
+	f, err := os.CreateTemp("", pattern)
 	if err != nil {
 		return "", err
 	}
 	path := f.Name()
-	if _, err := f.WriteString(prompt); err != nil {
+	if _, err := f.WriteString(contents); err != nil {
 		_ = f.Close()
 		_ = os.Remove(path)
 		return "", err
@@ -589,11 +612,32 @@ func buildHarnessCommand(command string, mcpTokens []string) string {
 	return strings.Join(parts, " ")
 }
 
-func buildHarnessLaunchCommand(command string, mcpTokens []string, promptPath string) string {
+func buildHarnessCommandWithSecretEnv(command string, mcpTokens []string) string {
+	parts := make([]string, 0, 1+len(mcpTokens))
+	parts = append(parts, shellQuoteArg(command))
+	for _, tok := range mcpTokens {
+		parts = append(parts, shellQuoteArgWithSecretEnv(tok))
+	}
+	return strings.Join(parts, " ")
+}
+
+func buildHarnessLaunchCommand(command string, mcpTokens []string, promptPath, secretPath string) string {
 	quotedPromptPath := shellQuoteArg(promptPath)
-	return "{ rm -f " + quotedPromptPath + "; exec " + buildHarnessCommand(command, mcpTokens) + "; } < " + quotedPromptPath
+	prefix := ""
+	if secretPath != "" {
+		quotedSecretPath := shellQuoteArg(secretPath)
+		prefix = secretEnvName + "=$(cat " + quotedSecretPath + "); export " + secretEnvName + "; rm -f " + quotedSecretPath + "; "
+	}
+	return prefix + "{ rm -f " + quotedPromptPath + "; exec " + buildHarnessCommandWithSecretEnv(command, mcpTokens) + "; } < " + quotedPromptPath
 }
 
 func shellQuoteArg(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
+}
+
+func shellQuoteArgWithSecretEnv(s string) string {
+	if !strings.Contains(s, secretEnvToken) {
+		return shellQuoteArg(s)
+	}
+	return shellQuoteArg(strings.ReplaceAll(s, secretEnvToken, "$"+secretEnvName))
 }
