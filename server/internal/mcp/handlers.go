@@ -190,20 +190,17 @@ func handleCreateTask(deps *Deps) ToolHandler {
 			return nil, fmt.Errorf("forbidden_files: %w", err)
 		}
 
-		id, err := deps.Ledger.GenerateID()
-		if err != nil {
-			return nil, err
-		}
-
+		// Use AddNew to generate ID and append atomically, avoiding a TOCTOU race
+		// where concurrent create_task calls generate the same sequence number.
 		t := ledger.Task{
-			ID:             id,
 			Title:          title,
 			Status:         "unstarted",
 			AllowedFiles:   allowedFiles,
 			ForbiddenFiles: forbiddenFiles,
 			Body:           description,
 		}
-		if err := deps.Ledger.Add(t); err != nil {
+		id, err := deps.Ledger.AddNew(t)
+		if err != nil {
 			return nil, err
 		}
 		return map[string]any{"id": id}, nil

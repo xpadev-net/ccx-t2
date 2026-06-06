@@ -142,6 +142,35 @@ func (l *Ledger) save(tasks []Task) error {
 	return nil
 }
 
+// AddNew generates a unique ID and appends the task atomically in a single
+// read + write, returning the generated ID. Use this instead of separate
+// GenerateID + Add calls to avoid a TOCTOU race where two concurrent callers
+// observe the same on-disk state and generate the same sequence number.
+func (l *Ledger) AddNew(task Task) (string, error) {
+	l.mu.Lock()
+	// Load once and reuse for both ID generation and the append.
+	tasks, err := l.load()
+	if err != nil {
+		l.mu.Unlock()
+		return "", err
+	}
+	id, err := l.generateIDFromTasks(tasks)
+	if err != nil {
+		l.mu.Unlock()
+		return "", err
+	}
+	task.ID = id
+	task.UpdatedAt = time.Now().Format(time.RFC3339)
+	tasks = append(tasks, task)
+	err = l.save(tasks)
+	onChange := l.onChange
+	l.mu.Unlock()
+	if err == nil && onChange != nil {
+		onChange()
+	}
+	return id, err
+}
+
 // Add appends a new task to the ledger with updated_at set to now.
 func (l *Ledger) Add(task Task) error {
 	l.mu.Lock()
@@ -496,7 +525,10 @@ func (l *Ledger) generateID() (string, error) {
 	if err != nil {
 		return "", err
 	}
+	return l.generateIDFromTasks(tasks)
+}
 
+func (l *Ledger) generateIDFromTasks(tasks []Task) (string, error) {
 	existing := make(map[string]bool)
 	for _, t := range tasks {
 		existing[t.ID] = true

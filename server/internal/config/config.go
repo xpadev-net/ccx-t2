@@ -176,7 +176,7 @@ func validateHarness(cfg *Config, name string, checkBinary bool) error {
 		return fmt.Errorf("mcp_args must contain the {url} placeholder")
 	}
 	if cfg.Server.McpSecret != "" && !strings.Contains(h.McpArgs, "{secret}") {
-		return fmt.Errorf("mcp_secret is configured but mcp_args does not contain {secret}; workers will receive 401 on every notify call")
+		return fmt.Errorf("mcp_secret is configured but mcp_args does not contain {secret}; the harness will receive 401 on every MCP call")
 	}
 	if cfg.Server.McpSecret == "" && strings.Contains(h.McpArgs, "{secret}") {
 		return fmt.Errorf("mcp_args contains {secret} placeholder but mcp_secret is not configured; {secret} will expand to empty string")
