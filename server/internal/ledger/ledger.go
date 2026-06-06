@@ -203,6 +203,38 @@ func (l *Ledger) AddAll(newTasks []Task) error {
 	return err
 }
 
+// DeleteTasks removes tasks with the given IDs from the ledger, ignoring
+// IDs that are not present. Used to roll back orphaned tasks after a
+// partial write failure (e.g., AddAll succeeded but the parent Update failed).
+func (l *Ledger) DeleteTasks(ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	l.mu.Lock()
+	tasks, err := l.load()
+	if err != nil {
+		l.mu.Unlock()
+		return err
+	}
+	del := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		del[id] = true
+	}
+	remaining := tasks[:0]
+	for _, t := range tasks {
+		if !del[t.ID] {
+			remaining = append(remaining, t)
+		}
+	}
+	err = l.save(remaining)
+	onChange := l.onChange
+	l.mu.Unlock()
+	if err == nil && onChange != nil {
+		onChange()
+	}
+	return err
+}
+
 // Update modifies fields of an existing task by ID, updating updated_at.
 func (l *Ledger) Update(id string, fields map[string]any) error {
 	l.mu.Lock()

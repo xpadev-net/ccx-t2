@@ -363,6 +363,8 @@ func handleSplitTask(deps *Deps) ToolHandler {
 			"branch":    "",
 			"harness":   "",
 		}); err != nil {
+			// Roll back the children to avoid orphans on retry.
+			_ = deps.Ledger.DeleteTasks(childIDs)
 			return nil, err
 		}
 
@@ -407,7 +409,12 @@ func handleArchiveTask(deps *Deps) ToolHandler {
 			return nil, err
 		}
 
-		// Delete git branch.
+		// Best-effort cleanup: remove worktree (may still exist if the server
+		// crashed between notify(completed) and the worktree.Remove call) and
+		// delete the git branch.
+		wPath := filepath.Join(deps.Config.Project.WorktreeBase,
+			deps.Config.Project.Slug+"-"+id)
+		_ = worktree.Remove(deps.Config.Project.RepoPath, wPath)
 		if t.Branch != "" {
 			_ = exec.Command("git", "-C", deps.Config.Project.RepoPath, "branch", "-D", t.Branch).Run()
 		}
@@ -553,11 +560,22 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 		// mcpArgsStr was validated above; use it directly to preserve quoting.
 		harnessCmd := hCfg.Command + " " + mcpArgsStr
 		if err := tmux.SendKeys(deps.Session, workerID, harnessCmd); err != nil {
-			// Best-effort: harness may still start.
-			log.Printf("warn: send harness command: %v", err)
+			// Harness failed to launch — roll back all resources so the task
+			// can be retried with stop_worker or a new spawn_worker call.
+			_ = tmux.KillWindow(deps.Session, workerID)
+			_ = worktree.Remove(repoPath, worktreePath)
+			_ = exec.Command("git", "-C", repoPath, "branch", "-D", branch).Run()
+			_ = deps.Ledger.Update(taskID, map[string]any{
+				"status":    "unstarted",
+				"worker_id": "",
+				"branch":    "",
+				"harness":   "",
+			})
+			deps.Registry.Remove(workerID)
+			return nil, fmt.Errorf("send harness command: %w", err)
 		}
 
-		// Step 5: Send task prompt.
+		// Step 5: Send task prompt (best-effort — worker is already running).
 		prompt := buildWorkerPrompt(task, taskID, branch, allowedFiles, forbiddenFiles,
 			worktreePath, deps.Config.Project.ValidationCommand)
 		if err := tmux.SendKeys(deps.Session, workerID, prompt); err != nil {
@@ -843,6 +861,10 @@ func handleNotify(deps *Deps) ToolHandler {
 			}
 
 			// Update parent to split after children are safely written.
+			srChildIDs := make([]string, len(srChildren))
+			for i, c := range srChildren {
+				srChildIDs[i] = c.id
+			}
 			if err := deps.Ledger.Update(taskID, map[string]any{
 				"status":    "split",
 				"worker_id": "",
@@ -850,6 +872,8 @@ func handleNotify(deps *Deps) ToolHandler {
 				"harness":   "",
 				"reason":    reason,
 			}); err != nil {
+				// Roll back the children to avoid orphans on retry.
+				_ = deps.Ledger.DeleteTasks(srChildIDs)
 				return nil, err
 			}
 
