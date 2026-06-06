@@ -113,11 +113,8 @@ func (o *Orchestrator) drain() {
 	for range ticker.C {
 		startedOrBusy, err := o.tryStartNext(context.Background())
 		if err != nil {
-			// Keep the request queued; a later heartbeat or event can retry.
-			o.mu.Lock()
-			o.draining = false
-			o.mu.Unlock()
-			return
+			// Keep the request queued and retry on the next tick.
+			continue
 		}
 		if startedOrBusy {
 			continue
@@ -154,8 +151,12 @@ func (o *Orchestrator) tryStartNext(ctx context.Context) (bool, error) {
 	if active {
 		return true, nil
 	}
-	if err := o.start(ctx, reason); err != nil {
+	started, err := o.start(ctx, reason)
+	if err != nil {
 		return false, err
+	}
+	if !started {
+		return true, nil
 	}
 	o.mu.Lock()
 	if len(o.queued) > 0 {
@@ -202,52 +203,52 @@ func (o *Orchestrator) isActive() (bool, error) {
 	return !idle, nil
 }
 
-func (o *Orchestrator) start(ctx context.Context, reason string) error {
+func (o *Orchestrator) start(ctx context.Context, reason string) (bool, error) {
 	if err := ctx.Err(); err != nil {
-		return err
+		return false, err
 	}
 	hCfg, ok := o.cfg.Harnesses[o.cfg.Orchestrator.Harness]
 	if !ok {
-		return fmt.Errorf("orchestrator harness %q not configured", o.cfg.Orchestrator.Harness)
+		return false, fmt.Errorf("orchestrator harness %q not configured", o.cfg.Orchestrator.Harness)
 	}
 	tokens, err := buildMCPTokens(hCfg.McpArgs, o.baseURL+"/mcp/orchestrator", o.cfg.Server.McpSecret)
 	if err != nil {
-		return fmt.Errorf("orchestrator mcp_args: %w", err)
+		return false, fmt.Errorf("orchestrator mcp_args: %w", err)
 	}
 	prompt, err := o.buildPrompt(reason)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	if err := o.tmux.EnsureSession(o.session); err != nil {
-		return fmt.Errorf("ensure tmux session: %w", err)
+		return false, fmt.Errorf("ensure tmux session: %w", err)
 	}
 	alive, err := o.tmux.IsWindowAlive(o.session, windowName)
 	if err != nil {
-		return fmt.Errorf("check orchestrator window: %w", err)
+		return false, fmt.Errorf("check orchestrator window: %w", err)
 	}
 	if alive {
 		idle, err := o.tmux.IsPaneIdle(o.session, windowName)
 		if err != nil {
-			return fmt.Errorf("check orchestrator pane: %w", err)
+			return false, fmt.Errorf("check orchestrator pane: %w", err)
 		}
 		if !idle {
-			return nil
+			return false, nil
 		}
 		if err := o.tmux.KillWindow(o.session, windowName); err != nil {
-			return fmt.Errorf("reset idle orchestrator window: %w", err)
+			return false, fmt.Errorf("reset idle orchestrator window: %w", err)
 		}
 	}
 	if err := o.tmux.CreateWindow(o.session, windowName, o.cfg.Project.RepoPath); err != nil {
-		return fmt.Errorf("create orchestrator window: %w", err)
+		return false, fmt.Errorf("create orchestrator window: %w", err)
 	}
 	if err := o.tmux.SendKeys(o.session, windowName, buildHarnessCommand(hCfg.Command, tokens)); err != nil {
-		return fmt.Errorf("send orchestrator command: %w", err)
+		return false, fmt.Errorf("send orchestrator command: %w", err)
 	}
 	if err := o.tmux.SendKeys(o.session, windowName, prompt); err != nil {
-		return fmt.Errorf("send orchestrator prompt: %w", err)
+		return false, fmt.Errorf("send orchestrator prompt: %w", err)
 	}
-	return nil
+	return true, nil
 }
 
 func (o *Orchestrator) buildPrompt(reason string) (string, error) {

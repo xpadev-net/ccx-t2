@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -19,6 +20,7 @@ type fakeTmux struct {
 	alive    bool
 	idle     bool
 	onAlive  func()
+	onIdle   func()
 	commands []string
 	prompts  []string
 	kills    int
@@ -70,8 +72,14 @@ func (f *fakeTmux) IsWindowAlive(session, window string) (bool, error) {
 
 func (f *fakeTmux) IsPaneIdle(session, window string) (bool, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.idle, nil
+	onIdle := f.onIdle
+	f.onIdle = nil
+	idle := f.idle
+	f.mu.Unlock()
+	if onIdle != nil {
+		onIdle()
+	}
+	return idle, nil
 }
 
 func (f *fakeTmux) setIdle(idle bool) {
@@ -200,7 +208,6 @@ func TestTriggerCanceledContextDoesNotQueueWhenActive(t *testing.T) {
 		t.Fatalf("queued = %#v, want empty", queued)
 	}
 	fake.setIdle(true)
-	time.Sleep(10 * time.Millisecond)
 	creates, commands, prompts := fake.counts()
 	if creates != 0 || commands != 0 || prompts != 0 {
 		t.Fatalf("canceled active trigger drained later: creates=%d commands=%d prompts=%d", creates, commands, prompts)
@@ -228,7 +235,6 @@ func TestTriggerMidCallCancellationDoesNotQueue(t *testing.T) {
 		t.Fatalf("queued = %#v, want empty", queued)
 	}
 	fake.setIdle(true)
-	time.Sleep(10 * time.Millisecond)
 	creates, commands, prompts := fake.counts()
 	if creates != 0 || commands != 0 || prompts != 0 {
 		t.Fatalf("mid-call canceled trigger drained later: creates=%d commands=%d prompts=%d", creates, commands, prompts)
@@ -254,6 +260,28 @@ func TestTriggerMidCallCancellationKeepsOlderQueuedWork(t *testing.T) {
 	}
 	if queued := queuedSnapshot(o); !reflect.DeepEqual(queued, []string{"same"}) {
 		t.Fatalf("queued = %#v, want older queued work preserved", queued)
+	}
+}
+
+func TestTriggerKeepsQueuedWorkWhenWindowBecomesActiveBeforeStart(t *testing.T) {
+	l, cfg := newTestDeps(t)
+	fake := &fakeTmux{alive: true, idle: true}
+	fake.onIdle = func() {
+		fake.setIdle(false)
+	}
+	o := New(l, cfg, "proj", "http://localhost:8080")
+	o.tmux = fake
+	o.pollInterval = time.Millisecond
+
+	if err := o.Trigger(context.Background(), "toctou"); err != nil {
+		t.Fatalf("Trigger: %v", err)
+	}
+	if queued := queuedSnapshot(o); !reflect.DeepEqual(queued, []string{"toctou"}) {
+		t.Fatalf("queued = %#v, want trigger preserved while active", queued)
+	}
+	creates, commands, prompts := fake.counts()
+	if creates != 0 || commands != 0 || prompts != 0 {
+		t.Fatalf("busy recheck launched or dequeued work: creates=%d commands=%d prompts=%d", creates, commands, prompts)
 	}
 }
 
@@ -306,6 +334,56 @@ func TestTriggerMidCallCancellationDrainsLaterQueuedWork(t *testing.T) {
 	if queued := queuedSnapshot(o); len(queued) != 0 {
 		t.Fatalf("queued = %#v, want empty after later trigger drains", queued)
 	}
+}
+
+func TestDrainRetriesAfterStartError(t *testing.T) {
+	l, cfg := newTestDeps(t)
+	fake := &flakyTmux{fakeTmux: fakeTmux{alive: true, idle: false}, failCreates: 1}
+	o := New(l, cfg, "proj", "http://localhost:8080")
+	o.tmux = fake
+	o.pollInterval = time.Millisecond
+
+	if err := o.Trigger(context.Background(), "retry"); err != nil {
+		t.Fatalf("Trigger queued behind active window: %v", err)
+	}
+	fake.setIdle(true)
+
+	deadline := time.After(time.Second)
+	for {
+		creates, commands, prompts := fake.counts()
+		if creates >= 2 && commands == 1 && prompts == 1 {
+			break
+		}
+		select {
+		case <-deadline:
+			creates, commands, prompts := fake.counts()
+			t.Fatalf("queued trigger did not retry: creates=%d commands=%d prompts=%d queued=%#v", creates, commands, prompts, queuedSnapshot(o))
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+	if queued := queuedSnapshot(o); len(queued) != 0 {
+		t.Fatalf("queued = %#v, want empty after retry", queued)
+	}
+}
+
+var errCreateWindow = errors.New("create window failed")
+
+type flakyTmux struct {
+	fakeTmux
+	failCreates int
+}
+
+func (f *flakyTmux) CreateWindow(session, name, startDir string) error {
+	f.mu.Lock()
+	if f.failCreates > 0 {
+		f.failCreates--
+		f.creates++
+		f.mu.Unlock()
+		return errCreateWindow
+	}
+	f.mu.Unlock()
+	return f.fakeTmux.CreateWindow(session, name, startDir)
 }
 
 func queuedSnapshot(o *Orchestrator) []string {
