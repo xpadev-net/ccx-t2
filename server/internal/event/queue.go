@@ -204,6 +204,7 @@ func (q *Queue) Process(ctx context.Context, e Event) error {
 					"pr_url":    e.PRURL,
 					"worker_id": "",
 					"harness":   "",
+					"reason":    "",
 				}
 				if e.MergeCommit != "" {
 					comment := "<!-- merge_commit: " + e.MergeCommit + " -->"

@@ -57,6 +57,9 @@ func TestQueueRunProcessesEventsFIFOAndTriggers(t *testing.T) {
 	if got := tasksByID["task-002"].PrURL; got != "https://example.test/pr/2" {
 		t.Fatalf("task-002 pr_url = %q", got)
 	}
+	if got := tasksByID["task-002"].Reason; got != "" {
+		t.Fatalf("task-002 reason = %q, want cleared", got)
+	}
 	if got := tasksByID["task-002"].Body; got != "<!-- merge_commit: abc123 -->" {
 		t.Fatalf("task-002 body = %q, want merge_commit comment", got)
 	}
@@ -164,6 +167,32 @@ func TestQueueRunDoesNotProcessBufferedEventAfterCancellation(t *testing.T) {
 	task := loadTasksByID(t, l)["task-001"]
 	if task.Status != "in_progress" {
 		t.Fatalf("task status = %q, want in_progress", task.Status)
+	}
+}
+
+func TestQueueProcessCompletedClearsBlockedReason(t *testing.T) {
+	l := newTestLedger(t)
+	if err := l.Add(ledger.Task{
+		ID:       "task-001",
+		Title:    "Task",
+		Status:   "blocked",
+		WorkerID: "worker-1",
+		Reason:   "needs review",
+	}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	q := NewQueue(l, &fakeTrigger{}, 0)
+
+	if err := q.Process(context.Background(), Event{Type: Completed, TaskID: "task-001", WorkerID: "worker-1"}); err != nil {
+		t.Fatalf("Process completed: %v", err)
+	}
+
+	task := loadTasksByID(t, l)["task-001"]
+	if task.Status != "completed" {
+		t.Fatalf("task status = %q, want completed", task.Status)
+	}
+	if task.Reason != "" {
+		t.Fatalf("task reason = %q, want cleared", task.Reason)
 	}
 }
 
