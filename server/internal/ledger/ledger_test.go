@@ -115,6 +115,18 @@ Body without closing separator`
 	}
 }
 
+func TestParseUnclosedFrontMatterReturnsError(t *testing.T) {
+	content := `---
+id: task-001
+title: Truncated
+status: unstarted
+`
+	_, err := parseContent(content)
+	if err == nil {
+		t.Error("expected error for unclosed front matter, got nil")
+	}
+}
+
 // ---- Round-trip test ----
 
 func TestRoundTrip(t *testing.T) {
