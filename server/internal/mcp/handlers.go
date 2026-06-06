@@ -707,10 +707,6 @@ func handleFollowupWorker(deps *Deps) ToolHandler {
 			return nil, err
 		}
 
-		if err := ensureWorkerTaskActive(deps.Ledger, workerID); err != nil {
-			return nil, err
-		}
-
 		// Verify window exists.
 		windowName := workerID
 		alive, err := tmux.IsWindowAlive(deps.Session, windowName)
