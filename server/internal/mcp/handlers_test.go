@@ -108,6 +108,27 @@ func TestBuildWorkerPromptFromTaskUsesTaskRestrictions(t *testing.T) {
 	}
 }
 
+func TestEnsureWorkerTaskActiveRejectsTerminalOrMissingWorker(t *testing.T) {
+	dir := t.TempDir()
+	l := ledger.NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
+	if err := l.Add(ledger.Task{ID: "task-001", Title: "Task", Status: "completed", WorkerID: "worker-done"}); err != nil {
+		t.Fatalf("Add completed: %v", err)
+	}
+	if err := l.Add(ledger.Task{ID: "task-002", Title: "Task", Status: "in_progress", WorkerID: "worker-active"}); err != nil {
+		t.Fatalf("Add active: %v", err)
+	}
+
+	if err := ensureWorkerTaskActive(l, "worker-active"); err != nil {
+		t.Fatalf("ensureWorkerTaskActive(active): %v", err)
+	}
+	if err := ensureWorkerTaskActive(l, "worker-done"); err == nil {
+		t.Fatal("ensureWorkerTaskActive(completed) error = nil, want error")
+	}
+	if err := ensureWorkerTaskActive(l, "worker-missing"); err == nil {
+		t.Fatal("ensureWorkerTaskActive(missing) error = nil, want error")
+	}
+}
+
 func TestHandleNotifyCompletedRejectsStaleWorkerIDUnderLedgerLock(t *testing.T) {
 	testHandleNotifyRejectsStaleWorkerID(t, "completed", map[string]any{
 		"pr_url":       "https://example.test/pr/1",

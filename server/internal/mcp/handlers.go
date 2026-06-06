@@ -457,6 +457,23 @@ func cleanupArchivedTaskResources(deps *Deps, taskID, branch string) {
 	}
 }
 
+func ensureWorkerTaskActive(l *ledger.Ledger, workerID string) error {
+	tasks, err := l.Load()
+	if err != nil {
+		return err
+	}
+	for _, t := range tasks {
+		if t.WorkerID != workerID {
+			continue
+		}
+		if t.Status != "in_progress" && t.Status != "blocked" {
+			return fmt.Errorf("task %s status is %q, cannot followup", t.ID, t.Status)
+		}
+		return nil
+	}
+	return fmt.Errorf("no task found with worker_id %q", workerID)
+}
+
 func handleSpawnWorker(deps *Deps) ToolHandler {
 	return func(ctx context.Context, args map[string]any) (any, error) {
 		taskID, err := stringArg(args, "task_id")
@@ -627,11 +644,11 @@ func handleStopWorker(deps *Deps) ToolHandler {
 
 		// Find task in registry or ledger.
 		// Always load branch from the ledger: the registry does not store it.
-		var taskID, branch string
+		var taskID string
 		if info, ok := deps.Registry.Get(workerID); ok {
 			taskID = info.TaskID
 		}
-		// Ledger search fills branch (and taskID as fallback when not in registry).
+		// Ledger search fills taskID as fallback when not in registry.
 		tasks, err := deps.Ledger.Load()
 		if err != nil {
 			return nil, err
@@ -641,7 +658,6 @@ func handleStopWorker(deps *Deps) ToolHandler {
 				if taskID == "" {
 					taskID = t.ID
 				}
-				branch = t.Branch
 				break
 			}
 		}
@@ -658,7 +674,7 @@ func handleStopWorker(deps *Deps) ToolHandler {
 		// Reject if the task is already terminal to prevent overwriting
 		// "completed" or "split" tasks back to "unstarted" in a narrow race
 		// with notify(completed) or split_request cleanup.
-		if err := deps.Ledger.UpdateIfStatuses(taskID,
+		prevTask, err := deps.Ledger.UpdateIfStatusesReturnPrev(taskID,
 			[]string{"in_progress", "blocked", "unstarted"},
 			map[string]any{
 				"status":    "unstarted",
@@ -666,10 +682,15 @@ func handleStopWorker(deps *Deps) ToolHandler {
 				"branch":    "",
 				"harness":   "",
 				"reason":    "",
-			}); err != nil {
+			})
+		if err != nil {
 			return nil, err
 		}
-		stopWorkerCleanup(deps, workerID, branch, taskID)
+		cleanupWorkerID := prevTask.WorkerID
+		if cleanupWorkerID == "" {
+			cleanupWorkerID = workerID
+		}
+		stopWorkerCleanup(deps, cleanupWorkerID, prevTask.Branch, taskID)
 
 		return map[string]any{"stopped": workerID}, nil
 	}
@@ -686,23 +707,8 @@ func handleFollowupWorker(deps *Deps) ToolHandler {
 			return nil, err
 		}
 
-		// Validate task status.
-		tasks, err := deps.Ledger.Load()
-		if err != nil {
+		if err := ensureWorkerTaskActive(deps.Ledger, workerID); err != nil {
 			return nil, err
-		}
-		var found bool
-		for _, t := range tasks {
-			if t.WorkerID == workerID {
-				if t.Status != "in_progress" && t.Status != "blocked" {
-					return nil, fmt.Errorf("task %s status is %q, cannot followup", t.ID, t.Status)
-				}
-				found = true
-				break
-			}
-		}
-		if !found {
-			return nil, fmt.Errorf("no task found with worker_id %q", workerID)
 		}
 
 		// Verify window exists.
@@ -713,6 +719,9 @@ func handleFollowupWorker(deps *Deps) ToolHandler {
 		}
 		if !alive {
 			return nil, fmt.Errorf("tmux window %q does not exist", windowName)
+		}
+		if err := ensureWorkerTaskActive(deps.Ledger, workerID); err != nil {
+			return nil, err
 		}
 
 		if err := tmux.SendKeys(deps.Session, windowName, message); err != nil {
