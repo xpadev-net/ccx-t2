@@ -118,9 +118,16 @@ func unmarshalTask(fm string) (Task, error) {
 // marshalFrontMatter serializes a Task's front matter with "id" always first.
 func marshalFrontMatter(t Task) ([]byte, error) {
 	// Build ordered map manually to guarantee id is first.
+	// Encode the ID as a YAML scalar to handle any special characters safely.
 	var buf bytes.Buffer
+	idNode := &yaml.Node{Kind: yaml.ScalarNode, Value: t.ID, Tag: "!!str"}
+	idBytes, err := yaml.Marshal(idNode)
+	if err != nil {
+		return nil, fmt.Errorf("marshal id: %w", err)
+	}
 	buf.WriteString("id: ")
-	buf.WriteString(t.ID)
+	// yaml.Marshal of a scalar node produces "value\n"; strip the trailing newline.
+	buf.Write(bytes.TrimRight(idBytes, "\n"))
 	buf.WriteString("\n")
 
 	// Marshal the rest of the struct, then strip the id line.

@@ -173,7 +173,10 @@ func TestAddUpdatesUpdatedAt(t *testing.T) {
 	}
 	after := time.Now().Add(time.Second)
 
-	tasks, _ := l.Load()
+	tasks, err := l.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
 	ts, err := time.Parse(time.RFC3339, tasks[0].UpdatedAt)
 	if err != nil {
 		t.Fatalf("parse updated_at: %v", err)
@@ -187,8 +190,13 @@ func TestUpdateUpdatesUpdatedAt(t *testing.T) {
 	dir := t.TempDir()
 	l := NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
 
-	_ = l.Add(Task{ID: "task-001", Title: "T", Status: "unstarted"})
-	tasks, _ := l.Load()
+	if err := l.Add(Task{ID: "task-001", Title: "T", Status: "unstarted"}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	tasks, err := l.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
 	firstUpdatedAt := tasks[0].UpdatedAt
 
 	time.Sleep(1100 * time.Millisecond)
@@ -196,7 +204,10 @@ func TestUpdateUpdatesUpdatedAt(t *testing.T) {
 		t.Fatalf("Update: %v", err)
 	}
 
-	tasks, _ = l.Load()
+	tasks, err = l.Load()
+	if err != nil {
+		t.Fatalf("Load after Update: %v", err)
+	}
 	if tasks[0].UpdatedAt == firstUpdatedAt {
 		t.Error("updated_at not changed after Update")
 	}
@@ -228,7 +239,9 @@ func TestArchiveCompletedOnly(t *testing.T) {
 	dir := t.TempDir()
 	l := NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
 
-	_ = l.Add(Task{ID: "task-001", Title: "T", Status: "unstarted"})
+	if err := l.Add(Task{ID: "task-001", Title: "T", Status: "unstarted"}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
 	err := l.Archive("task-001", "")
 	if err == nil {
 		t.Error("expected error archiving non-completed task")
@@ -240,13 +253,18 @@ func TestArchiveMovesFile(t *testing.T) {
 	archiveDir := filepath.Join(dir, "archive")
 	l := NewLedger(filepath.Join(dir, "ledger.md"), archiveDir)
 
-	_ = l.Add(Task{ID: "task-001", Title: "Do thing", Status: "completed", Body: "body"})
+	if err := l.Add(Task{ID: "task-001", Title: "Do thing", Status: "completed", Body: "body"}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
 	if err := l.Archive("task-001", "abc123"); err != nil {
 		t.Fatalf("Archive: %v", err)
 	}
 
 	// Task should be removed from ledger.
-	tasks, _ := l.Load()
+	tasks, err := l.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
 	for _, t2 := range tasks {
 		if t2.ID == "task-001" {
 			t.Error("task still in ledger after archive")
@@ -265,8 +283,12 @@ func TestArchiveStripsMergeCommitComment(t *testing.T) {
 	l := NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
 
 	body := "Some body.\n<!-- merge_commit: deadbeef -->"
-	_ = l.Add(Task{ID: "task-001", Title: "T", Status: "completed", Body: body})
-	_ = l.Archive("task-001", "deadbeef")
+	if err := l.Add(Task{ID: "task-001", Title: "T", Status: "completed", Body: body}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if err := l.Archive("task-001", "deadbeef"); err != nil {
+		t.Fatalf("Archive: %v", err)
+	}
 
 	archiveFile := filepath.Join(dir, "archive", "task-001-t.md")
 	data, err := os.ReadFile(archiveFile)
@@ -297,19 +319,25 @@ func TestGenerateIDUnique(t *testing.T) {
 			t.Errorf("duplicate ID: %s", id)
 		}
 		seen[id] = true
-		_ = l.Add(Task{ID: id, Title: "T", Status: "unstarted"})
+		if err := l.Add(Task{ID: id, Title: "T", Status: "unstarted"}); err != nil {
+			t.Fatalf("Add: %v", err)
+		}
 	}
 }
 
 func TestGenerateIDNoConflictWithArchive(t *testing.T) {
 	dir := t.TempDir()
 	archiveDir := filepath.Join(dir, "archive")
-	_ = os.MkdirAll(archiveDir, 0o755)
+	if err := os.MkdirAll(archiveDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
 
 	date := time.Now().Format("20060102")
 	existingID := "task-" + date + "-0001"
 	// Create a fake archive file with this ID.
-	_ = os.WriteFile(filepath.Join(archiveDir, existingID+"-some-slug.md"), []byte("content"), 0o644)
+	if err := os.WriteFile(filepath.Join(archiveDir, existingID+"-some-slug.md"), []byte("content"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
 
 	l := NewLedger(filepath.Join(dir, "ledger.md"), archiveDir)
 	id, err := l.GenerateID()
@@ -327,9 +355,14 @@ func TestIDFirstInFrontMatter(t *testing.T) {
 	dir := t.TempDir()
 	l := NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
 
-	_ = l.Add(Task{ID: "task-001", Title: "Test", Status: "unstarted"})
+	if err := l.Add(Task{ID: "task-001", Title: "Test", Status: "unstarted"}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
 
-	data, _ := os.ReadFile(filepath.Join(dir, "ledger.md"))
+	data, err := os.ReadFile(filepath.Join(dir, "ledger.md"))
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
 	lines := strings.Split(string(data), "\n")
 	// First line is "---", second line should start with "id:"
 	if len(lines) < 2 {
