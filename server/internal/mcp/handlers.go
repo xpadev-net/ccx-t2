@@ -147,6 +147,7 @@ func RegisterWorkerTools(s *Server, deps *Deps) {
 				"type": "object",
 				"properties": map[string]any{
 					"task_id":         prop("string", "Task ID"),
+					"worker_id":       prop("string", "Caller's worker_id for ownership verification (optional but recommended)"),
 					"pr_url":          prop("string", "PR URL (completed)"),
 					"merge_commit":    prop("string", "Merge commit hash (completed)"),
 					"reason":          prop("string", "Reason (blocked/split_request)"),
@@ -708,6 +709,9 @@ func handleGetPRStatus(deps *Deps) ToolHandler {
 			return nil, err
 		}
 
+		if prNumber <= 0 {
+			return nil, fmt.Errorf("pr_number must be a positive integer")
+		}
 		if deps.GitHub == nil {
 			return nil, fmt.Errorf("github.token, github.owner, and github.repo must be configured")
 		}
@@ -736,6 +740,11 @@ func handleNotify(deps *Deps) ToolHandler {
 			return nil, err
 		}
 
+		// Optional worker_id field: if provided, verify the caller owns the task.
+		// All workers share the same bearer token, so this provides a best-effort
+		// ownership check preventing a buggy worker from notifying sibling tasks.
+		callerWorkerID := optionalStringArg(payload, "worker_id")
+
 		tasks, err := deps.Ledger.Load()
 		if err != nil {
 			return nil, err
@@ -749,6 +758,10 @@ func handleNotify(deps *Deps) ToolHandler {
 		}
 		if task == nil {
 			return nil, fmt.Errorf("task not found: %s", taskID)
+		}
+		if callerWorkerID != "" && task.WorkerID != callerWorkerID {
+			return nil, fmt.Errorf("worker %q is not assigned to task %s (assigned to %q)",
+				callerWorkerID, taskID, task.WorkerID)
 		}
 		if task.Status != "in_progress" && task.Status != "blocked" {
 			// Silently ignore notifications for non-active tasks.
