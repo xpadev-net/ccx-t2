@@ -589,12 +589,14 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 			_ = exec.Command("git", "-C", repoPath, "branch", "-D", branch).Run()
 			// Reset lifecycle fields only — do not restore allowed/forbidden_files
 			// to avoid overwriting concurrent update_task edits.
-			_ = deps.Ledger.Update(taskID, map[string]any{
+			if rollbackErr := deps.Ledger.Update(taskID, map[string]any{
 				"status":    "unstarted",
 				"worker_id": "",
 				"branch":    "",
 				"harness":   "",
-			})
+			}); rollbackErr != nil {
+				log.Printf("error: spawn_worker rollback failed for task %s: %v — task may be stuck in_progress", taskID, rollbackErr)
+			}
 			deps.Registry.Remove(workerID)
 			return nil, fmt.Errorf("send harness command: %w", err)
 		}
@@ -602,7 +604,7 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 		// Step 5: Send task prompt (best-effort — worker is already running).
 		// If this fails, include prompt_sent:false in the response so the orchestrator
 		// knows to call followup_worker to deliver the task description.
-		prompt := buildWorkerPrompt(task, taskID, branch, allowedFiles, forbiddenFiles,
+		prompt := buildWorkerPrompt(task, taskID, workerID, branch, allowedFiles, forbiddenFiles,
 			worktreePath, deps.Config.Project.ValidationCommand)
 		promptSent := true
 		if err := tmux.SendKeys(deps.Session, workerID, prompt); err != nil {
@@ -646,18 +648,24 @@ func handleStopWorker(deps *Deps) ToolHandler {
 			}
 		}
 
+		// If neither the registry nor the ledger knows this worker, return an
+		// error so the caller knows the ID was wrong. Best-effort kill the tmux
+		// window in case it exists as an orphan.
+		if taskID == "" {
+			_ = tmux.KillWindow(deps.Session, workerID)
+			return nil, fmt.Errorf("worker %q not found in registry or ledger", workerID)
+		}
+
 		// Commit ledger first so the task is always recoverable, then clean
 		// up resources best-effort (same ordering as split_task and split_request).
-		if taskID != "" {
-			if err := deps.Ledger.Update(taskID, map[string]any{
-				"status":    "unstarted",
-				"worker_id": "",
-				"branch":    "",
-				"harness":   "",
-				"reason":    "",
-			}); err != nil {
-				return nil, err
-			}
+		if err := deps.Ledger.Update(taskID, map[string]any{
+			"status":    "unstarted",
+			"worker_id": "",
+			"branch":    "",
+			"harness":   "",
+			"reason":    "",
+		}); err != nil {
+			return nil, err
 		}
 		stopWorkerCleanup(deps, workerID, branch, taskID)
 
@@ -984,11 +992,14 @@ func extractMergeCommit(body string) string {
 }
 
 // buildWorkerPrompt constructs the stdin prompt sent to the worker harness.
-func buildWorkerPrompt(task *ledger.Task, taskID, branch string, allowedFiles, forbiddenFiles []string,
+// workerID is included so the worker can pass it in notify payloads for
+// ownership verification by the server.
+func buildWorkerPrompt(task *ledger.Task, taskID, workerID, branch string, allowedFiles, forbiddenFiles []string,
 	worktreePath, validationCmd string) string {
 	var sb strings.Builder
 	sb.WriteString("You are a Worker agent. Complete the following task:\n\n")
 	sb.WriteString("Task ID: " + taskID + "\n")
+	sb.WriteString("Worker ID: " + workerID + "\n")
 	sb.WriteString("Title: " + task.Title + "\n")
 	sb.WriteString("Branch: " + branch + "\n")
 	sb.WriteString("Worktree: " + worktreePath + "\n")
@@ -1013,9 +1024,10 @@ Instructions:
 - Only edit files within the allowed_files paths (directory-boundary prefix match).
 - Do not edit any forbidden_files.
 - Implement the task, validate, self-review, create a PR, and merge it.
-- When complete: call notify(type="completed", payload={task_id, pr_url, merge_commit}).
-- If blocked: call notify(type="blocked", payload={task_id, reason}).
-- If you need to split: call notify(type="split_request", payload={task_id, reason, proposed_slices}).
+- Always include your worker_id in notify payloads for ownership verification.
+- When complete: call notify(type="completed", payload={task_id, worker_id, pr_url, merge_commit}).
+- If blocked: call notify(type="blocked", payload={task_id, worker_id, reason}).
+- If you need to split: call notify(type="split_request", payload={task_id, worker_id, reason, proposed_slices}).
 `)
 	return sb.String()
 }
