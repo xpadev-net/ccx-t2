@@ -2,6 +2,7 @@ package tmux
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -73,7 +74,7 @@ func IsPaneIdle(session, window string) (bool, error) {
 		return false, fmt.Errorf("display-message: %w", err)
 	}
 	switch strings.TrimSpace(out) {
-	case "bash", "zsh", "sh", "fish":
+	case "bash", "zsh", "sh", "fish", "dash", "ksh", "tcsh", "nu":
 		return true, nil
 	}
 	return false, nil
@@ -126,7 +127,11 @@ func PipeOutput(session, window string) (<-chan string, func(), error) {
 			default:
 			}
 			if scanner.Scan() {
-				ch <- scanner.Text()
+				select {
+				case ch <- scanner.Text():
+				case <-stop:
+					return
+				}
 			} else {
 				// No new data yet — avoid busy-looping.
 				time.Sleep(50 * time.Millisecond)
@@ -153,6 +158,10 @@ func output(name string, args ...string) (string, error) {
 	cmd := exec.Command(name, args...)
 	out, err := cmd.Output()
 	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			return "", fmt.Errorf("%s %v: %w: %s", name, args, err, strings.TrimSpace(string(exitErr.Stderr)))
+		}
 		return "", fmt.Errorf("%s %v: %w", name, args, err)
 	}
 	return string(out), nil
