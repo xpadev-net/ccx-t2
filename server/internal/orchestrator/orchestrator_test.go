@@ -611,6 +611,21 @@ func TestNewTrimsSessionAndBaseURL(t *testing.T) {
 	}
 }
 
+func TestTriggerRejectsMissingOrchestratorHarness(t *testing.T) {
+	l, cfg := newTestDeps(t)
+	cfg.Orchestrator.Harness = "missing"
+	o := New(l, cfg, "proj", "http://localhost:8080")
+	o.tmux = &fakeTmux{}
+
+	err := o.Trigger(context.Background(), "bad config")
+	if err == nil {
+		t.Fatal("Trigger missing harness error = nil, want error")
+	}
+	if !strings.Contains(err.Error(), `orchestrator harness "missing" not configured`) {
+		t.Fatalf("Trigger error = %v", err)
+	}
+}
+
 func TestRemoveQueuedAtLockedPrefersEntryAtOrAfterIndex(t *testing.T) {
 	l, cfg := newTestDeps(t)
 	o := New(l, cfg, "proj", "http://localhost:8080")

@@ -431,7 +431,8 @@ func (o *Orchestrator) buildPrompt(reason string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("marshal ledger snapshot: %w", err)
 	}
-	harnessJSON, err := json.MarshalIndent(harness.List(o.cfg), "", "  ")
+	harnessSnapshot := harness.List(o.cfg)
+	harnessJSON, err := json.MarshalIndent(harnessSnapshot, "", "  ")
 	if err != nil {
 		return "", fmt.Errorf("marshal harness snapshot: %w", err)
 	}
@@ -475,6 +476,9 @@ func (o *Orchestrator) validate() error {
 	}
 	if strings.TrimSpace(o.baseURL) == "" {
 		return fmt.Errorf("orchestrator base URL is required")
+	}
+	if _, ok := o.cfg.Harnesses[o.cfg.Orchestrator.Harness]; !ok {
+		return fmt.Errorf("orchestrator harness %q not configured", o.cfg.Orchestrator.Harness)
 	}
 	return nil
 }
