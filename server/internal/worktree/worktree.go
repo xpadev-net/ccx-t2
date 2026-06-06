@@ -8,7 +8,7 @@ import (
 )
 
 // Create creates a new git worktree at worktreePath branching from baseRef.
-// It fails if worktreePath already exists.
+// repoPath is the main repository root. Fails if worktreePath already exists.
 func Create(repoPath, branch, worktreePath, baseRef string) error {
 	if _, err := os.Stat(worktreePath); err == nil {
 		return fmt.Errorf("worktree path already exists: %s", worktreePath)
@@ -16,10 +16,10 @@ func Create(repoPath, branch, worktreePath, baseRef string) error {
 	return run("git", "-C", repoPath, "worktree", "add", "-b", branch, worktreePath, baseRef)
 }
 
-// Remove removes a git worktree by path. The --force flag is used to handle
-// dirty or detached worktrees.
-func Remove(worktreePath string) error {
-	return run("git", "worktree", "remove", "--force", worktreePath)
+// Remove removes a git worktree. repoPath is the main repository root;
+// -C ensures git finds the repo regardless of the process working directory.
+func Remove(repoPath, worktreePath string) error {
+	return run("git", "-C", repoPath, "worktree", "remove", "--force", worktreePath)
 }
 
 func run(name string, args ...string) error {
