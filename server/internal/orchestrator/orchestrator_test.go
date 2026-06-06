@@ -442,7 +442,7 @@ func TestTriggerRestartsTimedOutActiveWindow(t *testing.T) {
 
 func TestRunStartMarkedOnlyAfterPromptSent(t *testing.T) {
 	l, cfg := newTestDeps(t)
-	fake := &failingSendTmux{fakeTmux: fakeTmux{}, failAfter: 1}
+	fake := &failingSendTmux{fakeTmux: fakeTmux{}, failAfter: 2}
 	o := New(l, cfg, "proj", "http://localhost:8080")
 	o.tmux = fake
 
@@ -632,8 +632,10 @@ func (f *failingSendTmux) SendKeys(session, window, keys string) error {
 	f.mu.Lock()
 	if f.failAfter > 0 {
 		f.failAfter--
-		f.mu.Unlock()
-		return errSendKeys
+		if f.failAfter == 0 {
+			f.mu.Unlock()
+			return errSendKeys
+		}
 	}
 	f.mu.Unlock()
 	return f.fakeTmux.SendKeys(session, window, keys)
@@ -652,8 +654,9 @@ func assertNoTmuxActivity(t *testing.T, fake *fakeTmux, window time.Duration) {
 	defer ticker.Stop()
 	for {
 		creates, commands, prompts := fake.counts()
-		if creates != 0 || commands != 0 || prompts != 0 {
-			t.Fatalf("unexpected tmux activity: creates=%d commands=%d prompts=%d", creates, commands, prompts)
+		kills := fake.killCount()
+		if creates != 0 || commands != 0 || prompts != 0 || kills != 0 {
+			t.Fatalf("unexpected tmux activity: creates=%d commands=%d prompts=%d kills=%d", creates, commands, prompts, kills)
 		}
 		select {
 		case <-deadline:
