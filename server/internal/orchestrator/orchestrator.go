@@ -17,36 +17,39 @@ import (
 )
 
 const (
-	windowName   = "orchestrator"
-	maxReasonLen = 200
+	windowName       = "orchestrator"
+	maxReasonLen     = 200
+	cleanupTmuxLimit = 5 * time.Second
 )
 
 type tmuxClient interface {
-	EnsureSession(session string) error
-	CreateWindow(session, name, startDir string) error
-	SendKeys(session, window, keys string) error
-	KillWindow(session, window string) error
-	IsWindowAlive(session, window string) (bool, error)
-	IsPaneIdle(session, window string) (bool, error)
+	EnsureSession(ctx context.Context, session string) error
+	CreateWindow(ctx context.Context, session, name, startDir string) error
+	SendKeys(ctx context.Context, session, window, keys string) error
+	KillWindow(ctx context.Context, session, window string) error
+	IsWindowAlive(ctx context.Context, session, window string) (bool, error)
+	IsPaneIdle(ctx context.Context, session, window string) (bool, error)
 }
 
 type realTmux struct{}
 
-func (realTmux) EnsureSession(session string) error { return tmux.EnsureSession(session) }
-func (realTmux) CreateWindow(session, name, startDir string) error {
-	return tmux.CreateWindow(session, name, startDir)
+func (realTmux) EnsureSession(ctx context.Context, session string) error {
+	return tmux.EnsureSessionContext(ctx, session)
 }
-func (realTmux) SendKeys(session, window, keys string) error {
-	return tmux.SendKeys(session, window, keys)
+func (realTmux) CreateWindow(ctx context.Context, session, name, startDir string) error {
+	return tmux.CreateWindowContext(ctx, session, name, startDir)
 }
-func (realTmux) KillWindow(session, window string) error {
-	return tmux.KillWindow(session, window)
+func (realTmux) SendKeys(ctx context.Context, session, window, keys string) error {
+	return tmux.SendKeysContext(ctx, session, window, keys)
 }
-func (realTmux) IsWindowAlive(session, window string) (bool, error) {
-	return tmux.IsWindowAlive(session, window)
+func (realTmux) KillWindow(ctx context.Context, session, window string) error {
+	return tmux.KillWindowContext(ctx, session, window)
 }
-func (realTmux) IsPaneIdle(session, window string) (bool, error) {
-	return tmux.IsPaneIdle(session, window)
+func (realTmux) IsWindowAlive(ctx context.Context, session, window string) (bool, error) {
+	return tmux.IsWindowAliveContext(ctx, session, window)
+}
+func (realTmux) IsPaneIdle(ctx context.Context, session, window string) (bool, error) {
+	return tmux.IsPaneIdleContext(ctx, session, window)
 }
 
 // Orchestrator starts and queues stateless orchestrator harness runs.
@@ -228,7 +231,7 @@ func (o *Orchestrator) tryStartNext(ctx context.Context) (bool, error) {
 	reason := o.queued[0]
 	o.mu.Unlock()
 
-	active, err := o.isActive()
+	active, err := o.isActive(ctx)
 	if err != nil {
 		return false, err
 	}
@@ -250,7 +253,7 @@ func (o *Orchestrator) tryStartNext(ctx context.Context) (bool, error) {
 	}
 	defer o.releaseStart()
 	if active {
-		if err := o.killTimedOutRun(); err != nil {
+		if err := o.killTimedOutRun(ctx); err != nil {
 			return false, err
 		}
 	}
@@ -318,8 +321,8 @@ func (o *Orchestrator) removeQueuedIndexLocked(index int) {
 	o.queued = o.queued[:len(o.queued)-1]
 }
 
-func (o *Orchestrator) isActive() (bool, error) {
-	alive, err := o.tmux.IsWindowAlive(o.session, windowName)
+func (o *Orchestrator) isActive(ctx context.Context) (bool, error) {
+	alive, err := o.tmux.IsWindowAlive(ctx, o.session, windowName)
 	if err != nil {
 		return false, fmt.Errorf("check orchestrator window: %w", err)
 	}
@@ -328,7 +331,7 @@ func (o *Orchestrator) isActive() (bool, error) {
 		o.clearNoTimeoutWarning()
 		return false, nil
 	}
-	idle, err := o.tmux.IsPaneIdle(o.session, windowName)
+	idle, err := o.tmux.IsPaneIdle(ctx, o.session, windowName)
 	if err != nil {
 		return false, fmt.Errorf("check orchestrator pane: %w", err)
 	}
@@ -393,9 +396,9 @@ func (o *Orchestrator) activeTimedOut() bool {
 	return !runStart.IsZero() && time.Since(runStart) >= timeout
 }
 
-func (o *Orchestrator) killTimedOutRun() error {
+func (o *Orchestrator) killTimedOutRun(ctx context.Context) error {
 	log.Printf("warn: orchestrator window exceeded timeout %s; restarting", o.cfg.Orchestrator.Timeout)
-	if err := o.tmux.KillWindow(o.session, windowName); err != nil {
+	if err := o.tmux.KillWindow(ctx, o.session, windowName); err != nil {
 		return fmt.Errorf("kill timed-out orchestrator window: %w", err)
 	}
 	o.clearRunStart()
@@ -419,38 +422,44 @@ func (o *Orchestrator) start(ctx context.Context, reason string) (bool, error) {
 		return false, err
 	}
 
-	if err := o.tmux.EnsureSession(o.session); err != nil {
+	if err := o.tmux.EnsureSession(ctx, o.session); err != nil {
 		return false, fmt.Errorf("ensure tmux session: %w", err)
 	}
-	alive, err := o.tmux.IsWindowAlive(o.session, windowName)
+	alive, err := o.tmux.IsWindowAlive(ctx, o.session, windowName)
 	if err != nil {
 		return false, fmt.Errorf("check orchestrator window: %w", err)
 	}
 	if alive {
-		idle, err := o.tmux.IsPaneIdle(o.session, windowName)
+		idle, err := o.tmux.IsPaneIdle(ctx, o.session, windowName)
 		if err != nil {
 			return false, fmt.Errorf("check orchestrator pane: %w", err)
 		}
 		if !idle {
 			return false, nil
 		}
-		if err := o.tmux.KillWindow(o.session, windowName); err != nil {
+		if err := o.tmux.KillWindow(ctx, o.session, windowName); err != nil {
 			return false, fmt.Errorf("reset idle orchestrator window: %w", err)
 		}
 	}
-	if err := o.tmux.CreateWindow(o.session, windowName, o.cfg.Project.RepoPath); err != nil {
+	if err := o.tmux.CreateWindow(ctx, o.session, windowName, o.cfg.Project.RepoPath); err != nil {
 		return false, fmt.Errorf("create orchestrator window: %w", err)
 	}
-	if err := o.tmux.SendKeys(o.session, windowName, buildHarnessCommand(hCfg.Command, tokens)); err != nil {
-		_ = o.tmux.KillWindow(o.session, windowName)
+	if err := o.tmux.SendKeys(ctx, o.session, windowName, buildHarnessCommand(hCfg.Command, tokens)); err != nil {
+		o.cleanupStartedWindow()
 		return false, fmt.Errorf("send orchestrator command: %w", err)
 	}
-	if err := o.tmux.SendKeys(o.session, windowName, prompt); err != nil {
-		_ = o.tmux.KillWindow(o.session, windowName)
+	if err := o.tmux.SendKeys(ctx, o.session, windowName, prompt); err != nil {
+		o.cleanupStartedWindow()
 		return false, fmt.Errorf("send orchestrator prompt: %w", err)
 	}
 	o.markRunStarted()
 	return true, nil
+}
+
+func (o *Orchestrator) cleanupStartedWindow() {
+	ctx, cancel := context.WithTimeout(context.Background(), cleanupTmuxLimit)
+	defer cancel()
+	_ = o.tmux.KillWindow(ctx, o.session, windowName)
 }
 
 func (o *Orchestrator) buildPrompt(reason string) (string, error) {

@@ -28,9 +28,12 @@ type fakeTmux struct {
 	creates  int
 }
 
-func (f *fakeTmux) EnsureSession(session string) error { return nil }
+func (f *fakeTmux) EnsureSession(ctx context.Context, session string) error { return ctx.Err() }
 
-func (f *fakeTmux) CreateWindow(session, name, startDir string) error {
+func (f *fakeTmux) CreateWindow(ctx context.Context, session, name, startDir string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.alive = true
@@ -39,7 +42,10 @@ func (f *fakeTmux) CreateWindow(session, name, startDir string) error {
 	return nil
 }
 
-func (f *fakeTmux) SendKeys(session, window, keys string) error {
+func (f *fakeTmux) SendKeys(ctx context.Context, session, window, keys string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if strings.Contains(keys, "You are the Orchestrator agent") {
@@ -50,7 +56,10 @@ func (f *fakeTmux) SendKeys(session, window, keys string) error {
 	return nil
 }
 
-func (f *fakeTmux) KillWindow(session, window string) error {
+func (f *fakeTmux) KillWindow(ctx context.Context, session, window string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.alive = false
@@ -59,7 +68,10 @@ func (f *fakeTmux) KillWindow(session, window string) error {
 	return nil
 }
 
-func (f *fakeTmux) IsWindowAlive(session, window string) (bool, error) {
+func (f *fakeTmux) IsWindowAlive(ctx context.Context, session, window string) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	f.mu.Lock()
 	onAlive := f.onAlive
 	f.onAlive = nil
@@ -68,10 +80,16 @@ func (f *fakeTmux) IsWindowAlive(session, window string) (bool, error) {
 	if onAlive != nil {
 		onAlive()
 	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	return alive, nil
 }
 
-func (f *fakeTmux) IsPaneIdle(session, window string) (bool, error) {
+func (f *fakeTmux) IsPaneIdle(ctx context.Context, session, window string) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	f.mu.Lock()
 	onIdle := f.onIdle
 	f.onIdle = nil
@@ -79,6 +97,9 @@ func (f *fakeTmux) IsPaneIdle(session, window string) (bool, error) {
 	f.mu.Unlock()
 	if onIdle != nil {
 		onIdle()
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
 	}
 	return idle, nil
 }
@@ -324,7 +345,7 @@ func TestTriggerActiveWindowWithZeroTimeoutWaits(t *testing.T) {
 		t.Fatal("warnedNoTimeout = false, want warning state recorded")
 	}
 	fake.setIdle(true)
-	if _, err := o.isActive(); err != nil {
+	if _, err := o.isActive(context.Background()); err != nil {
 		t.Fatalf("isActive idle: %v", err)
 	}
 	o.mu.Lock()
@@ -499,6 +520,25 @@ func TestRunStartMarkedOnlyAfterPromptSent(t *testing.T) {
 	}
 }
 
+func TestPromptSendCancellationStillCleansWindow(t *testing.T) {
+	l, cfg := newTestDeps(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	fake := &cancelingPromptSendTmux{
+		fakeTmux: fakeTmux{},
+		cancel:   cancel,
+	}
+	o := New(l, cfg, "proj", "http://localhost:8080")
+	o.tmux = fake
+
+	err := o.Trigger(ctx, "prompt send canceled")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Trigger error = %v, want context.Canceled", err)
+	}
+	if kills := fake.killCount(); kills != 1 {
+		t.Fatalf("kills = %d, want partial window cleanup despite canceled trigger context", kills)
+	}
+}
+
 func TestTriggerDoesNotRestartObservedActiveWindowBeforeTimeout(t *testing.T) {
 	l, cfg := newTestDeps(t)
 	cfg.Orchestrator.Timeout = time.Hour
@@ -667,7 +707,7 @@ type flakyTmux struct {
 	failCreates int
 }
 
-func (f *flakyTmux) CreateWindow(session, name, startDir string) error {
+func (f *flakyTmux) CreateWindow(ctx context.Context, session, name, startDir string) error {
 	f.mu.Lock()
 	if f.failCreates > 0 {
 		f.failCreates--
@@ -676,7 +716,7 @@ func (f *flakyTmux) CreateWindow(session, name, startDir string) error {
 		return errCreateWindow
 	}
 	f.mu.Unlock()
-	return f.fakeTmux.CreateWindow(session, name, startDir)
+	return f.fakeTmux.CreateWindow(ctx, session, name, startDir)
 }
 
 type blockingCreateTmux struct {
@@ -686,12 +726,15 @@ type blockingCreateTmux struct {
 	once          sync.Once
 }
 
-func (b *blockingCreateTmux) CreateWindow(session, name, startDir string) error {
+func (b *blockingCreateTmux) CreateWindow(ctx context.Context, session, name, startDir string) error {
 	b.once.Do(func() {
 		close(b.insideCreate)
-		<-b.releaseCreate
+		select {
+		case <-b.releaseCreate:
+		case <-ctx.Done():
+		}
 	})
-	return b.fakeTmux.CreateWindow(session, name, startDir)
+	return b.fakeTmux.CreateWindow(ctx, session, name, startDir)
 }
 
 var errSendKeys = errors.New("send keys failed")
@@ -701,7 +744,7 @@ type failingSendTmux struct {
 	failAfter int
 }
 
-func (f *failingSendTmux) SendKeys(session, window, keys string) error {
+func (f *failingSendTmux) SendKeys(ctx context.Context, session, window, keys string) error {
 	f.mu.Lock()
 	if f.failAfter > 0 {
 		f.failAfter--
@@ -711,7 +754,20 @@ func (f *failingSendTmux) SendKeys(session, window, keys string) error {
 		}
 	}
 	f.mu.Unlock()
-	return f.fakeTmux.SendKeys(session, window, keys)
+	return f.fakeTmux.SendKeys(ctx, session, window, keys)
+}
+
+type cancelingPromptSendTmux struct {
+	fakeTmux
+	cancel func()
+}
+
+func (c *cancelingPromptSendTmux) SendKeys(ctx context.Context, session, window, keys string) error {
+	if strings.Contains(keys, "You are the Orchestrator agent") {
+		c.cancel()
+		return context.Canceled
+	}
+	return c.fakeTmux.SendKeys(ctx, session, window, keys)
 }
 
 func queuedSnapshot(o *Orchestrator) []string {
