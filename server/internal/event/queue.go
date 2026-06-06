@@ -203,6 +203,7 @@ func (q *Queue) Process(ctx context.Context, e Event) error {
 					"status":    "completed",
 					"pr_url":    e.PRURL,
 					"worker_id": "",
+					"branch":    "",
 					"harness":   "",
 					"reason":    "",
 				}
@@ -223,11 +224,10 @@ func (q *Queue) Process(ctx context.Context, e Event) error {
 				if err := verifyWorkerOwner(current, e); err != nil {
 					return nil, err
 				}
-				fields := map[string]any{"status": "blocked"}
-				if e.Reason != "" {
-					fields["reason"] = e.Reason
-				}
-				return fields, nil
+				return map[string]any{
+					"status": "blocked",
+					"reason": e.Reason,
+				}, nil
 			},
 		)
 	case SplitRequest:

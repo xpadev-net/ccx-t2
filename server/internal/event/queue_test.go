@@ -177,6 +177,7 @@ func TestQueueProcessCompletedClearsBlockedReason(t *testing.T) {
 		Title:    "Task",
 		Status:   "blocked",
 		WorkerID: "worker-1",
+		Branch:   "task-001-worker",
 		Reason:   "needs review",
 	}); err != nil {
 		t.Fatalf("Add: %v", err)
@@ -190,6 +191,35 @@ func TestQueueProcessCompletedClearsBlockedReason(t *testing.T) {
 	task := loadTasksByID(t, l)["task-001"]
 	if task.Status != "completed" {
 		t.Fatalf("task status = %q, want completed", task.Status)
+	}
+	if task.Reason != "" {
+		t.Fatalf("task reason = %q, want cleared", task.Reason)
+	}
+	if task.Branch != "" {
+		t.Fatalf("task branch = %q, want cleared", task.Branch)
+	}
+}
+
+func TestQueueProcessBlockedClearsOmittedReason(t *testing.T) {
+	l := newTestLedger(t)
+	if err := l.Add(ledger.Task{
+		ID:       "task-001",
+		Title:    "Task",
+		Status:   "blocked",
+		WorkerID: "worker-1",
+		Reason:   "old reason",
+	}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	q := NewQueue(l, &fakeTrigger{}, 0)
+
+	if err := q.Process(context.Background(), Event{Type: Blocked, TaskID: "task-001", WorkerID: "worker-1"}); err != nil {
+		t.Fatalf("Process blocked: %v", err)
+	}
+
+	task := loadTasksByID(t, l)["task-001"]
+	if task.Status != "blocked" {
+		t.Fatalf("task status = %q, want blocked", task.Status)
 	}
 	if task.Reason != "" {
 		t.Fatalf("task reason = %q, want cleared", task.Reason)
