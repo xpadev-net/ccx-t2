@@ -20,6 +20,9 @@ func Create(repoPath, branch, worktreePath, baseRef string) error {
 
 // Remove removes a git worktree. repoPath is the main repository root;
 // -C ensures git finds the repo regardless of the process working directory.
+// --force is used intentionally: callers invoke Remove only when stopping or
+// cleaning up a Worker (stop_worker, completed, split_request), at which point
+// any uncommitted changes in the worktree are intentionally discarded.
 func Remove(repoPath, worktreePath string) error {
 	return run("git", "-C", repoPath, "worktree", "remove", "--force", worktreePath)
 }

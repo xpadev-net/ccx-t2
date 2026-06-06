@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strings"
@@ -119,25 +120,38 @@ func PipeOutput(session, window string) (<-chan string, func(), error) {
 		}
 		defer f.Close()
 
-		scanner := bufio.NewScanner(f)
+		// Use bufio.Reader rather than bufio.Scanner: Scanner sets an internal
+		// done flag on the first io.EOF and never reads the file again, making
+		// it unsuitable for tailing a growing file. Reader.ReadString returns
+		// io.EOF on every read that reaches the current end of file, which we
+		// treat as "no data yet" and retry after a short sleep.
+		reader := bufio.NewReader(f)
 		for {
 			select {
 			case <-stop:
 				return
 			default:
 			}
-			if scanner.Scan() {
-				select {
-				case ch <- scanner.Text():
-				case <-stop:
+			line, err := reader.ReadString('\n')
+			if len(line) > 0 {
+				// Deliver whatever was read (may not have trailing newline yet).
+				trimmed := strings.TrimRight(line, "\n")
+				if trimmed != "" {
+					select {
+					case ch <- trimmed:
+					case <-stop:
+						return
+					}
+				}
+			}
+			if err != nil {
+				if errors.Is(err, io.EOF) {
+					// Transient EOF — file still being written. Sleep and retry.
+					time.Sleep(50 * time.Millisecond)
+				} else {
+					// Real read error — stop streaming.
 					return
 				}
-			} else if err := scanner.Err(); err != nil {
-				// Real read error — stop streaming.
-				return
-			} else {
-				// No new data yet — avoid busy-looping.
-				time.Sleep(50 * time.Millisecond)
 			}
 		}
 	}()
