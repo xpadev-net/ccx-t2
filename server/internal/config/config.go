@@ -77,6 +77,10 @@ func Load(path string) (*Config, error) {
 }
 
 // expandEnv replaces ${VAR} patterns with environment variable values.
+// Unknown variable names expand to an empty string (os.Getenv behaviour).
+// Callers that configure optional security fields (e.g. mcp_secret) via env
+// vars should ensure the referenced variable is actually set; an undefined
+// variable will silently disable the associated protection.
 func expandEnv(cfg *Config) {
 	expand := func(s string) string {
 		return os.Expand(s, func(key string) string {
