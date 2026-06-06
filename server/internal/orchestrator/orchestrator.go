@@ -63,6 +63,7 @@ type Orchestrator struct {
 	draining bool
 	closed   bool
 	starting bool
+	runStart time.Time
 }
 
 // New creates an Orchestrator triggerer.
@@ -216,13 +217,18 @@ func (o *Orchestrator) tryStartNext(ctx context.Context) (bool, error) {
 	if closed {
 		return false, context.Canceled
 	}
-	if active {
+	if active && !o.activeTimedOut() {
 		return true, nil
 	}
 	if err := o.claimStart(); err != nil {
 		return false, err
 	}
 	defer o.releaseStart()
+	if active {
+		if err := o.killTimedOutRun(); err != nil {
+			return false, err
+		}
+	}
 	started, err := o.start(ctx, reason)
 	if err != nil {
 		return false, err
@@ -283,13 +289,59 @@ func (o *Orchestrator) isActive() (bool, error) {
 		return false, fmt.Errorf("check orchestrator window: %w", err)
 	}
 	if !alive {
+		o.clearRunStart()
 		return false, nil
 	}
 	idle, err := o.tmux.IsPaneIdle(o.session, windowName)
 	if err != nil {
 		return false, fmt.Errorf("check orchestrator pane: %w", err)
 	}
-	return !idle, nil
+	if idle {
+		o.clearRunStart()
+		return false, nil
+	}
+	o.markRunObserved()
+	return true, nil
+}
+
+func (o *Orchestrator) markRunObserved() {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.runStart.IsZero() {
+		o.runStart = time.Now()
+	}
+}
+
+func (o *Orchestrator) markRunStarted() {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.runStart = time.Now()
+}
+
+func (o *Orchestrator) clearRunStart() {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.runStart = time.Time{}
+}
+
+func (o *Orchestrator) activeTimedOut() bool {
+	timeout := o.cfg.Orchestrator.Timeout
+	if timeout <= 0 {
+		return false
+	}
+	o.mu.Lock()
+	runStart := o.runStart
+	o.mu.Unlock()
+	return !runStart.IsZero() && time.Since(runStart) >= timeout
+}
+
+func (o *Orchestrator) killTimedOutRun() error {
+	log.Printf("warn: orchestrator window exceeded timeout %s; restarting", o.cfg.Orchestrator.Timeout)
+	if err := o.tmux.KillWindow(o.session, windowName); err != nil {
+		return fmt.Errorf("kill timed-out orchestrator window: %w", err)
+	}
+	o.clearRunStart()
+	return nil
 }
 
 func (o *Orchestrator) start(ctx context.Context, reason string) (bool, error) {
@@ -331,6 +383,7 @@ func (o *Orchestrator) start(ctx context.Context, reason string) (bool, error) {
 	if err := o.tmux.CreateWindow(o.session, windowName, o.cfg.Project.RepoPath); err != nil {
 		return false, fmt.Errorf("create orchestrator window: %w", err)
 	}
+	o.markRunStarted()
 	if err := o.tmux.SendKeys(o.session, windowName, buildHarnessCommand(hCfg.Command, tokens)); err != nil {
 		return false, fmt.Errorf("send orchestrator command: %w", err)
 	}

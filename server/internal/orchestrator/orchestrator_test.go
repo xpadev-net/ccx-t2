@@ -94,6 +94,12 @@ func (f *fakeTmux) counts() (int, int, int) {
 	return f.creates, len(f.commands), len(f.prompts)
 }
 
+func (f *fakeTmux) killCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.kills
+}
+
 func TestTriggerStartsOrchestratorWithSnapshotAndMCPArgs(t *testing.T) {
 	l, cfg := newTestDeps(t)
 	if err := l.Add(ledger.Task{ID: "task-001", Title: "Task", Status: "unstarted", Body: "Do it"}); err != nil {
@@ -174,8 +180,8 @@ func TestTriggerQueuesWhileWindowActiveAndDrainsAfterIdle(t *testing.T) {
 			time.Sleep(time.Millisecond)
 		}
 	}
-	if fake.kills != 1 {
-		t.Fatalf("kills = %d, want idle window reset", fake.kills)
+	if kills := fake.killCount(); kills != 1 {
+		t.Fatalf("kills = %d, want idle window reset", kills)
 	}
 }
 
@@ -388,6 +394,53 @@ func TestDrainRetriesAfterStartError(t *testing.T) {
 	}
 	if queued := queuedSnapshot(o); len(queued) != 0 {
 		t.Fatalf("queued = %#v, want empty after retry", queued)
+	}
+}
+
+func TestTriggerRestartsTimedOutActiveWindow(t *testing.T) {
+	l, cfg := newTestDeps(t)
+	cfg.Orchestrator.Timeout = time.Millisecond
+	fake := &fakeTmux{alive: true, idle: false}
+	o := New(l, cfg, "proj", "http://localhost:8080")
+	o.tmux = fake
+	o.pollInterval = time.Millisecond
+	o.mu.Lock()
+	o.runStart = time.Now().Add(-time.Second)
+	o.mu.Unlock()
+
+	if err := o.Trigger(context.Background(), "timeout"); err != nil {
+		t.Fatalf("Trigger: %v", err)
+	}
+	creates, commands, prompts := fake.counts()
+	if kills := fake.killCount(); kills != 1 {
+		t.Fatalf("kills = %d, want timed-out window killed", kills)
+	}
+	if creates != 1 || commands != 1 || prompts != 1 {
+		t.Fatalf("timed-out trigger did not relaunch: creates=%d commands=%d prompts=%d", creates, commands, prompts)
+	}
+	if queued := queuedSnapshot(o); len(queued) != 0 {
+		t.Fatalf("queued = %#v, want empty after timeout restart", queued)
+	}
+}
+
+func TestTriggerDoesNotRestartObservedActiveWindowBeforeTimeout(t *testing.T) {
+	l, cfg := newTestDeps(t)
+	cfg.Orchestrator.Timeout = time.Hour
+	fake := &fakeTmux{alive: true, idle: false}
+	o := New(l, cfg, "proj", "http://localhost:8080")
+	o.tmux = fake
+	o.pollInterval = time.Millisecond
+	t.Cleanup(o.Close)
+
+	if err := o.Trigger(context.Background(), "active"); err != nil {
+		t.Fatalf("Trigger: %v", err)
+	}
+	creates, commands, prompts := fake.counts()
+	if kills := fake.killCount(); kills != 0 || creates != 0 || commands != 0 || prompts != 0 {
+		t.Fatalf("active non-timeout trigger relaunched: kills=%d creates=%d commands=%d prompts=%d", kills, creates, commands, prompts)
+	}
+	if queued := queuedSnapshot(o); !reflect.DeepEqual(queued, []string{"active"}) {
+		t.Fatalf("queued = %#v, want active trigger preserved", queued)
 	}
 }
 
