@@ -16,7 +16,10 @@ import (
 	"github.com/xpadev/ccx-t2/internal/tmux"
 )
 
-const windowName = "orchestrator"
+const (
+	windowName   = "orchestrator"
+	maxReasonLen = 200
+)
 
 type tmuxClient interface {
 	EnsureSession(session string) error
@@ -122,7 +125,11 @@ func (o *Orchestrator) Trigger(ctx context.Context, reason string) error {
 }
 
 func normalizeReason(reason string) string {
-	return strings.Join(strings.Fields(reason), " ")
+	normalized := strings.Join(strings.Fields(reason), " ")
+	if len(normalized) > maxReasonLen {
+		return normalized[:maxReasonLen]
+	}
+	return normalized
 }
 
 // Close stops the background drain loop. It does not kill the tmux window.
@@ -383,13 +390,13 @@ func (o *Orchestrator) start(ctx context.Context, reason string) (bool, error) {
 	if err := o.tmux.CreateWindow(o.session, windowName, o.cfg.Project.RepoPath); err != nil {
 		return false, fmt.Errorf("create orchestrator window: %w", err)
 	}
-	o.markRunStarted()
 	if err := o.tmux.SendKeys(o.session, windowName, buildHarnessCommand(hCfg.Command, tokens)); err != nil {
 		return false, fmt.Errorf("send orchestrator command: %w", err)
 	}
 	if err := o.tmux.SendKeys(o.session, windowName, prompt); err != nil {
 		return false, fmt.Errorf("send orchestrator prompt: %w", err)
 	}
+	o.markRunStarted()
 	return true, nil
 }
 

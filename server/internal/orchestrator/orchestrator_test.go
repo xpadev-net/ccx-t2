@@ -313,6 +313,11 @@ func TestTriggerNormalizesReasonBeforePrompt(t *testing.T) {
 	if strings.Contains(prompt, "Trigger reason: worker completed\n") {
 		t.Fatalf("prompt contains raw newline in trigger reason:\n%s", prompt)
 	}
+
+	longReason := strings.Repeat("a", maxReasonLen+1)
+	if got := normalizeReason(longReason); len(got) != maxReasonLen {
+		t.Fatalf("normalized long reason length = %d, want %d", len(got), maxReasonLen)
+	}
 }
 
 func TestTriggerMidCallCancellationDrainsLaterQueuedWork(t *testing.T) {
@@ -420,6 +425,23 @@ func TestTriggerRestartsTimedOutActiveWindow(t *testing.T) {
 	}
 	if queued := queuedSnapshot(o); len(queued) != 0 {
 		t.Fatalf("queued = %#v, want empty after timeout restart", queued)
+	}
+}
+
+func TestRunStartMarkedOnlyAfterPromptSent(t *testing.T) {
+	l, cfg := newTestDeps(t)
+	fake := &failingSendTmux{fakeTmux: fakeTmux{}, failAfter: 1}
+	o := New(l, cfg, "proj", "http://localhost:8080")
+	o.tmux = fake
+
+	if err := o.Trigger(context.Background(), "send fails"); err == nil {
+		t.Fatal("Trigger send failure error = nil, want error")
+	}
+	o.mu.Lock()
+	runStart := o.runStart
+	o.mu.Unlock()
+	if !runStart.IsZero() {
+		t.Fatalf("runStart = %v, want zero after failed send", runStart)
 	}
 }
 
@@ -585,6 +607,24 @@ func (b *blockingCreateTmux) CreateWindow(session, name, startDir string) error 
 		<-b.releaseCreate
 	})
 	return b.fakeTmux.CreateWindow(session, name, startDir)
+}
+
+var errSendKeys = errors.New("send keys failed")
+
+type failingSendTmux struct {
+	fakeTmux
+	failAfter int
+}
+
+func (f *failingSendTmux) SendKeys(session, window, keys string) error {
+	f.mu.Lock()
+	if f.failAfter > 0 {
+		f.failAfter--
+		f.mu.Unlock()
+		return errSendKeys
+	}
+	f.mu.Unlock()
+	return f.fakeTmux.SendKeys(session, window, keys)
 }
 
 func queuedSnapshot(o *Orchestrator) []string {
