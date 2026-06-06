@@ -617,8 +617,8 @@ func handleStopWorker(deps *Deps) ToolHandler {
 			}
 		}
 
-		stopWorkerCleanup(deps, workerID, branch, taskID)
-
+		// Commit ledger first so the task is always recoverable, then clean
+		// up resources best-effort (same ordering as split_task and split_request).
 		if taskID != "" {
 			if err := deps.Ledger.Update(taskID, map[string]any{
 				"status":    "unstarted",
@@ -630,6 +630,7 @@ func handleStopWorker(deps *Deps) ToolHandler {
 				return nil, err
 			}
 		}
+		stopWorkerCleanup(deps, workerID, branch, taskID)
 
 		return map[string]any{"stopped": workerID}, nil
 	}
