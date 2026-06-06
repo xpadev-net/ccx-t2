@@ -247,28 +247,12 @@ func handleUpdateTask(deps *Deps) ToolHandler {
 			return nil, fmt.Errorf("status cannot be changed via update_task")
 		}
 
-		// Reject updates to terminal tasks (completed, split) to prevent stale
-		// orchestrator calls from silently overwriting ledger state.
-		tasks, err := deps.Ledger.Load()
-		if err != nil {
-			return nil, err
-		}
-		var t *ledger.Task
-		for i := range tasks {
-			if tasks[i].ID == id {
-				t = &tasks[i]
-				break
-			}
-		}
-		if t == nil {
-			return nil, fmt.Errorf("task not found: %s", id)
-		}
-		switch t.Status {
-		case "completed", "split":
-			return nil, fmt.Errorf("cannot update task %s with status %q", id, t.Status)
-		}
-
-		return nil, deps.Ledger.Update(id, fields)
+		// Atomically reject updates to terminal tasks (completed, split) using
+		// UpdateIfStatuses so the status check and write are in the same mutex lock,
+		// preventing a concurrent transition from sneaking in between Load and Update.
+		return nil, deps.Ledger.UpdateIfStatuses(id,
+			[]string{"unstarted", "in_progress", "blocked"},
+			fields)
 	}
 }
 
@@ -399,12 +383,11 @@ func handleSplitTask(deps *Deps) ToolHandler {
 			return nil, err
 		}
 
-		// Guard against concurrent terminal transitions (notify(completed)/notify(split_request)
-		// winning the race between our preflight and the UpdateReturnPrev write).
+		// Guard against concurrent transitions winning the race between our preflight
+		// and the UpdateReturnPrev write. "unstarted" covers stop_worker resetting
+		// the task; "completed"/"split" cover notify/split winning the race.
 		switch prevTask.Status {
-		case "completed", "split":
-			// The task reached a terminal state before we could commit the split.
-			// Roll back the children to keep the ledger consistent.
+		case "completed", "split", "unstarted":
 			_ = deps.Ledger.DeleteTasks(childIDs)
 			return nil, fmt.Errorf("cannot split task %s: it reached status %q concurrently", id, prevTask.Status)
 		}
