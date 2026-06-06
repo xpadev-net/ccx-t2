@@ -522,15 +522,20 @@ func (o *Orchestrator) buildPrompt(reason string) (string, error) {
 	sb.WriteString("Spawn workers for actionable unstarted tasks, archive completed tasks, ")
 	sb.WriteString("stop or follow up workers when appropriate, and create/split/update tasks only through MCP tools.\n\n")
 	sb.WriteString("Project:\n")
-	sb.WriteString("  slug: " + o.cfg.Project.Slug + "\n")
-	sb.WriteString("  repo_path: " + o.cfg.Project.RepoPath + "\n")
-	sb.WriteString("  validation_command: " + o.cfg.Project.ValidationCommand + "\n\n")
+	sb.WriteString("  slug: " + promptLine(o.cfg.Project.Slug) + "\n")
+	sb.WriteString("  repo_path: " + promptLine(o.cfg.Project.RepoPath) + "\n")
+	sb.WriteString("  validation_command: " + promptLine(o.cfg.Project.ValidationCommand) + "\n\n")
 	sb.WriteString("Ledger snapshot:\n```json\n")
 	sb.Write(taskJSON)
 	sb.WriteString("\n```\n\nHarness snapshot:\n```json\n")
 	sb.Write(harnessJSON)
 	sb.WriteString("\n```\n")
 	return sb.String(), nil
+}
+
+func promptLine(s string) string {
+	replacer := strings.NewReplacer("\r\n", " ", "\n", " ", "\r", " ")
+	return replacer.Replace(s)
 }
 
 func (o *Orchestrator) validate() error {

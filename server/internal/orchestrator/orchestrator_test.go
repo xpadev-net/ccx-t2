@@ -438,6 +438,35 @@ func TestTriggerNormalizesReasonBeforePrompt(t *testing.T) {
 	}
 }
 
+func TestTriggerSanitizesProjectConfigPromptLines(t *testing.T) {
+	l, cfg := newTestDeps(t)
+	cfg.Project.Slug = "proj\n  injected: slug"
+	cfg.Project.RepoPath = filepath.Join(t.TempDir(), "repo") + "\n  injected: path"
+	cfg.Project.ValidationCommand = "go test  ./...\n  injected: command"
+	fake := &fakeTmux{}
+	o := New(l, cfg, "proj", "http://localhost:8080")
+	o.tmux = fake
+
+	if err := o.Trigger(context.Background(), "config prompt"); err != nil {
+		t.Fatalf("Trigger: %v", err)
+	}
+	fake.mu.Lock()
+	prompt := fake.prompts[0]
+	fake.mu.Unlock()
+	if strings.Contains(prompt, "\n  injected:") {
+		t.Fatalf("prompt contains injected project config line:\n%s", prompt)
+	}
+	for _, want := range []string{
+		"slug: proj   injected: slug",
+		"repo_path: " + cfg.Project.RepoPath[:strings.Index(cfg.Project.RepoPath, "\n")] + "   injected: path",
+		"validation_command: go test  ./...   injected: command",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt does not contain sanitized line %q:\n%s", want, prompt)
+		}
+	}
+}
+
 func TestTriggerMidCallCancellationDrainsLaterQueuedWork(t *testing.T) {
 	l, cfg := newTestDeps(t)
 	ctx, cancel := context.WithCancel(context.Background())
