@@ -579,13 +579,14 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 			_ = tmux.KillWindow(deps.Session, workerID)
 			_ = worktree.Remove(repoPath, worktreePath)
 			_ = exec.Command("git", "-C", repoPath, "branch", "-D", branch).Run()
+			// Restore to original values from before the spawn attempt.
 			_ = deps.Ledger.Update(taskID, map[string]any{
 				"status":          "unstarted",
 				"worker_id":       "",
 				"branch":          "",
 				"harness":         "",
-				"allowed_files":   []string(nil),
-				"forbidden_files": []string(nil),
+				"allowed_files":   task.AllowedFiles,
+				"forbidden_files": task.ForbiddenFiles,
 			})
 			deps.Registry.Remove(workerID)
 			return nil, fmt.Errorf("send harness command: %w", err)
@@ -799,10 +800,11 @@ func handleNotify(deps *Deps) ToolHandler {
 
 		case "blocked":
 			reason, _ := payload["reason"].(string)
-			if err := deps.Ledger.Update(taskID, map[string]any{
-				"status": "blocked",
-				"reason": reason,
-			}); err != nil {
+			fields := map[string]any{"status": "blocked"}
+			if reason != "" {
+				fields["reason"] = reason
+			}
+			if err := deps.Ledger.Update(taskID, fields); err != nil {
 				return nil, err
 			}
 
