@@ -518,10 +518,14 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 			return nil, err
 		}
 
-		// Validate mcp_args shell syntax before any state mutation.
+		// Validate mcp_args shell syntax and split into tokens before any state mutation.
+		// The expanded URL and secret values may contain shell metacharacters, so we
+		// rebuild the command by single-quoting each split token rather than forwarding
+		// the concatenated string verbatim to the shell.
 		workerMCPURL := deps.BaseURL + "/mcp/worker"
 		mcpArgsStr := replaceMcpURL(hCfg.McpArgs, workerMCPURL, deps.Config.Server.McpSecret)
-		if _, err := shellquote.Split(mcpArgsStr); err != nil {
+		mcpTokens, err := shellquote.Split(mcpArgsStr)
+		if err != nil {
 			return nil, fmt.Errorf("invalid mcp_args shell syntax: %w", err)
 		}
 
@@ -605,8 +609,14 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 		})
 
 		// Step 4: Launch harness with MCP args.
-		// mcpArgsStr was validated above; use it directly to preserve quoting.
-		harnessCmd := hCfg.Command + " " + mcpArgsStr
+		// Rebuild the command by single-quoting each split token so that expanded
+		// URL/secret values with shell metacharacters are not interpreted by the shell.
+		parts := make([]string, 0, 1+len(mcpTokens))
+		parts = append(parts, shellQuoteArg(hCfg.Command))
+		for _, t := range mcpTokens {
+			parts = append(parts, shellQuoteArg(t))
+		}
+		harnessCmd := strings.Join(parts, " ")
 		if err := tmux.SendKeys(deps.Session, workerID, harnessCmd); err != nil {
 			// Harness failed to launch — roll back all resources so the task
 			// can be retried with stop_worker or a new spawn_worker call.
@@ -1074,4 +1084,10 @@ Instructions:
 - If you need to split: call notify(type="split_request", payload={task_id, worker_id, reason, proposed_slices}).
 `)
 	return sb.String()
+}
+
+// shellQuoteArg wraps a single argument in POSIX single quotes so that shell
+// metacharacters in expanded values (URL, secret) are not interpreted.
+func shellQuoteArg(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
 }

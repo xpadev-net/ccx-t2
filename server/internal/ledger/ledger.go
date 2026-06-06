@@ -12,21 +12,21 @@ import (
 
 // Task represents a single task in the ledger.
 type Task struct {
-	ID             string   `yaml:"id"`
-	Title          string   `yaml:"title,omitempty"`
-	Status         string   `yaml:"status,omitempty"`
-	Branch         string   `yaml:"branch,omitempty"`
-	WorkerID       string   `yaml:"worker_id,omitempty"`
-	Harness        string   `yaml:"harness,omitempty"`
-	AllowedFiles   []string `yaml:"allowed_files,omitempty"`
-	ForbiddenFiles []string `yaml:"forbidden_files,omitempty"`
-	PrURL          string   `yaml:"pr_url,omitempty"`
-	MergeCommit    string   `yaml:"merge_commit,omitempty"`
-	Reason         string   `yaml:"reason,omitempty"`
-	UpdatedAt      string   `yaml:"updated_at,omitempty"`
+	ID             string   `yaml:"id"              json:"id"`
+	Title          string   `yaml:"title,omitempty" json:"title,omitempty"`
+	Status         string   `yaml:"status,omitempty" json:"status,omitempty"`
+	Branch         string   `yaml:"branch,omitempty" json:"branch,omitempty"`
+	WorkerID       string   `yaml:"worker_id,omitempty" json:"worker_id,omitempty"`
+	Harness        string   `yaml:"harness,omitempty" json:"harness,omitempty"`
+	AllowedFiles   []string `yaml:"allowed_files,omitempty" json:"allowed_files,omitempty"`
+	ForbiddenFiles []string `yaml:"forbidden_files,omitempty" json:"forbidden_files,omitempty"`
+	PrURL          string   `yaml:"pr_url,omitempty" json:"pr_url,omitempty"`
+	MergeCommit    string   `yaml:"merge_commit,omitempty" json:"merge_commit,omitempty"`
+	Reason         string   `yaml:"reason,omitempty" json:"reason,omitempty"`
+	UpdatedAt      string   `yaml:"updated_at,omitempty" json:"updated_at,omitempty"`
 
-	// Body is the markdown body of the task (not part of front matter).
-	Body string `yaml:"-"`
+	// Body is the markdown body of the task (not part of front matter or JSON).
+	Body string `yaml:"-" json:"-"`
 }
 
 // Ledger manages the task ledger file.

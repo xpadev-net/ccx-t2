@@ -124,5 +124,7 @@ func normalizeCheckStatus(run *gh.CheckRun) CheckStatus {
 	case "queued", "in_progress":
 		return CheckPending
 	}
-	return CheckPending
+	// Unknown conclusion+status combination — treat as failure so the orchestrator
+	// does not wait indefinitely for a check that may never reach a known terminal state.
+	return CheckFailure
 }
