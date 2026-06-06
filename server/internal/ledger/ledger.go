@@ -290,24 +290,53 @@ func (l *Ledger) Archive(id, mergeCommit string) error {
 		return err
 	}
 
-	fm, err := marshalFrontMatter(t)
-	if err != nil {
+	// If the archive file already exists we crashed between the last archive
+	// write and the ledger save; skip re-writing and proceed to remove the
+	// task from the ledger (idempotent recovery).
+	_, statErr := os.Stat(archiveFile)
+	if statErr != nil && !os.IsNotExist(statErr) {
 		l.mu.Unlock()
-		return err
+		return fmt.Errorf("stat archive file: %w", statErr)
 	}
-	var ab strings.Builder
-	ab.WriteString("---\n")
-	ab.Write(fm)
-	ab.WriteString("---\n")
-	if t.Body != "" {
-		ab.WriteString("\n")
-		ab.WriteString(t.Body)
-		ab.WriteString("\n")
-	}
+	if os.IsNotExist(statErr) {
+		fm, err := marshalFrontMatter(t)
+		if err != nil {
+			l.mu.Unlock()
+			return err
+		}
+		var ab strings.Builder
+		ab.WriteString("---\n")
+		ab.Write(fm)
+		ab.WriteString("---\n")
+		if t.Body != "" {
+			ab.WriteString("\n")
+			ab.WriteString(t.Body)
+			ab.WriteString("\n")
+		}
 
-	if err := os.WriteFile(archiveFile, []byte(ab.String()), 0o644); err != nil {
-		l.mu.Unlock()
-		return err
+		// Write archive file atomically via temp file + rename.
+		tmpArchive, err := os.CreateTemp(l.archiveDir, ".archive-*.tmp")
+		if err != nil {
+			l.mu.Unlock()
+			return err
+		}
+		tmpArchiveName := tmpArchive.Name()
+		if _, err := tmpArchive.WriteString(ab.String()); err != nil {
+			tmpArchive.Close()
+			os.Remove(tmpArchiveName)
+			l.mu.Unlock()
+			return err
+		}
+		if err := tmpArchive.Close(); err != nil {
+			os.Remove(tmpArchiveName)
+			l.mu.Unlock()
+			return err
+		}
+		if err := os.Rename(tmpArchiveName, archiveFile); err != nil {
+			os.Remove(tmpArchiveName)
+			l.mu.Unlock()
+			return err
+		}
 	}
 
 	// Build remaining slice without aliasing the original backing array.
@@ -372,16 +401,18 @@ func (l *Ledger) generateID() (string, error) {
 	return "", fmt.Errorf("could not generate unique task ID for date %s", date)
 }
 
+var (
+	reSlugNonAlnum = regexp.MustCompile(`[^a-z0-9-]`)
+	reSlugHyphens  = regexp.MustCompile(`-{2,}`)
+	reMergeCommit  = regexp.MustCompile(`(?m)\n?<!-- merge_commit: [^\n]+ -->`)
+)
+
 // titleToSlug converts a title to a URL slug.
 func titleToSlug(title string) string {
 	s := strings.ToLower(title)
 	s = strings.ReplaceAll(s, " ", "-")
-	// Remove characters that are not alphanumeric or hyphen.
-	re := regexp.MustCompile(`[^a-z0-9-]`)
-	s = re.ReplaceAllString(s, "")
-	// Collapse multiple hyphens.
-	reHyphens := regexp.MustCompile(`-{2,}`)
-	s = reHyphens.ReplaceAllString(s, "-")
+	s = reSlugNonAlnum.ReplaceAllString(s, "")
+	s = reSlugHyphens.ReplaceAllString(s, "-")
 	s = strings.Trim(s, "-")
 	if s == "" {
 		return "untitled"
@@ -391,6 +422,5 @@ func titleToSlug(title string) string {
 
 // removeMergeCommitComment strips "<!-- merge_commit: ... -->" from body text.
 func removeMergeCommitComment(body string) string {
-	re := regexp.MustCompile(`(?m)\n?<!-- merge_commit: [^\n]+ -->`)
-	return re.ReplaceAllString(body, "")
+	return reMergeCommit.ReplaceAllString(body, "")
 }

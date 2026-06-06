@@ -12,9 +12,10 @@ func ValidatePath(p string) error {
 	if filepath.IsAbs(p) {
 		return fmt.Errorf("path must be relative: %s", p)
 	}
-	// Clean the path and check it doesn't escape.
+	// Clean the path and check it doesn't escape via "..".
+	// Only reject a true parent-directory traversal: exactly ".." or starting with "../".
 	cleaned := filepath.Clean(p)
-	if strings.HasPrefix(cleaned, "..") {
+	if cleaned == ".." || strings.HasPrefix(cleaned, ".."+string(filepath.Separator)) {
 		return fmt.Errorf("path escapes repository root: %s", p)
 	}
 	return nil

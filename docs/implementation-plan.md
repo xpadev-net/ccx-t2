@@ -2,7 +2,7 @@
 
 ## ディレクトリ構成
 
-```
+```text
 ccx-t2/
 ├── server/                        ← Go バックエンド
 │   ├── cmd/
@@ -54,6 +54,7 @@ ccx-t2/
 ## フェーズ1：台帳・パーサー
 
 ### 目標
+
 `tasks/ledger.md` の読み書きができる状態にする。
 
 ### 実装内容
@@ -82,6 +83,7 @@ ccx-t2/
 ## フェーズ2：tmux・Worktree 管理
 
 ### 目標
+
 tmux ウィンドウの作成・削除・キー送信と git worktree の管理ができる状態にする。
 
 ### 実装内容
@@ -104,6 +106,7 @@ tmux ウィンドウの作成・削除・キー送信と git worktree の管理�
 **フェーズ2の完了が前提。** `spawn_worker`・`stop_worker` はフェーズ2の tmux・worktree 実装に依存する。
 
 ### 目標
+
 Orchestrator・Worker がツールを呼べる HTTP MCP サーバーを立てる。
 
 ### 実装内容
@@ -137,6 +140,7 @@ Orchestrator・Worker がツールを呼べる HTTP MCP サーバーを立てる
 ## フェーズ4：イベントキュー・Orchestrator トリガー
 
 ### 目標
+
 Worker からのイベントを直列に処理し、Orchestrator を適切なタイミングで起動する。
 
 ### 実装内容
@@ -166,6 +170,7 @@ Worker からのイベントを直列に処理し、Orchestrator を適切なタ
 ## フェーズ5：Web UI
 
 ### 目標
+
 台帳 CRUD・Worker ログストリーミング・タスク追加フォームが動く Web UI を実装する。
 
 ### 実装内容
@@ -200,6 +205,7 @@ Worker からのイベントを直列に処理し、Orchestrator を適切なタ
 ## フェーズ6：ハーネス統合テスト
 
 ### 目標
+
 各ハーネスで Worker が正常に動作することを確認する。
 
 ### 確認内容

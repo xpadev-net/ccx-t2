@@ -9,6 +9,7 @@ task-pr-orchestrator / task-pr-worker スキルのフローを複数のエージ
 ## 役割分担
 
 ### Go ハーネスが担う
+
 - タスク台帳の永続化・読み書き
 - Worktree の生成・削除
 - Worker プロセス（tmux ウィンドウ）の起動・停止
@@ -20,6 +21,7 @@ task-pr-orchestrator / task-pr-worker スキルのフローを複数のエージ
 - MCP サーバー（HTTP）の提供
 
 ### Orchestrator Agent が担う
+
 - どのタスクを Worker にアサインするか（MCP ツールを呼んで Go 側に命令を発行）
 - コンフリクト判定（ファイル所有権）
 - タスク分割の粒度・ブランチ設計
@@ -28,6 +30,7 @@ task-pr-orchestrator / task-pr-worker スキルのフローを複数のエージ
 - 構造化 JSON を返すのではなく MCP ツールコールで命令を発行するエージェント型動作
 
 ### Worker Agent が担う
+
 - 委任されたタスクの実装
 - バリデーション・テスト
 - セルフレビュー
@@ -75,7 +78,7 @@ updated_at: 2026-06-04T12:30:00Z
 
 ### ステータス遷移
 
-```
+```text
 unstarted → in_progress → completed → (archive_task でアーカイブに移動・台帳から削除)
                         → blocked
                         → split   ← 終端。子タスクが unstarted で追加される。再スケジュールしない。
@@ -109,7 +112,7 @@ unstarted → in_progress → completed → (archive_task でアーカイブに�
 
 ## tmux 構造
 
-```
+```text
 session: {project-slug}
   window: orchestrator        ← Orchestrator Agent（トリガーのたびに同ウィンドウで再起動）
   window: worker-{task-id}   ← Worker Agent（タスクごとに1ウィンドウ）
@@ -145,7 +148,7 @@ Orchestrator・Worker ともに以下から選択可能とする。
 
 ### Orchestrator 向けツール
 
-```
+```text
 list_tasks()
   → 台帳のスナップショット（全アクティブタスク）
 
@@ -182,7 +185,7 @@ get_pr_status(pr_number)
 
 ### Worker 向けツール
 
-```
+```text
 notify(type, payload)
   type: "completed" | "blocked" | "split_request"
   payload: {
