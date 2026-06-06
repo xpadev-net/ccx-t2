@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-func TestInitializedNotificationWithoutIDReturnsJSONAck(t *testing.T) {
+func TestInitializedNotificationWithoutIDReturnsJSONRPCResponse(t *testing.T) {
 	s := NewServer("worker", "")
 	body := bytes.NewBufferString(`{"jsonrpc":"2.0","method":"notifications/initialized"}`)
 	req := httptest.NewRequest(http.MethodPost, "/mcp/worker", body)
@@ -23,8 +23,14 @@ func TestInitializedNotificationWithoutIDReturnsJSONAck(t *testing.T) {
 	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("response is not JSON: %v\n%s", err, rr.Body.String())
 	}
-	if len(resp) != 0 {
-		t.Fatalf("response = %#v, want empty JSON object for notification ack", resp)
+	if resp["jsonrpc"] != "2.0" {
+		t.Fatalf("jsonrpc = %#v, want 2.0", resp["jsonrpc"])
+	}
+	if _, ok := resp["id"]; !ok {
+		t.Fatalf("response missing id field: %#v", resp)
+	}
+	if _, ok := resp["result"]; !ok {
+		t.Fatalf("response missing result: %#v", resp)
 	}
 }
 

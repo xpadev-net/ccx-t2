@@ -103,11 +103,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		})
 
 	case "notifications/initialized":
-		if req.ID != nil {
-			writeResult(w, req.ID, map[string]any{})
-			return
-		}
-		writeJSON(w, map[string]any{})
+		writeResult(w, req.ID, map[string]any{})
 
 	case "tools/list":
 		writeResult(w, req.ID, map[string]any{"tools": s.toolDefs})
