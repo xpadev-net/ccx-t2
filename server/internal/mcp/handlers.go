@@ -21,12 +21,12 @@ import (
 
 // Deps holds the dependencies used by MCP tool handlers.
 type Deps struct {
-	Ledger       *ledger.Ledger
-	Registry     *worker.Registry
-	Config       *config.Config
-	GitHub       *githubpkg.Client // may be nil if GitHub is not configured
-	Session      string            // tmux session name
-	BaseURL      string            // e.g. "http://localhost:8080"
+	Ledger   *ledger.Ledger
+	Registry *worker.Registry
+	Config   *config.Config
+	GitHub   *githubpkg.Client // may be nil if GitHub is not configured
+	Session  string            // tmux session name
+	BaseURL  string            // e.g. "http://localhost:8080"
 }
 
 // RegisterOrchestratorTools registers the 10 Orchestrator tools on s.
@@ -303,7 +303,7 @@ func handleSplitTask(deps *Deps) ToolHandler {
 		}
 		// Validate all slices before allocating IDs.
 		type pendingSlice struct {
-			title, desc    string
+			title, desc        string
 			allowed, forbidden []string
 		}
 		pending := make([]pendingSlice, 0, len(slicesAny))
@@ -519,12 +519,10 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 		}
 
 		// Validate mcp_args shell syntax and split into tokens before any state mutation.
-		// The expanded URL and secret values may contain shell metacharacters, so we
-		// rebuild the command by single-quoting each split token rather than forwarding
-		// the concatenated string verbatim to the shell.
-		workerMCPURL := deps.BaseURL + "/mcp/worker"
-		mcpArgsStr := replaceMcpURL(hCfg.McpArgs, workerMCPURL, deps.Config.Server.McpSecret)
-		mcpTokens, err := shellquote.Split(mcpArgsStr)
+		// Split the *template* before expanding {url}/{secret} so that the expanded
+		// values (which may contain spaces or other shell metacharacters) are treated
+		// as atomic tokens. Each token then has its placeholders substituted individually.
+		mcpTokens, err := buildMCPTokens(hCfg.McpArgs, deps.BaseURL+"/mcp/worker", deps.Config.Server.McpSecret)
 		if err != nil {
 			return nil, fmt.Errorf("invalid mcp_args shell syntax: %w", err)
 		}
@@ -611,12 +609,7 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 		// Step 4: Launch harness with MCP args.
 		// Rebuild the command by single-quoting each split token so that expanded
 		// URL/secret values with shell metacharacters are not interpreted by the shell.
-		parts := make([]string, 0, 1+len(mcpTokens))
-		parts = append(parts, shellQuoteArg(hCfg.Command))
-		for _, t := range mcpTokens {
-			parts = append(parts, shellQuoteArg(t))
-		}
-		harnessCmd := strings.Join(parts, " ")
+		harnessCmd := buildHarnessCommand(hCfg.Command, mcpTokens)
 		if err := tmux.SendKeys(deps.Session, workerID, harnessCmd); err != nil {
 			// Harness failed to launch — roll back all resources so the task
 			// can be retried with stop_worker or a new spawn_worker call.
@@ -1049,6 +1042,27 @@ func extractMergeCommit(body string) string {
 		return ""
 	}
 	return strings.TrimSpace(rest[:end])
+}
+
+func buildMCPTokens(template, workerMCPURL, secret string) ([]string, error) {
+	templateTokens, err := shellquote.Split(template)
+	if err != nil {
+		return nil, err
+	}
+	tokens := make([]string, len(templateTokens))
+	for i, tok := range templateTokens {
+		tokens[i] = replaceMcpURL(tok, workerMCPURL, secret)
+	}
+	return tokens, nil
+}
+
+func buildHarnessCommand(command string, mcpTokens []string) string {
+	parts := make([]string, 0, 1+len(mcpTokens))
+	parts = append(parts, shellQuoteArg(command))
+	for _, tok := range mcpTokens {
+		parts = append(parts, shellQuoteArg(tok))
+	}
+	return strings.Join(parts, " ")
 }
 
 // buildWorkerPrompt constructs the stdin prompt sent to the worker harness.
