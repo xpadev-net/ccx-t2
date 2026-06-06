@@ -9,9 +9,12 @@ import (
 )
 
 // Create creates a new git worktree at worktreePath branching from baseRef.
-// worktreePath must be absolute so that both os.Stat and git resolve it
-// consistently regardless of the process working directory.
+// Both repoPath and worktreePath must be absolute so that os.Stat and git
+// resolve them consistently regardless of the process working directory.
 func Create(repoPath, branch, worktreePath, baseRef string) error {
+	if !filepath.IsAbs(repoPath) {
+		return fmt.Errorf("repoPath must be absolute, got: %s", repoPath)
+	}
 	if !filepath.IsAbs(worktreePath) {
 		return fmt.Errorf("worktreePath must be absolute, got: %s", worktreePath)
 	}
