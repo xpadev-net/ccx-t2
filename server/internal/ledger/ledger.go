@@ -283,6 +283,45 @@ func (l *Ledger) UpdateIfStatus(id, expectedStatus string, fields map[string]any
 	return l.updateWithCheck(id, expectedStatus, fields)
 }
 
+// UpdateReturnPrev applies the field update and returns a snapshot of the task
+// from before the write, all within a single mutex lock. The caller can compare
+// the returned prev task with its earlier read to detect concurrent transitions
+// (e.g., a spawned worker that changed status between the caller's Load and this Update).
+func (l *Ledger) UpdateReturnPrev(id string, fields map[string]any) (prev Task, err error) {
+	l.mu.Lock()
+	tasks, err := l.load()
+	if err != nil {
+		l.mu.Unlock()
+		return Task{}, err
+	}
+	found := false
+	for i := range tasks {
+		if tasks[i].ID != id {
+			continue
+		}
+		prev = tasks[i] // snapshot before mutation
+		found = true
+		t := &tasks[i]
+		if err := applyFields(t, fields); err != nil {
+			l.mu.Unlock()
+			return Task{}, err
+		}
+		t.UpdatedAt = time.Now().Format(time.RFC3339)
+		break
+	}
+	if !found {
+		l.mu.Unlock()
+		return Task{}, fmt.Errorf("task not found: %s", id)
+	}
+	err = l.save(tasks)
+	onChange := l.onChange
+	l.mu.Unlock()
+	if err == nil && onChange != nil {
+		onChange()
+	}
+	return prev, err
+}
+
 func (l *Ledger) updateWithCheck(id, expectedStatus string, fields map[string]any) error {
 	l.mu.Lock()
 	tasks, err := l.load()

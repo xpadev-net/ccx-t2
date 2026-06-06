@@ -383,21 +383,28 @@ func handleSplitTask(deps *Deps) ToolHandler {
 		}
 
 		// Update parent to split only after all children are safely written.
-		if err := deps.Ledger.Update(id, map[string]any{
+		// Use UpdateReturnPrev to capture the actual pre-update task snapshot
+		// atomically: a concurrent spawn_worker could have changed status from
+		// "unstarted" to "in_progress" between our preflight read and this write.
+		prevTask, err := deps.Ledger.UpdateReturnPrev(id, map[string]any{
 			"status":    "split",
 			"reason":    reason,
 			"worker_id": "",
 			"branch":    "",
 			"harness":   "",
-		}); err != nil {
+		})
+		if err != nil {
 			// Roll back the children to avoid orphans on retry.
 			_ = deps.Ledger.DeleteTasks(childIDs)
 			return nil, err
 		}
 
-		// Clean up worker resources best-effort (parent already committed as split).
-		if original.Status == "in_progress" || original.Status == "blocked" {
-			stopWorkerCleanup(deps, original.WorkerID, original.Branch, id)
+		// Clean up worker resources based on the actual previous status and
+		// worker_id/branch from the atomic snapshot, not the stale preflight read.
+		// This handles the race where spawn_worker won and moved the task to
+		// in_progress with a new worker before our Update committed.
+		if prevTask.Status == "in_progress" || prevTask.Status == "blocked" {
+			stopWorkerCleanup(deps, prevTask.WorkerID, prevTask.Branch, id)
 		}
 
 		return map[string]any{"child_ids": childIDs}, nil
