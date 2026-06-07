@@ -292,7 +292,18 @@ func (s *Server) handleProjects(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		if s.manager != nil {
-			writeJSON(w, http.StatusOK, s.manager.Projects())
+			projects := s.manager.Projects()
+			out := make([]projectResponse, len(projects))
+			for i, info := range projects {
+				out[i] = projectResponse{
+					Slug:     info.Slug,
+					RepoPath: info.RepoPath,
+				}
+				if project, err := s.manager.Project(info.Slug); err == nil {
+					out[i].Session = project.Session
+				}
+			}
+			writeJSON(w, http.StatusOK, out)
 			return
 		}
 		cfg, ok := s.configSnapshot()
@@ -300,9 +311,14 @@ func (s *Server) handleProjects(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, "config is not configured")
 			return
 		}
-		writeJSON(w, http.StatusOK, []runtimepkg.ProjectInfo{{
+		session := s.tmuxSession
+		if session == "" {
+			session = cfg.Runtime.TmuxSession
+		}
+		writeJSON(w, http.StatusOK, []projectResponse{{
 			Slug:     cfg.Project.Slug,
 			RepoPath: cfg.Project.RepoPath,
+			Session:  session,
 		}})
 	case http.MethodPost:
 		s.createProject(w, r)
@@ -1021,6 +1037,12 @@ type taskResponse struct {
 	Reason         string   `json:"reason,omitempty"`
 	UpdatedAt      string   `json:"updated_at,omitempty"`
 	Body           string   `json:"body,omitempty"`
+}
+
+type projectResponse struct {
+	Slug     string `json:"slug"`
+	RepoPath string `json:"repo_path"`
+	Session  string `json:"session,omitempty"`
 }
 
 type taskCreateResponse struct {

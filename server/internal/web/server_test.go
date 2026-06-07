@@ -95,6 +95,18 @@ func TestProjectScopedTasksUseSelectedProjectLedger(t *testing.T) {
 	}
 
 	handler := New(Deps{Config: cfg, Manager: manager, AuthDisabled: true})
+	projectsResp := performRequest(handler, http.MethodGet, "/api/projects")
+	if projectsResp.Code != http.StatusOK {
+		t.Fatalf("projects status = %d, want %d; body=%s", projectsResp.Code, http.StatusOK, projectsResp.Body.String())
+	}
+	var projects []projectResponse
+	if err := json.Unmarshal(projectsResp.Body.Bytes(), &projects); err != nil {
+		t.Fatalf("decode projects: %v", err)
+	}
+	if len(projects) != 2 || projects[0].Session != "ccx-test" || projects[1].Session != "ccx-test" {
+		t.Fatalf("projects = %#v, want project sessions", projects)
+	}
+
 	resp := performRequest(handler, http.MethodGet, "/api/projects/alpha/tasks")
 	if resp.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusOK, resp.Body.String())
