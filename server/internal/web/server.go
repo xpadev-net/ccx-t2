@@ -208,6 +208,8 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 					s.writeTaskCreateResponse(w, r, http.StatusOK, existing)
 					return
 				}
+				writeError(w, http.StatusConflict, "task already exists outside active ledger")
+				return
 			}
 			writeError(w, http.StatusInternalServerError, "create task")
 			return
