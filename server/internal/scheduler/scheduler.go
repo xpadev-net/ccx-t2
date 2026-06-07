@@ -64,9 +64,6 @@ func (s *Scheduler) Run(ctx context.Context) error {
 }
 
 func (s *Scheduler) validate() error {
-	if s == nil {
-		return fmt.Errorf("scheduler is nil")
-	}
 	if s.ledger == nil {
 		return fmt.Errorf("scheduler ledger is nil")
 	}
