@@ -2,6 +2,7 @@ package tmux
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -14,17 +15,29 @@ import (
 
 // EnsureSession creates a tmux session with the given name if it does not exist.
 func EnsureSession(slug string) error {
-	err := run("tmux", "has-session", "-t", slug)
+	return EnsureSessionContext(context.Background(), slug)
+}
+
+// EnsureSessionContext creates a tmux session with the given name if it does
+// not exist, aborting command execution when ctx is canceled.
+func EnsureSessionContext(ctx context.Context, slug string) error {
+	err := runCtx(ctx, "tmux", "has-session", "-t", slug)
 	if err == nil {
 		return nil
 	}
-	return run("tmux", "new-session", "-d", "-s", slug)
+	return runCtx(ctx, "tmux", "new-session", "-d", "-s", slug)
 }
 
 // CreateWindow creates a new window in the given session with the specified
 // name and starting directory.
 func CreateWindow(session, name, startDir string) error {
-	return run("tmux", "new-window", "-t", session, "-n", name, "-c", startDir)
+	return CreateWindowContext(context.Background(), session, name, startDir)
+}
+
+// CreateWindowContext creates a new window and aborts command execution when
+// ctx is canceled.
+func CreateWindowContext(ctx context.Context, session, name, startDir string) error {
+	return runCtx(ctx, "tmux", "new-window", "-t", session, "-n", name, "-c", startDir)
 }
 
 // SendKeys sends keys to a window's pane. The text is sent literally via -l,
@@ -32,24 +45,42 @@ func CreateWindow(session, name, startDir string) error {
 // newlines in keys are sent as literal 0x0A and are suitable for multiline
 // stdin payloads; the final Enter terminates the input sequence.
 func SendKeys(session, window, keys string) error {
+	return SendKeysContext(context.Background(), session, window, keys)
+}
+
+// SendKeysContext sends keys to a window's pane and aborts command execution
+// when ctx is canceled.
+func SendKeysContext(ctx context.Context, session, window, keys string) error {
 	target := session + ":" + window
-	if err := run("tmux", "send-keys", "-t", target, "-l", keys); err != nil {
+	if err := runCtx(ctx, "tmux", "send-keys", "-t", target, "-l", keys); err != nil {
 		return err
 	}
-	return run("tmux", "send-keys", "-t", target, "Enter")
+	return runCtx(ctx, "tmux", "send-keys", "-t", target, "Enter")
 }
 
 // KillWindow terminates a window in a session.
 func KillWindow(session, window string) error {
+	return KillWindowContext(context.Background(), session, window)
+}
+
+// KillWindowContext terminates a window and aborts command execution when ctx
+// is canceled.
+func KillWindowContext(ctx context.Context, session, window string) error {
 	target := session + ":" + window
-	return run("tmux", "kill-window", "-t", target)
+	return runCtx(ctx, "tmux", "kill-window", "-t", target)
 }
 
 // IsWindowAlive reports whether a window with the given name exists in the
 // session. Returns (false, nil) when the session does not exist, and
 // (false, err) for unexpected errors.
 func IsWindowAlive(session, window string) (bool, error) {
-	out, err := output("tmux", "list-windows", "-t", session, "-F", "#{window_name}")
+	return IsWindowAliveContext(context.Background(), session, window)
+}
+
+// IsWindowAliveContext reports whether a window exists and aborts command
+// execution when ctx is canceled.
+func IsWindowAliveContext(ctx context.Context, session, window string) (bool, error) {
+	out, err := outputCtx(ctx, "tmux", "list-windows", "-t", session, "-F", "#{window_name}")
 	if err != nil {
 		msg := err.Error()
 		if strings.Contains(msg, "no such session") || strings.Contains(msg, "can't find session") {
@@ -70,8 +101,14 @@ func IsWindowAlive(session, window string) (bool, error) {
 // (bash, zsh, sh, fish, dash, ksh, tcsh, or nu), indicating that the
 // harness process has exited.
 func IsPaneIdle(session, window string) (bool, error) {
+	return IsPaneIdleContext(context.Background(), session, window)
+}
+
+// IsPaneIdleContext reports whether the pane's foreground process is a shell
+// and aborts command execution when ctx is canceled.
+func IsPaneIdleContext(ctx context.Context, session, window string) (bool, error) {
 	target := session + ":" + window
-	out, err := output("tmux", "display-message", "-t", target, "-p", "#{pane_current_command}")
+	out, err := outputCtx(ctx, "tmux", "display-message", "-t", target, "-p", "#{pane_current_command}")
 	if err != nil {
 		return false, fmt.Errorf("display-message: %w", err)
 	}
@@ -168,7 +205,11 @@ func PipeOutput(session, window string) (<-chan string, func(), error) {
 }
 
 func run(name string, args ...string) error {
-	cmd := exec.Command(name, args...)
+	return runCtx(context.Background(), name, args...)
+}
+
+func runCtx(ctx context.Context, name string, args ...string) error {
+	cmd := exec.CommandContext(ctx, name, args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%s %v: %w: %s", name, args, err, strings.TrimSpace(string(out)))
@@ -176,8 +217,8 @@ func run(name string, args ...string) error {
 	return nil
 }
 
-func output(name string, args ...string) (string, error) {
-	cmd := exec.Command(name, args...)
+func outputCtx(ctx context.Context, name string, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, name, args...)
 	out, err := cmd.Output()
 	if err != nil {
 		var exitErr *exec.ExitError
