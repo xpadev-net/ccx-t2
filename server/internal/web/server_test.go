@@ -126,6 +126,94 @@ func TestProjectScopedTasksUseSelectedProjectLedger(t *testing.T) {
 	}
 }
 
+func TestProjectPostTaskUsesSelectedProjectRuntimeAndNotifiesLedger(t *testing.T) {
+	dir := t.TempDir()
+	cfg := testConfig()
+	cfg.Runtime = config.RuntimeConfig{TmuxSession: "ccx-test", WorktreeBase: filepath.Join(dir, "worktrees")}
+	cfg.Orchestrator.Timeout = 0
+	cfg.Projects = map[string]config.ProjectConfig{
+		"alpha": {
+			Slug:         "alpha",
+			RepoPath:     filepath.Join(dir, "alpha"),
+			LedgerPath:   filepath.Join(dir, "alpha", "tasks", "ledger.md"),
+			WorktreeBase: cfg.Runtime.WorktreeBase,
+			Orchestrator: cfg.Orchestrator,
+			GitHub:       cfg.GitHub,
+		},
+		"beta": {
+			Slug:         "beta",
+			RepoPath:     filepath.Join(dir, "beta"),
+			LedgerPath:   filepath.Join(dir, "beta", "tasks", "ledger.md"),
+			WorktreeBase: cfg.Runtime.WorktreeBase,
+			Orchestrator: cfg.Orchestrator,
+			GitHub:       cfg.GitHub,
+		},
+	}
+	manager, err := runtimepkg.NewManager(cfg, "http://127.0.0.1:8080")
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	alpha, err := manager.Project("alpha")
+	if err != nil {
+		t.Fatalf("Project alpha: %v", err)
+	}
+	beta, err := manager.Project("beta")
+	if err != nil {
+		t.Fatalf("Project beta: %v", err)
+	}
+	handler := New(Deps{Config: cfg, Manager: manager, AuthDisabled: true})
+	server := httptest.NewServer(handler)
+	defer server.Close()
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(server.URL, "/ws/projects/alpha/ledger"), nil)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer conn.Close()
+	var ready wsMessage
+	if err := conn.ReadJSON(&ready); err != nil {
+		t.Fatalf("ReadJSON ready: %v", err)
+	}
+	if ready.Type != "ready" {
+		t.Fatalf("ready message = %#v, want ready", ready)
+	}
+
+	resp := performJSONRequest(handler, http.MethodPost, "/api/projects/alpha/tasks", `{
+		"idempotency_key": "task-20260101-0001",
+		"title": "Project task"
+	}`)
+	if resp.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusAccepted, resp.Body.String())
+	}
+	var created taskCreateResponse
+	if err := json.Unmarshal(resp.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode created task: %v", err)
+	}
+	if created.Task.ID != "task-20260101-0001" || created.TriggerError == "" {
+		t.Fatalf("created = %#v, want project task with retryable trigger error", created)
+	}
+	alphaTasks, err := alpha.Ledger.Load()
+	if err != nil {
+		t.Fatalf("Load alpha: %v", err)
+	}
+	if len(alphaTasks) != 1 || alphaTasks[0].Title != "Project task" {
+		t.Fatalf("alpha tasks = %#v, want created project task", alphaTasks)
+	}
+	betaTasks, err := beta.Ledger.Load()
+	if err != nil {
+		t.Fatalf("Load beta: %v", err)
+	}
+	if len(betaTasks) != 0 {
+		t.Fatalf("beta tasks = %#v, want untouched beta ledger", betaTasks)
+	}
+	var changed wsMessage
+	if err := conn.ReadJSON(&changed); err != nil {
+		t.Fatalf("ReadJSON changed: %v", err)
+	}
+	if changed.Type != "ledger_changed" {
+		t.Fatalf("changed message = %#v, want ledger_changed", changed)
+	}
+}
+
 func TestPostTasksCreatesTaskAndTriggersOrchestrator(t *testing.T) {
 	l := newTestLedger(t)
 	trigger := &fakeTrigger{}
@@ -183,6 +271,32 @@ func TestPostTasksSupportsIdempotencyKey(t *testing.T) {
 	}
 	if tasks[0].ID != "task-20260101-0001" {
 		t.Fatalf("task ID = %q, want task-20260101-0001", tasks[0].ID)
+	}
+}
+
+func TestPostTasksDuplicateIdempotencyKeyDoesNotRetriggerAfterSuccess(t *testing.T) {
+	l := newTestLedger(t)
+	trigger := &fakeTrigger{}
+	server := New(Deps{Ledger: l, Trigger: trigger, AuthDisabled: true})
+	body := `{"idempotency_key":"task-20260101-0001","title":"New task"}`
+
+	first := performJSONRequest(server, http.MethodPost, "/api/tasks", body)
+	if first.Code != http.StatusCreated {
+		t.Fatalf("first status = %d, want %d; body=%s", first.Code, http.StatusCreated, first.Body.String())
+	}
+	second := performJSONRequest(server, http.MethodPost, "/api/tasks", body)
+	if second.Code != http.StatusOK {
+		t.Fatalf("second status = %d, want %d; body=%s", second.Code, http.StatusOK, second.Body.String())
+	}
+	if len(trigger.reasons) != 1 {
+		t.Fatalf("trigger count = %d, want 1", len(trigger.reasons))
+	}
+	var replay taskCreateResponse
+	if err := json.Unmarshal(second.Body.Bytes(), &replay); err != nil {
+		t.Fatalf("decode replay response: %v", err)
+	}
+	if replay.OrchestratorTriggered {
+		t.Fatal("replay OrchestratorTriggered = true, want false for already-triggered task")
 	}
 }
 

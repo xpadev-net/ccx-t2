@@ -41,6 +41,7 @@ type Server struct {
 	isWindowAlive   WindowAliveFunc
 	tmuxSession     string
 	projectScoped   bool
+	pendingTriggers *pendingTriggerSet
 	secret          string
 	authDisabled    bool
 	allowedOrigins  map[string]bool
@@ -93,6 +94,9 @@ func New(deps Deps) *Server {
 		harnesses:      harnessResponsesFromConfig(cfg),
 		mux:            http.NewServeMux(),
 		tmuxStreams:    &tmuxStreamRegistry{},
+		pendingTriggers: &pendingTriggerSet{
+			tasks: make(map[string]triggerState),
+		},
 	}
 	s.cleaner = workerCleanerFromDeps(s, deps)
 	if s.pipeOutput == nil {
@@ -489,21 +493,22 @@ func (s *Server) projectServer(slug string) (*Server, error) {
 		return nil, err
 	}
 	out := &Server{
-		cfg:            project.Config,
-		ledger:         project.Ledger,
-		manager:        s.manager,
-		registry:       project.Registry,
-		trigger:        project.Orchestrator,
-		pipeOutput:     s.pipeOutput,
-		sendKeys:       s.sendKeys,
-		isWindowAlive:  s.isWindowAlive,
-		tmuxSession:    project.Session,
-		projectScoped:  true,
-		secret:         s.secret,
-		authDisabled:   s.authDisabled,
-		allowedOrigins: s.allowedOrigins,
-		harnesses:      s.harnesses,
-		tmuxStreams:    s.tmuxStreams,
+		cfg:             project.Config,
+		ledger:          project.Ledger,
+		manager:         s.manager,
+		registry:        project.Registry,
+		trigger:         project.Orchestrator,
+		pipeOutput:      s.pipeOutput,
+		sendKeys:        s.sendKeys,
+		isWindowAlive:   s.isWindowAlive,
+		tmuxSession:     project.Session,
+		projectScoped:   true,
+		pendingTriggers: s.pendingTriggers,
+		secret:          s.secret,
+		authDisabled:    s.authDisabled,
+		allowedOrigins:  s.allowedOrigins,
+		harnesses:       s.harnesses,
+		tmuxStreams:     s.tmuxStreams,
 	}
 	out.cleaner = defaultWorkerCleaner{
 		deps: func() cleanupDependencies {
@@ -577,7 +582,7 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 		}
 		if ok {
 			w.Header().Set("Idempotency-Key", task.ID)
-			s.writeTaskCreateResponse(w, r, http.StatusOK, existing)
+			s.writeTaskCreateResponse(w, r, http.StatusOK, existing, triggerIfPending)
 			return
 		}
 	}
@@ -601,7 +606,7 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 				}
 				if ok {
 					w.Header().Set("Idempotency-Key", id)
-					s.writeTaskCreateResponse(w, r, http.StatusOK, existing)
+					s.writeTaskCreateResponse(w, r, http.StatusOK, existing, triggerIfPending)
 					return
 				}
 				writeError(w, http.StatusConflict, "task already exists outside active ledger")
@@ -622,21 +627,116 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 	task.ID = id
 	task.UpdatedAt = ""
 	w.Header().Set("Idempotency-Key", id)
-	s.writeTaskCreateResponse(w, r, http.StatusCreated, task)
+	s.writeTaskCreateResponse(w, r, http.StatusCreated, task, triggerAlways)
 }
 
-func (s *Server) writeTaskCreateResponse(w http.ResponseWriter, r *http.Request, status int, task ledger.Task) {
+type triggerPolicy int
+
+const (
+	triggerAlways triggerPolicy = iota
+	triggerIfPending
+)
+
+type pendingTriggerSet struct {
+	mu    sync.Mutex
+	tasks map[string]triggerState
+}
+
+type triggerState int
+
+const (
+	triggerStatePending triggerState = iota + 1
+	triggerStateInFlight
+)
+
+func (p *pendingTriggerSet) begin(key string) {
+	if p == nil || key == "" {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.tasks == nil {
+		p.tasks = make(map[string]triggerState)
+	}
+	p.tasks[key] = triggerStateInFlight
+}
+
+func (p *pendingTriggerSet) beginPending(key string) bool {
+	if p == nil || key == "" {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.tasks == nil {
+		p.tasks = make(map[string]triggerState)
+	}
+	if p.tasks[key] != triggerStatePending {
+		return false
+	}
+	p.tasks[key] = triggerStateInFlight
+	return true
+}
+
+func (p *pendingTriggerSet) mark(key string) {
+	if p == nil || key == "" {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.tasks == nil {
+		p.tasks = make(map[string]triggerState)
+	}
+	p.tasks[key] = triggerStatePending
+}
+
+func (p *pendingTriggerSet) clear(key string) {
+	if p == nil || key == "" {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.tasks, key)
+}
+
+func (s *Server) writeTaskCreateResponse(w http.ResponseWriter, r *http.Request, status int, task ledger.Task, policy triggerPolicy) {
 	resp := taskCreateResponse{Task: taskResponseFromLedger(task)}
 	if s.trigger != nil {
+		key := s.taskTriggerKey(task.ID)
+		switch policy {
+		case triggerAlways:
+			s.pendingTriggers.begin(key)
+		case triggerIfPending:
+			if !s.pendingTriggers.beginPending(key) {
+				writeJSON(w, status, resp)
+				return
+			}
+		}
+		if key == "" {
+			writeJSON(w, status, resp)
+			return
+		}
 		if err := s.trigger.Trigger(context.WithoutCancel(r.Context()), "task created: "+task.ID); err != nil {
 			log.Printf("web: orchestrator trigger after task create failed: %v", err)
+			s.pendingTriggers.mark(key)
 			resp.TriggerError = "orchestrator trigger failed"
 			status = http.StatusAccepted
 		} else {
+			s.pendingTriggers.clear(key)
 			resp.OrchestratorTriggered = true
 		}
 	}
 	writeJSON(w, status, resp)
+}
+
+func (s *Server) taskTriggerKey(taskID string) string {
+	if taskID == "" {
+		return ""
+	}
+	cfg, ok := s.configSnapshot()
+	if !ok || cfg.Project.Slug == "" {
+		return taskID
+	}
+	return cfg.Project.Slug + "\x00" + taskID
 }
 
 func (s *Server) updateTask(w http.ResponseWriter, r *http.Request, id string) {
