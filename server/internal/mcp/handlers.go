@@ -618,6 +618,9 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 			rollbackSpawnAfterLedgerUpdate(deps, workerID, branch, taskID, repoPath, worktreePath)
 			return nil, fmt.Errorf("send harness command: %w", err)
 		}
+		if err := waitForHarnessProcess(deps.Session, workerID, 2*time.Second); err != nil {
+			log.Printf("warn: wait for harness process: %v", err)
+		}
 
 		// Step 5: Send task prompt (best-effort — worker is already running).
 		// If this fails, include prompt_sent:false in the response so the orchestrator
@@ -1115,6 +1118,23 @@ func buildHarnessCommand(command string, mcpTokens []string) string {
 		parts = append(parts, shellQuoteArg(tok))
 	}
 	return strings.Join(parts, " ")
+}
+
+func waitForHarnessProcess(session, window string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		if time.Now().After(deadline) {
+			return fmt.Errorf("harness process did not start within %v", timeout)
+		}
+		idle, err := tmux.IsPaneIdle(session, window)
+		if err != nil {
+			return err
+		}
+		if !idle {
+			return nil
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 func buildWorkerPromptFromTask(task *ledger.Task, taskID, workerID, branch, worktreePath, validationCmd string) string {

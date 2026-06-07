@@ -497,7 +497,7 @@ func TestTriggerMidCallCancellationDrainsLaterQueuedWork(t *testing.T) {
 	deadline := time.After(time.Second)
 	for {
 		creates, commands, prompts := fake.counts()
-		if creates == 1 && commands == 1 && prompts == 1 {
+		if creates == 1 && commands == 1 && prompts == 1 && len(queuedSnapshot(o)) == 0 {
 			break
 		}
 		select {
