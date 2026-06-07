@@ -218,6 +218,13 @@ function App() {
       socket = new WebSocket(
         `${protocol}//${window.location.host}${workerLogPath(selectedProjectSlug, selectedWorker.worker_id)}${tokenQuery}`
       );
+      socket.addEventListener("open", () => {
+        attempts = 0;
+        if (retryTimer !== undefined) {
+          window.clearTimeout(retryTimer);
+          retryTimer = undefined;
+        }
+      });
       socket.addEventListener("message", (event) => {
         try {
           const msg = JSON.parse(String(event.data)) as { type?: string; data?: string };
@@ -253,10 +260,6 @@ function App() {
   }, [selectedProjectSlug, selectedWorker?.worker_id, token]);
 
   useEffect(() => {
-    if (!selectedProjectSlug) {
-      setOrchestratorLog([]);
-      return;
-    }
     setOrchestratorLog([]);
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
     const tokenQuery = token ? `?token=${encodeURIComponent(token)}` : "";
@@ -271,6 +274,13 @@ function App() {
       socket = new WebSocket(
         `${protocol}//${window.location.host}${orchestratorLogPath(selectedProjectSlug)}${tokenQuery}`
       );
+      socket.addEventListener("open", () => {
+        attempts = 0;
+        if (retryTimer !== undefined) {
+          window.clearTimeout(retryTimer);
+          retryTimer = undefined;
+        }
+      });
       socket.addEventListener("message", (event) => {
         try {
           const msg = JSON.parse(String(event.data)) as { type?: string; data?: string };

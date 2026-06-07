@@ -831,7 +831,8 @@ func (s *Server) sendWorkerFollowup(w http.ResponseWriter, r *http.Request, work
 		writeError(w, http.StatusNotFound, "worker tmux window not found")
 		return
 	}
-	if _, err := s.activeTaskForWorker(workerID); err != nil {
+	task, err = s.activeTaskForWorker(workerID)
+	if err != nil {
 		if errors.Is(err, errWorkerNotActive) {
 			writeError(w, http.StatusConflict, err.Error())
 			return
@@ -870,7 +871,7 @@ func (s *Server) activeTaskForWorker(workerID string) (ledger.Task, error) {
 }
 
 func normalizeFollowupMessage(input string) (string, error) {
-	message := strings.Trim(input, "\n")
+	message := strings.Trim(input, "\r\n")
 	if strings.TrimSpace(message) == "" {
 		return "", fmt.Errorf("message is required")
 	}
