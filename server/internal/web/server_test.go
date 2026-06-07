@@ -11,7 +11,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -979,14 +978,14 @@ func TestWorkerLogWebSocketStreamsLines(t *testing.T) {
 	lines <- "hello"
 	lines <- "world"
 	close(lines)
-	var cleanupCalled atomic.Bool
+	cleanupCalled := make(chan struct{})
 	server := httptest.NewServer(New(Deps{
 		Config: testConfig(),
 		PipeOutput: func(session, window string) (<-chan string, func(), error) {
 			if session != "ccx-t2" || window != "worker-task-001" {
 				t.Fatalf("pipe args = %q %q, want ccx-t2 worker-task-001", session, window)
 			}
-			return lines, func() { cleanupCalled.Store(true) }, nil
+			return lines, func() { close(cleanupCalled) }, nil
 		},
 		AuthDisabled: true,
 	}))
@@ -1013,7 +1012,9 @@ func TestWorkerLogWebSocketStreamsLines(t *testing.T) {
 	if closed.Type != "closed" {
 		t.Fatalf("closed message = %#v, want closed", closed)
 	}
-	if !cleanupCalled.Load() {
+	select {
+	case <-cleanupCalled:
+	case <-time.After(time.Second):
 		t.Fatal("cleanup was not called")
 	}
 }
