@@ -67,7 +67,7 @@ func DeleteTaskBranchIfSafeContext(ctx context.Context, repoPath, branch, taskID
 	if branch == "" {
 		return nil
 	}
-	if !BranchMatchesTaskID(branch, taskID) {
+	if !BranchMatchesTaskID(branch, taskID) && !isLegacyCleanupBranchName(branch, taskID) {
 		return fmt.Errorf("%w: %q is not scoped to task %q", ErrUnsafeBranchDelete, branch, taskID)
 	}
 	if exists, err := localBranchExists(ctx, repoPath, branch); err != nil {
@@ -269,6 +269,10 @@ func isAlphaNumeric(b byte) bool {
 	return (b >= 'a' && b <= 'z') ||
 		(b >= 'A' && b <= 'Z') ||
 		(b >= '0' && b <= '9')
+}
+
+func isLegacyCleanupBranchName(branch, taskID string) bool {
+	return strings.Contains(branch, "/") && !strings.Contains(branch, taskID)
 }
 
 func run(name string, args ...string) error {

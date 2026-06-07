@@ -89,6 +89,18 @@ func TestDeleteTaskBranchIfSafeSkipsNonTaskScopedBranch(t *testing.T) {
 	}
 }
 
+func TestDeleteTaskBranchIfSafeDeletesLegacyNamespacedLocalBranch(t *testing.T) {
+	repoPath := initRepo(t)
+	runGit(t, repoPath, "branch", "feature/my-work")
+
+	if err := DeleteTaskBranchIfSafe(repoPath, "feature/my-work", "task-001"); err != nil {
+		t.Fatalf("DeleteTaskBranchIfSafe(legacy branch): %v", err)
+	}
+	if branchExists(t, repoPath, "feature/my-work") {
+		t.Fatal("feature/my-work still exists, want deleted")
+	}
+}
+
 func TestDeleteTaskBranchIfSafeRequiresTaskIDBoundary(t *testing.T) {
 	repoPath := initRepo(t)
 	runGit(t, repoPath, "branch", "feature/task-0012")

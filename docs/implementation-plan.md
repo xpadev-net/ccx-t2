@@ -123,7 +123,7 @@ tmux ウィンドウの作成・削除・キー送信と git worktree の管理�
 **`internal/worktree/worktree.go`**
 - `Create(repoPath, branch, worktreePath string) error` — `git worktree add -b {branch}`（ブランチを新規作成）
 - `Remove(repoPath, worktreePath string) error` — `git -C {repoPath} worktree remove --force`
-- `DeleteTaskBranchIfSafe(repoPath, branch, taskID string) error` — task ID に明確に紐づく cleanup 用の local branch のみ削除し、default branch、別 worktree で checkout 中のブランチ、remote/upstream ref を持つブランチは削除しない
+- `DeleteTaskBranchIfSafe(repoPath, branch, taskID string) error` — task ID に明確に紐づく cleanup 用の local branch、または移行用の namespaced legacy branch のみ削除し、default branch、別 worktree で checkout 中のブランチ、remote/upstream ref を持つブランチは削除しない
 
 worktree path は `runtime.worktree_base/{project_slug}-{task_id}` を既定とする。
 
