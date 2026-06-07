@@ -792,6 +792,39 @@ func TestDefaultWorkerCleanerSkipsUnsafeDefaultBranchDelete(t *testing.T) {
 	}
 }
 
+func TestDefaultWorkerCleanerSkipsOriginUnavailableBranchDelete(t *testing.T) {
+	repoPath := initWebTestRepo(t)
+	runWebGit(t, repoPath, "remote", "add", "origin", filepath.Join(t.TempDir(), "missing.git"))
+	runWebGit(t, repoPath, "branch", "feature/task-001")
+	cfg := testConfig()
+	cfg.Project.RepoPath = repoPath
+	cfg.Project.WorktreeBase = filepath.Join(t.TempDir(), "worktrees")
+	registry := worker.NewRegistry()
+	registry.Register(worker.Info{WorkerID: "worker-task-001", TaskID: "task-001"})
+	cleaner := defaultWorkerCleaner{
+		deps: func() cleanupDependencies {
+			return cleanupDependencies{cfg: cfg}
+		},
+		registry: registry,
+	}
+
+	err := cleaner.CleanupWorker(context.Background(), ledger.Task{
+		ID:       "task-001",
+		Status:   "in_progress",
+		WorkerID: "worker-task-001",
+		Branch:   "feature/task-001",
+	})
+	if err != nil {
+		t.Fatalf("CleanupWorker: %v", err)
+	}
+	if !webTestBranchExists(t, repoPath, "feature/task-001") {
+		t.Fatal("feature/task-001 was deleted, want preserved when origin is unavailable")
+	}
+	if _, ok := registry.Get("worker-task-001"); ok {
+		t.Fatal("worker registry entry still exists, want cleanup to continue")
+	}
+}
+
 func TestPostTasksRejectsEmptyTask(t *testing.T) {
 	resp := performJSONRequest(New(Deps{Ledger: newTestLedger(t), AuthDisabled: true}), http.MethodPost, "/api/tasks", `{}`)
 	if resp.Code != http.StatusBadRequest {
