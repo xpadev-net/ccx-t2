@@ -261,6 +261,10 @@ function App() {
   }, [selectedProjectSlug, selectedWorker?.worker_id, token]);
 
   useEffect(() => {
+    if (!selectedProjectSlug) {
+      setOrchestratorLog([]);
+      return;
+    }
     setOrchestratorLog([]);
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
     const tokenQuery = token ? `?token=${encodeURIComponent(token)}` : "";

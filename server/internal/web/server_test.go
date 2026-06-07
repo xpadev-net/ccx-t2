@@ -1430,6 +1430,16 @@ func TestWorkerFollowupRejectsControlCharacters(t *testing.T) {
 	}
 }
 
+func TestNormalizeFollowupMessageAllowsCRLF(t *testing.T) {
+	got, err := normalizeFollowupMessage("line one\r\nline two\r\n")
+	if err != nil {
+		t.Fatalf("normalizeFollowupMessage: %v", err)
+	}
+	if got != "line one\nline two" {
+		t.Fatalf("message = %q, want normalized LF lines", got)
+	}
+}
+
 func TestLedgerWebSocketReceivesChangeNotification(t *testing.T) {
 	l := newTestLedger(t)
 	server := httptest.NewServer(New(Deps{Ledger: l, AuthDisabled: true}))

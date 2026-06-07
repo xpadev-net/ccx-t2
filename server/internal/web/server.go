@@ -871,7 +871,7 @@ func (s *Server) activeTaskForWorker(workerID string) (ledger.Task, error) {
 }
 
 func normalizeFollowupMessage(input string) (string, error) {
-	message := strings.Trim(input, "\r\n")
+	message := strings.NewReplacer("\r\n", "\n", "\r", "\n").Replace(strings.Trim(input, "\r\n"))
 	if strings.TrimSpace(message) == "" {
 		return "", fmt.Errorf("message is required")
 	}
