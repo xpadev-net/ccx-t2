@@ -205,6 +205,7 @@ function App() {
     }
     setSelectedWorkerID(selectedWorker.worker_id);
     setWorkerLog([]);
+    setFollowupMessage("");
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
     const tokenQuery = token ? `?token=${encodeURIComponent(token)}` : "";
     let attempts = 0;
