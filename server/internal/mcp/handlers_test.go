@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
@@ -154,7 +155,18 @@ func TestCleanupTaskBranchNormalizesRelativeRepoPath(t *testing.T) {
 	runGit(t, repoPath, "config", "user.name", "Test User")
 	runGit(t, repoPath, "commit", "--allow-empty", "-m", "init")
 	runGit(t, repoPath, "branch", "feature/task-001")
-	t.Chdir(dir)
+	previousWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatalf("Chdir: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(previousWD); err != nil {
+			t.Fatalf("restore working directory: %v", err)
+		}
+	})
 
 	cleanupTaskBranch(context.Background(), "repo", "feature/task-001", "task-001")
 
