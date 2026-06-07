@@ -221,28 +221,35 @@ func writeWSJSON(conn *websocket.Conn, msg wsMessage) error {
 }
 
 func (s *Server) reserveTmuxStream(key string) bool {
+	s.tmuxStreamsMu.Lock()
 	if s.tmuxStreams == nil {
+		s.tmuxStreams = &tmuxStreamRegistry{}
+	}
+	streams := s.tmuxStreams
+	s.tmuxStreamsMu.Unlock()
+
+	streams.mu.Lock()
+	defer streams.mu.Unlock()
+	if streams.streams == nil {
+		streams.streams = make(map[string]struct{})
+	}
+	if _, ok := streams.streams[key]; ok {
 		return false
 	}
-	s.tmuxStreams.mu.Lock()
-	defer s.tmuxStreams.mu.Unlock()
-	if s.tmuxStreams.streams == nil {
-		s.tmuxStreams.streams = make(map[string]struct{})
-	}
-	if _, ok := s.tmuxStreams.streams[key]; ok {
-		return false
-	}
-	s.tmuxStreams.streams[key] = struct{}{}
+	streams.streams[key] = struct{}{}
 	return true
 }
 
 func (s *Server) releaseTmuxStream(key string) {
-	if s.tmuxStreams == nil {
+	s.tmuxStreamsMu.Lock()
+	streams := s.tmuxStreams
+	s.tmuxStreamsMu.Unlock()
+	if streams == nil {
 		return
 	}
-	s.tmuxStreams.mu.Lock()
-	defer s.tmuxStreams.mu.Unlock()
-	delete(s.tmuxStreams.streams, key)
+	streams.mu.Lock()
+	defer streams.mu.Unlock()
+	delete(streams.streams, key)
 }
 
 func discardWSReads(ctx context.Context, conn *websocket.Conn, cancel context.CancelFunc) {

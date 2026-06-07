@@ -48,12 +48,13 @@ type Server struct {
 	mux             *http.ServeMux
 	ledgerClientsMu sync.Mutex
 	ledgerClients   map[*ledgerWSClient]struct{}
+	tmuxStreamsMu   sync.Mutex
 	tmuxStreams     *tmuxStreamRegistry
 }
 
 const deleteCleanupLease = 5 * time.Minute
 const maxFollowupMessageBytes = 20000
-const followupTmuxTimeout = 10 * time.Second
+const followupTmuxOperationTimeout = 5 * time.Second
 
 // Deps contains dependencies needed by the web API.
 type Deps struct {
@@ -820,9 +821,9 @@ func (s *Server) sendWorkerFollowup(w http.ResponseWriter, r *http.Request, work
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), followupTmuxTimeout)
-	defer cancel()
-	alive, err := s.isWindowAlive(ctx, session, workerID)
+	aliveCtx, cancel := context.WithTimeout(r.Context(), followupTmuxOperationTimeout)
+	alive, err := s.isWindowAlive(aliveCtx, session, workerID)
+	cancel()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "check worker tmux window")
 		return
@@ -840,7 +841,9 @@ func (s *Server) sendWorkerFollowup(w http.ResponseWriter, r *http.Request, work
 		writeError(w, http.StatusInternalServerError, "load worker task")
 		return
 	}
-	if err := s.sendKeys(ctx, session, workerID, message); err != nil {
+	sendCtx, cancel := context.WithTimeout(r.Context(), followupTmuxOperationTimeout)
+	defer cancel()
+	if err := s.sendKeys(sendCtx, session, workerID, message); err != nil {
 		writeError(w, http.StatusInternalServerError, "send worker followup")
 		return
 	}
