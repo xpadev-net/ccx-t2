@@ -292,7 +292,15 @@ func TestHandleNotifyCompletedRejectsMissingCompletionEvidence(t *testing.T) {
 			name: "multiline pr_url",
 			payload: map[string]any{
 				"pr_url":       "https://example.test/pr/1\nextra",
-				"merge_commit": "abc123",
+				"merge_commit": "abc123def456",
+			},
+			wantErr: "pr_url must be a single line",
+		},
+		{
+			name: "trailing newline pr_url",
+			payload: map[string]any{
+				"pr_url":       "https://example.test/pr/1\n",
+				"merge_commit": "abc123def456",
 			},
 			wantErr: "pr_url must be a single line",
 		},
@@ -310,7 +318,15 @@ func TestHandleNotifyCompletedRejectsMissingCompletionEvidence(t *testing.T) {
 				"pr_url":       "https://example.test/pr/1",
 				"merge_commit": "abc123 --> injected",
 			},
-			wantErr: "merge_commit must be a single-line value",
+			wantErr: "merge_commit must be a valid commit hash",
+		},
+		{
+			name: "short merge_commit",
+			payload: map[string]any{
+				"pr_url":       "https://example.test/pr/1",
+				"merge_commit": "abc123",
+			},
+			wantErr: "merge_commit must be a valid commit hash",
 		},
 	}
 	for _, tc := range cases {

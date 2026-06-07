@@ -288,7 +288,7 @@ body = json.dumps({
                 "task_id": task_id,
                 "worker_id": worker_id,
                 "pr_url": "https://example.test/pull/fake",
-                "merge_commit": "fake-merge"
+                "merge_commit": "abc123def456"
             }
         }
     }
@@ -428,7 +428,7 @@ func waitForCompletedTask(t *testing.T, l *ledger.Ledger, taskID, harnessName, s
 				if task.PrURL != "https://example.test/pull/fake" {
 					t.Fatalf("pr_url = %q, want fake PR URL", task.PrURL)
 				}
-				if !strings.Contains(task.Body, "<!-- merge_commit: fake-merge -->") {
+				if !strings.Contains(task.Body, "<!-- merge_commit: abc123def456 -->") {
 					t.Fatalf("task body missing merge commit comment: %q", task.Body)
 				}
 				return

@@ -851,7 +851,7 @@ func (l *Ledger) Archive(id, mergeCommit string) error {
 	}
 
 	slug := titleToSlug(t.Title)
-	t.Body = removeMergeCommitComment(t.Body)
+	t.Body = RemoveMergeCommitComment(t.Body)
 	if mergeCommit != "" {
 		t.MergeCommit = mergeCommit
 	}
@@ -1119,13 +1119,7 @@ func titleToSlug(title string) string {
 	return s
 }
 
-// removeMergeCommitComment strips "<!-- merge_commit: ... -->" from body text.
-func removeMergeCommitComment(body string) string {
+// RemoveMergeCommitComment strips "<!-- merge_commit: ... -->" from body text.
+func RemoveMergeCommitComment(body string) string {
 	return reMergeCommit.ReplaceAllString(body, "")
-}
-
-// RemoveMergeCommitComments strips internal merge_commit markers from task body
-// text before a fresh verified marker is appended.
-func RemoveMergeCommitComments(body string) string {
-	return removeMergeCommitComment(body)
 }
