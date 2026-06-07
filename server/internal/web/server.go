@@ -26,18 +26,23 @@ import (
 
 // Server serves the browser-facing REST API.
 type Server struct {
-	configMu       sync.RWMutex
-	cfg            *config.Config
-	configPath     string
-	ledger         *ledger.Ledger
-	registry       *worker.Registry
-	trigger        Triggerer
-	cleaner        WorkerCleaner
-	secret         string
-	authDisabled   bool
-	allowedOrigins map[string]bool
-	harnesses      []harnessResponse
-	mux            *http.ServeMux
+	configMu        sync.RWMutex
+	cfg             *config.Config
+	configPath      string
+	ledger          *ledger.Ledger
+	registry        *worker.Registry
+	trigger         Triggerer
+	cleaner         WorkerCleaner
+	pipeOutput      PipeOutputFunc
+	secret          string
+	authDisabled    bool
+	allowedOrigins  map[string]bool
+	harnesses       []harnessResponse
+	mux             *http.ServeMux
+	ledgerClientsMu sync.Mutex
+	ledgerClients   map[*ledgerWSClient]struct{}
+	workerStreamsMu sync.Mutex
+	workerStreams   map[string]struct{}
 }
 
 const deleteCleanupLease = 5 * time.Minute
@@ -50,6 +55,7 @@ type Deps struct {
 	Registry       *worker.Registry
 	Trigger        Triggerer
 	Cleaner        WorkerCleaner
+	PipeOutput     PipeOutputFunc
 	Session        string
 	Secret         string
 	AuthDisabled   bool
@@ -65,6 +71,7 @@ func New(deps Deps) *Server {
 		ledger:         deps.Ledger,
 		registry:       deps.Registry,
 		trigger:        deps.Trigger,
+		pipeOutput:     deps.PipeOutput,
 		secret:         deps.Secret,
 		authDisabled:   deps.AuthDisabled,
 		allowedOrigins: allowedOriginSet(deps.AllowedOrigins),
@@ -72,6 +79,12 @@ func New(deps Deps) *Server {
 		mux:            http.NewServeMux(),
 	}
 	s.cleaner = workerCleanerFromDeps(s, deps)
+	if s.pipeOutput == nil {
+		s.pipeOutput = tmux.PipeOutput
+	}
+	if s.ledger != nil {
+		s.ledger.SetOnChange(s.broadcastLedgerChange)
+	}
 	if s.secret == "" && !s.authDisabled {
 		log.Printf("web: bearer auth is not configured; set Secret or AuthDisabled=true explicitly")
 	}
@@ -194,6 +207,11 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request) bool {
 		return false
 	}
 	hdr := r.Header.Get("Authorization")
+	if hdr == "" && strings.HasPrefix(r.URL.Path, "/ws/") {
+		if token := r.URL.Query().Get("token"); token != "" {
+			hdr = "Bearer " + token
+		}
+	}
 	if !strings.HasPrefix(hdr, "Bearer ") {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return false
@@ -231,6 +249,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/workers", s.handleWorkers)
 	s.mux.HandleFunc("/api/harnesses", s.handleHarnesses)
 	s.mux.HandleFunc("/api/config", s.handleConfig)
+	s.mux.HandleFunc("/ws/worker/", s.handleWorkerLogWS)
+	s.mux.HandleFunc("/ws/ledger", s.handleLedgerWS)
 }
 
 func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request) {
