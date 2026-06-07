@@ -586,9 +586,6 @@ func TestDeleteStaleDeletingTaskRetriesCleanup(t *testing.T) {
 		WorkerID:  "worker-task-001",
 		UpdatedAt: time.Now().Add(-deleteCleanupLease - time.Minute).Format(time.RFC3339),
 	}
-	if err := l.Add(task); err != nil {
-		t.Fatalf("Add: %v", err)
-	}
 	if err := l.RestoreTaskSnapshot(task); err != nil {
 		t.Fatalf("RestoreTaskSnapshot: %v", err)
 	}
