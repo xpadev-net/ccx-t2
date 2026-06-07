@@ -110,6 +110,7 @@ button:disabled {
 .task-list,
 .task-editor,
 .task-create,
+.worker-dashboard,
 .auth-panel {
   border: 1px solid #d9e0e7;
   border-radius: 8px;
@@ -122,11 +123,13 @@ button:disabled {
 
 .task-editor,
 .task-create,
+.worker-dashboard,
 .auth-panel {
   padding: 18px;
 }
 
 .task-create,
+.worker-dashboard,
 .auth-panel {
   grid-column: 2;
 }
@@ -142,6 +145,7 @@ button:disabled {
 
 .task-editor .section-heading,
 .task-create .section-heading,
+.worker-dashboard .section-heading,
 .auth-panel .section-heading {
   margin: -18px -18px 18px;
 }
@@ -168,6 +172,83 @@ button:disabled {
 
 .task-row.selected {
   background: #edf7f6;
+}
+
+.worker-layout {
+  display: grid;
+  grid-template-columns: minmax(180px, 260px) minmax(0, 1fr);
+  gap: 14px;
+}
+
+.worker-list {
+  border: 1px solid #e5ebf0;
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.worker-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  width: 100%;
+  min-height: 44px;
+  border: 0;
+  border-bottom: 1px solid #eef2f5;
+  border-radius: 0;
+  background: #ffffff;
+  color: #1f2933;
+  padding: 9px 12px;
+  text-align: left;
+}
+
+.worker-row.selected {
+  background: #edf7f6;
+}
+
+.worker-row span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.log-panel {
+  min-width: 0;
+  border: 1px solid #1f2933;
+  border-radius: 6px;
+  background: #111827;
+  color: #d7e2ec;
+  overflow: hidden;
+}
+
+.log-heading {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  border-bottom: 1px solid #2a3442;
+  padding: 9px 12px;
+  color: #9fb0c3;
+  font-size: 12px;
+}
+
+.log-heading span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.log-panel pre {
+  min-height: 220px;
+  max-height: 360px;
+  margin: 0;
+  overflow: auto;
+  padding: 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .task-title {
@@ -259,11 +340,13 @@ textarea {
   }
 
   .task-create,
+  .worker-dashboard,
   .auth-panel {
     grid-column: auto;
   }
 
-  .form-grid {
+  .form-grid,
+  .worker-layout {
     grid-template-columns: 1fr;
   }
 }
