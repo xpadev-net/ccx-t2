@@ -110,6 +110,29 @@ func TestPostTasksSupportsIdempotencyKey(t *testing.T) {
 	}
 }
 
+func TestPostTasksDuplicateIdempotencyKeyReturnsExistingTask(t *testing.T) {
+	l := newTestLedger(t)
+	if err := l.Add(ledger.Task{ID: "client-task-1", Title: "Existing", Status: "unstarted"}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	resp := performJSONRequest(New(Deps{Ledger: l, AuthDisabled: true}), http.MethodPost, "/api/tasks", `{
+		"idempotency_key": "client-task-1",
+		"title": "Duplicate"
+	}`)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusOK, resp.Body.String())
+	}
+
+	var created taskCreateResponse
+	if err := json.Unmarshal(resp.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if created.Task.Title != "Existing" {
+		t.Fatalf("task title = %q, want Existing", created.Task.Title)
+	}
+}
+
 func TestPostTasksIdempotentRetryRetriesTrigger(t *testing.T) {
 	l := newTestLedger(t)
 	trigger := &fakeTrigger{err: errors.New("tmux unavailable")}
@@ -199,6 +222,21 @@ func TestPatchTaskNotFound(t *testing.T) {
 	resp := performJSONRequest(New(Deps{Ledger: newTestLedger(t), AuthDisabled: true}), http.MethodPatch, "/api/tasks/missing", `{"title":"Updated"}`)
 	if resp.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want %d", resp.Code, http.StatusNotFound)
+	}
+}
+
+func TestPatchRejectsIdempotencyKey(t *testing.T) {
+	l := newTestLedger(t)
+	if err := l.Add(ledger.Task{ID: "task-001", Title: "Old", Status: "unstarted"}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	resp := performJSONRequest(New(Deps{Ledger: l, AuthDisabled: true}), http.MethodPatch, "/api/tasks/task-001", `{
+		"idempotency_key": "client-task-1",
+		"title": "Updated"
+	}`)
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", resp.Code, http.StatusBadRequest)
 	}
 }
 

@@ -196,6 +196,18 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 	id := task.ID
 	if id != "" {
 		if err := s.ledger.Add(task); err != nil {
+			if strings.Contains(err.Error(), "task ID already exists") {
+				existing, ok, loadErr := s.loadTaskIfExists(id)
+				if loadErr != nil {
+					writeError(w, http.StatusInternalServerError, "load tasks")
+					return
+				}
+				if ok {
+					w.Header().Set("Idempotency-Key", id)
+					s.writeTaskCreateResponse(w, r, http.StatusOK, existing)
+					return
+				}
+			}
 			writeError(w, http.StatusInternalServerError, "create task")
 			return
 		}
@@ -241,21 +253,20 @@ func (s *Server) updateTask(w http.ResponseWriter, r *http.Request, id string) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if req.IdempotencyKey != nil {
+		writeError(w, http.StatusBadRequest, "idempotency_key is only supported for task creation")
+		return
+	}
 	fields := fieldsFromUpdateRequest(req)
 	if len(fields) == 0 {
 		writeError(w, http.StatusBadRequest, "no task fields provided")
 		return
 	}
-	exists, err := s.taskExists(id)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "load tasks")
-		return
-	}
-	if !exists {
-		writeError(w, http.StatusNotFound, "task not found")
-		return
-	}
 	if err := s.ledger.Update(id, fields); err != nil {
+		if strings.Contains(err.Error(), "task not found:") {
+			writeError(w, http.StatusNotFound, "task not found")
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "update task")
 		return
 	}
@@ -265,19 +276,6 @@ func (s *Server) updateTask(w http.ResponseWriter, r *http.Request, id string) {
 		return
 	}
 	writeJSON(w, http.StatusOK, taskResponseFromLedger(updated))
-}
-
-func (s *Server) taskExists(id string) (bool, error) {
-	tasks, err := s.ledger.Load()
-	if err != nil {
-		return false, err
-	}
-	for _, task := range tasks {
-		if task.ID == id {
-			return true, nil
-		}
-	}
-	return false, nil
 }
 
 func (s *Server) loadTask(id string) (ledger.Task, error) {
