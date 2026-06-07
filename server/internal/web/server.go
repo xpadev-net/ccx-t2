@@ -91,9 +91,9 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request) bool {
 }
 
 func (s *Server) setCORSHeaders(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Vary", "Origin")
 	if s.allowedOrigins[r.Header.Get("Origin")] {
 		w.Header().Set("Access-Control-Allow-Origin", r.Header.Get("Origin"))
-		w.Header().Set("Vary", "Origin")
 	}
 	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
@@ -262,9 +262,14 @@ type harnessConfigResponse struct {
 }
 
 type harnessResponse struct {
-	Name      string         `json:"name"`
-	Available bool           `json:"available"`
-	Usage     map[string]any `json:"usage"`
+	Name      string       `json:"name"`
+	Available bool         `json:"available"`
+	Usage     harnessUsage `json:"usage"`
+}
+
+type harnessUsage struct {
+	Command string `json:"command,omitempty"`
+	Note    string `json:"note,omitempty"`
 }
 
 func harnessResponsesFromConfig(cfg *config.Config) []harnessResponse {
@@ -283,9 +288,9 @@ func harnessResponsesFromConfig(cfg *config.Config) []harnessResponse {
 				available = err == nil
 			}
 		}
-		usage := map[string]any{"note": "unavailable"}
+		usage := harnessUsage{Note: "unavailable"}
 		if available {
-			usage = map[string]any{"command": command}
+			usage = harnessUsage{Command: command}
 		}
 		out = append(out, harnessResponse{
 			Name:      name,

@@ -92,9 +92,9 @@ func TestGetHarnessesUsesConfiguredWorkerHarnesses(t *testing.T) {
 	}
 
 	var harnesses []struct {
-		Name      string         `json:"name"`
-		Available bool           `json:"available"`
-		Usage     map[string]any `json:"usage"`
+		Name      string       `json:"name"`
+		Available bool         `json:"available"`
+		Usage     harnessUsage `json:"usage"`
 	}
 	if err := json.Unmarshal(resp.Body.Bytes(), &harnesses); err != nil {
 		t.Fatalf("decode harnesses: %v", err)
@@ -105,8 +105,8 @@ func TestGetHarnessesUsesConfiguredWorkerHarnesses(t *testing.T) {
 	if harnesses[0].Name != "worker" || !harnesses[0].Available {
 		t.Fatalf("harness = %#v, want available worker", harnesses[0])
 	}
-	if harnesses[0].Usage["command"] != exe {
-		t.Fatalf("usage command = %#v, want %s", harnesses[0].Usage["command"], exe)
+	if harnesses[0].Usage.Command != exe {
+		t.Fatalf("usage command = %q, want %s", harnesses[0].Usage.Command, exe)
 	}
 }
 
@@ -211,6 +211,9 @@ func TestCORSPreflight(t *testing.T) {
 	}
 	if got := resp.Header().Get("Access-Control-Allow-Origin"); got != "http://localhost:5173" {
 		t.Fatalf("Access-Control-Allow-Origin = %q, want http://localhost:5173", got)
+	}
+	if got := resp.Header().Get("Vary"); got != "Origin" {
+		t.Fatalf("Vary = %q, want Origin", got)
 	}
 	if got := resp.Header().Get("Access-Control-Allow-Methods"); got != "GET, OPTIONS" {
 		t.Fatalf("Access-Control-Allow-Methods = %q, want GET, OPTIONS", got)
