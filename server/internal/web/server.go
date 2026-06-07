@@ -122,9 +122,11 @@ func (c defaultWorkerCleaner) CleanupWorker(ctx context.Context, task ledger.Tas
 		}
 	}
 	if task.Branch != "" {
-		if err := exec.CommandContext(ctx, "git", "-C", c.cfg.Project.RepoPath, "branch", "-D", task.Branch).Run(); err != nil {
-			if !isMissingBranchError(err) {
-				errs = append(errs, fmt.Errorf("delete branch: %w", err))
+		out, err := exec.CommandContext(ctx, "git", "-C", c.cfg.Project.RepoPath, "branch", "-D", task.Branch).CombinedOutput()
+		if err != nil {
+			combinedErr := fmt.Errorf("git branch -D %s: %w: %s", task.Branch, err, strings.TrimSpace(string(out)))
+			if !isMissingBranchError(combinedErr) {
+				errs = append(errs, fmt.Errorf("delete branch: %w", combinedErr))
 			}
 		}
 	}

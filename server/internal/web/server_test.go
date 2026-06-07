@@ -684,6 +684,7 @@ func TestCleanupMissingResourceErrorsAreRetrySafe(t *testing.T) {
 		errors.New("tmux [kill-window -t session:worker-task-001]: exit status 1: can't find window: worker-task-001"),
 		errors.New("git [-C /repo worktree remove --force /tmp/missing]: exit status 128: '/tmp/missing' is not a working tree"),
 		errors.New("git [-C /repo branch -D feature/task-001]: exit status 1: error: branch 'feature/task-001' not found"),
+		errors.New("git branch -D feature/task-001: exit status 1: error: branch 'feature/task-001' not found"),
 	} {
 		if !(isMissingTmuxWindowError(err) || isMissingWorktreeError(err) || isMissingBranchError(err)) {
 			t.Fatalf("error %q was not classified as retry-safe missing resource", err)
