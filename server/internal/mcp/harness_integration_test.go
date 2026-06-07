@@ -114,6 +114,104 @@ func TestWorkerHarnessesCompleteThroughMCPIntegration(t *testing.T) {
 	}
 }
 
+func TestWorkerSplitRequestThroughMCPIntegration(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skipf("tmux not available: %v", err)
+	}
+	pythonPath, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skipf("python3 not available: %v", err)
+	}
+
+	repoPath := initTestRepo(t)
+	worktreeBase := filepath.Join(t.TempDir(), "worktrees")
+	if err := os.MkdirAll(worktreeBase, 0o755); err != nil {
+		t.Fatalf("mkdir worktree base: %v", err)
+	}
+	root := t.TempDir()
+	harnessName := "codex"
+	splitHarnessCommand := writeFakeSplitHarness(t, root, pythonPath)
+	completeHarnessCommand := writeFakeHarness(t, root, pythonPath)
+	ledgerDir := t.TempDir()
+	l := ledger.NewLedger(filepath.Join(ledgerDir, "ledger.md"), filepath.Join(ledgerDir, "archive"))
+	const taskID = "task_split"
+	if err := l.Add(ledger.Task{
+		ID:     taskID,
+		Title:  "Split with codex",
+		Status: "unstarted",
+		Body:   "exercise fake split request flow",
+		AllowedFiles: []string{
+			"server/internal/mcp",
+		},
+	}); err != nil {
+		t.Fatalf("Add task: %v", err)
+	}
+
+	cfg := integrationConfig(repoPath, worktreeBase, harnessName, splitHarnessCommand)
+	registry := worker.NewRegistry()
+	session := "ccx-t2-test-split-" + fmt.Sprint(time.Now().UnixNano())
+	branch := "phase6/split-request"
+	worktreePath := filepath.Join(worktreeBase, cfg.Project.Slug+"-"+taskID)
+	t.Cleanup(func() {
+		_ = exec.Command("git", "-C", repoPath, "worktree", "remove", "--force", worktreePath).Run()
+		_ = exec.Command("git", "-C", repoPath, "branch", "-D", branch).Run()
+	})
+	if err := tmux.EnsureSession(session); err != nil {
+		t.Fatalf("ensure tmux session: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = exec.Command("tmux", "kill-session", "-t", session).Run()
+	})
+
+	deps := &Deps{
+		Ledger:   l,
+		Registry: registry,
+		Config:   cfg,
+		Session:  session,
+	}
+	workerServer := NewServer("worker", cfg.Server.McpSecret)
+	RegisterWorkerTools(workerServer, deps)
+	mux := http.NewServeMux()
+	mux.Handle("/mcp/worker", workerServer)
+	httpServer := httptest.NewServer(mux)
+	t.Cleanup(httpServer.Close)
+	deps.BaseURL = httpServer.URL
+
+	if _, err := handleSpawnWorker(deps)(context.Background(), map[string]any{
+		"task_id":       taskID,
+		"branch":        branch,
+		"allowed_files": []any{"server/internal/mcp"},
+		"harness":       harnessName,
+	}); err != nil {
+		t.Fatalf("spawn_worker: %v", err)
+	}
+
+	childID, childAllowed, childForbidden := waitForSplitTask(t, l, taskID, session, "worker-"+taskID)
+	waitForWorkerCleanup(t, registry, session, "worker-"+taskID, worktreePath)
+
+	cfg.Harnesses[harnessName] = config.HarnessConfig{
+		Command: completeHarnessCommand,
+		McpArgs: "--mcp-url {url} --mcp-secret {secret}",
+	}
+	childBranch := "phase6/split-child"
+	childWorktreePath := filepath.Join(worktreeBase, cfg.Project.Slug+"-"+childID)
+	t.Cleanup(func() {
+		_ = exec.Command("git", "-C", repoPath, "worktree", "remove", "--force", childWorktreePath).Run()
+		_ = exec.Command("git", "-C", repoPath, "branch", "-D", childBranch).Run()
+	})
+	if _, err := handleSpawnWorker(deps)(context.Background(), map[string]any{
+		"task_id":         childID,
+		"branch":          childBranch,
+		"allowed_files":   stringsToAny(childAllowed),
+		"forbidden_files": stringsToAny(childForbidden),
+		"harness":         harnessName,
+	}); err != nil {
+		t.Fatalf("spawn child worker: %v", err)
+	}
+	waitForCompletedTask(t, l, childID, harnessName, session, "worker-"+childID)
+	waitForWorkerCleanup(t, registry, session, "worker-"+childID, childWorktreePath)
+}
+
 func integrationConfig(repoPath, worktreeBase, harnessName, harnessCommand string) *config.Config {
 	return &config.Config{
 		Project: config.ProjectConfig{
@@ -213,6 +311,97 @@ if "error" in payload:
 	return path
 }
 
+func writeFakeSplitHarness(t *testing.T, dir, pythonPath string) string {
+	t.Helper()
+	path := filepath.Join(dir, "fake-split-harness")
+	script := "#!" + pythonPath + `
+import argparse
+import json
+import re
+import select
+import sys
+import time
+import urllib.request
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--mcp-url", required=True)
+parser.add_argument("--mcp-secret", required=True)
+args = parser.parse_args()
+
+prompt = ""
+deadline = time.monotonic() + ` + fmt.Sprintf("%.1f", fakeHarnessWait.Seconds()) + `
+while time.monotonic() < deadline:
+    ready, _, _ = select.select([sys.stdin], [], [], 0.2)
+    if not ready:
+        continue
+    line = sys.stdin.readline()
+    if not line:
+        break
+    prompt += line
+    if "If you need to split: call notify" in line:
+        break
+
+task_match = re.search(r"^Task ID: (.+)$", prompt, re.MULTILINE)
+worker_match = re.search(r"^Worker ID: (.+)$", prompt, re.MULTILINE)
+if task_match is None or worker_match is None:
+    print("fake split harness could not parse worker prompt", file=sys.stderr)
+    print(prompt, file=sys.stderr)
+    raise SystemExit(2)
+task_id = task_match.group(1)
+worker_id = worker_match.group(1)
+body = json.dumps({
+    "jsonrpc": "2.0",
+    "id": "fake-split-harness",
+    "method": "tools/call",
+    "params": {
+        "name": "notify",
+        "arguments": {
+            "type": "split_request",
+            "payload": {
+                "task_id": task_id,
+                "worker_id": worker_id,
+                "reason": "needs smaller slices",
+                "proposed_slices": [
+                    {
+                        "title": "Child API",
+                        "description": "Implement API slice",
+                        "allowed_files": ["server/internal/mcp"],
+                        "forbidden_files": ["server/internal/mcp/legacy.go"]
+                    },
+                    {
+                        "title": "Child UI",
+                        "description": "Implement UI slice",
+                        "allowed_files": ["web/src"],
+                        "forbidden_files": []
+                    }
+                ]
+            }
+        }
+    }
+}).encode()
+request = urllib.request.Request(
+    args.mcp_url,
+    data=body,
+    headers={
+        "Authorization": "Bearer " + args.mcp_secret,
+        "Content-Type": "application/json",
+    },
+)
+try:
+    with urllib.request.urlopen(request, timeout=5) as response:
+        payload = json.loads(response.read().decode())
+except Exception as exc:
+    print("fake split harness notify request failed:", exc, file=sys.stderr)
+    raise SystemExit(3)
+if "error" in payload:
+    raise SystemExit(payload["error"])
+`
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake split harness: %v", err)
+	}
+	return path
+}
+
 func waitForCompletedTask(t *testing.T, l *ledger.Ledger, taskID, harnessName, session, workerID string) {
 	t.Helper()
 	deadline := time.Now().Add(fakeHarnessWait)
@@ -244,6 +433,70 @@ func waitForCompletedTask(t *testing.T, l *ledger.Ledger, taskID, harnessName, s
 	}
 	t.Fatalf("task %s did not complete through %s harness, last state: %#v\ntmux pane:\n%s",
 		taskID, harnessName, last, capturePane(session, workerID))
+}
+
+func waitForSplitTask(t *testing.T, l *ledger.Ledger, taskID, session, workerID string) (string, []string, []string) {
+	t.Helper()
+	deadline := time.Now().Add(fakeHarnessWait)
+	var tasks []ledger.Task
+	for time.Now().Before(deadline) {
+		var err error
+		tasks, err = l.Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		parentIndex := -1
+		for i, task := range tasks {
+			if task.ID == taskID {
+				parentIndex = i
+				break
+			}
+		}
+		if parentIndex >= 0 && tasks[parentIndex].Status == "split" && len(tasks) == 3 {
+			parent := tasks[parentIndex]
+			if parent.WorkerID != "" || parent.Branch != "" || parent.Harness != "" {
+				t.Fatalf("split parent retained runtime fields: %#v", parent)
+			}
+			if parent.Reason != "needs smaller slices" {
+				t.Fatalf("split reason = %q, want needs smaller slices", parent.Reason)
+			}
+			childID, childAllowed, childForbidden := assertChildTask(t, tasks, "Child API", "Implement API slice", []string{"server/internal/mcp"}, []string{"server/internal/mcp/legacy.go"})
+			assertChildTask(t, tasks, "Child UI", "Implement UI slice", []string{"web/src"}, nil)
+			return childID, childAllowed, childForbidden
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("task %s did not split, tasks=%#v\ntmux pane:\n%s", taskID, tasks, capturePane(session, workerID))
+	return "", nil, nil
+}
+
+func assertChildTask(t *testing.T, tasks []ledger.Task, title, body string, allowed, forbidden []string) (string, []string, []string) {
+	t.Helper()
+	for _, task := range tasks {
+		if task.Title != title {
+			continue
+		}
+		if task.Status != "unstarted" || task.Body != body {
+			t.Fatalf("child %q = %#v, want unstarted body %q", title, task, body)
+		}
+		if strings.Join(task.AllowedFiles, "\x00") != strings.Join(allowed, "\x00") {
+			t.Fatalf("child %q allowed = %#v, want %#v", title, task.AllowedFiles, allowed)
+		}
+		if strings.Join(task.ForbiddenFiles, "\x00") != strings.Join(forbidden, "\x00") {
+			t.Fatalf("child %q forbidden = %#v, want %#v", title, task.ForbiddenFiles, forbidden)
+		}
+		return task.ID, append([]string(nil), task.AllowedFiles...), append([]string(nil), task.ForbiddenFiles...)
+	}
+	t.Fatalf("child %q not found in %#v", title, tasks)
+	return "", nil, nil
+}
+
+func stringsToAny(values []string) []any {
+	out := make([]any, len(values))
+	for i, value := range values {
+		out[i] = value
+	}
+	return out
 }
 
 func waitForWorkerCleanup(t *testing.T, registry *worker.Registry, session, workerID, worktreePath string) {
