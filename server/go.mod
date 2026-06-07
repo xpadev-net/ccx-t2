@@ -4,6 +4,7 @@ go 1.23
 
 require (
 	github.com/google/go-github/v60 v60.0.0
+	github.com/gorilla/websocket v1.5.3
 	github.com/kballard/go-shellquote v0.0.0-20180428030007-95032a82bc51
 	gopkg.in/yaml.v3 v3.0.1
 )

@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/xpadev/ccx-t2/internal/config"
 	"github.com/xpadev/ccx-t2/internal/ledger"
 	"github.com/xpadev/ccx-t2/internal/worker"
@@ -972,6 +973,147 @@ func TestPatchConfigDoesNotMutateCallerConfigPointer(t *testing.T) {
 	}
 }
 
+func TestWorkerLogWebSocketStreamsLines(t *testing.T) {
+	lines := make(chan string, 2)
+	lines <- "hello"
+	lines <- "world"
+	close(lines)
+	cleanupCalled := false
+	server := httptest.NewServer(New(Deps{
+		Config: testConfig(),
+		PipeOutput: func(session, window string) (<-chan string, func(), error) {
+			if session != "ccx-t2" || window != "worker-task-001" {
+				t.Fatalf("pipe args = %q %q, want ccx-t2 worker-task-001", session, window)
+			}
+			return lines, func() { cleanupCalled = true }, nil
+		},
+		AuthDisabled: true,
+	}))
+	defer server.Close()
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(server.URL, "/ws/worker/worker-task-001"), nil)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer conn.Close()
+
+	for _, want := range []string{"hello", "world"} {
+		var msg wsMessage
+		if err := conn.ReadJSON(&msg); err != nil {
+			t.Fatalf("ReadJSON: %v", err)
+		}
+		if msg.Type != "line" || msg.Data != want {
+			t.Fatalf("message = %#v, want line %q", msg, want)
+		}
+	}
+	var closed wsMessage
+	if err := conn.ReadJSON(&closed); err != nil {
+		t.Fatalf("ReadJSON closed: %v", err)
+	}
+	if closed.Type != "closed" {
+		t.Fatalf("closed message = %#v, want closed", closed)
+	}
+	if !cleanupCalled {
+		t.Fatal("cleanup was not called")
+	}
+}
+
+func TestWorkerLogWebSocketAcceptsTokenQueryAuth(t *testing.T) {
+	lines := make(chan string)
+	close(lines)
+	server := httptest.NewServer(New(Deps{
+		Config: testConfig(),
+		PipeOutput: func(session, window string) (<-chan string, func(), error) {
+			return lines, func() {}, nil
+		},
+		Secret: "web-secret",
+	}))
+	defer server.Close()
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(server.URL, "/ws/worker/worker-task-001?token=web-secret"), nil)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer conn.Close()
+	var msg wsMessage
+	if err := conn.ReadJSON(&msg); err != nil {
+		t.Fatalf("ReadJSON: %v", err)
+	}
+	if msg.Type != "closed" {
+		t.Fatalf("message = %#v, want closed", msg)
+	}
+}
+
+func TestWebSocketRejectsDisallowedOrigin(t *testing.T) {
+	server := httptest.NewServer(New(Deps{
+		Config:         testConfig(),
+		AuthDisabled:   true,
+		AllowedOrigins: []string{"http://allowed.example"},
+	}))
+	defer server.Close()
+	header := http.Header{"Origin": []string{"http://evil.example"}}
+
+	_, resp, err := websocket.DefaultDialer.Dial(wsURL(server.URL, "/ws/ledger"), header)
+	if err == nil {
+		t.Fatal("Dial error = nil, want origin rejection")
+	}
+	if resp == nil || resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("response = %#v, want 403", resp)
+	}
+}
+
+func TestWorkerLogWebSocketRejectsSecondSubscriber(t *testing.T) {
+	lines := make(chan string)
+	server := httptest.NewServer(New(Deps{
+		Config: testConfig(),
+		PipeOutput: func(session, window string) (<-chan string, func(), error) {
+			return lines, func() {}, nil
+		},
+		AuthDisabled: true,
+	}))
+	defer server.Close()
+	first, _, err := websocket.DefaultDialer.Dial(wsURL(server.URL, "/ws/worker/worker-task-001"), nil)
+	if err != nil {
+		t.Fatalf("first Dial: %v", err)
+	}
+	defer first.Close()
+
+	_, resp, err := websocket.DefaultDialer.Dial(wsURL(server.URL, "/ws/worker/worker-task-001"), nil)
+	if err == nil {
+		t.Fatal("second Dial error = nil, want conflict")
+	}
+	if resp == nil || resp.StatusCode != http.StatusConflict {
+		t.Fatalf("response = %#v, want 409", resp)
+	}
+	close(lines)
+}
+
+func TestLedgerWebSocketReceivesChangeNotification(t *testing.T) {
+	l := newTestLedger(t)
+	server := httptest.NewServer(New(Deps{Ledger: l, AuthDisabled: true}))
+	defer server.Close()
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(server.URL, "/ws/ledger"), nil)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer conn.Close()
+	var ready wsMessage
+	if err := conn.ReadJSON(&ready); err != nil {
+		t.Fatalf("ReadJSON ready: %v", err)
+	}
+	if ready.Type != "ready" {
+		t.Fatalf("ready message = %#v, want ready", ready)
+	}
+	if err := l.Add(ledger.Task{ID: "task-001", Title: "Changed", Status: "unstarted"}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	var changed wsMessage
+	if err := conn.ReadJSON(&changed); err != nil {
+		t.Fatalf("ReadJSON changed: %v", err)
+	}
+	if changed.Type != "ledger_changed" {
+		t.Fatalf("changed message = %#v, want ledger_changed", changed)
+	}
+}
+
 func TestMethodNotAllowed(t *testing.T) {
 	resp := performRequest(New(Deps{AuthDisabled: true}), http.MethodPut, "/api/tasks")
 	if resp.Code != http.StatusMethodNotAllowed {
@@ -980,6 +1122,10 @@ func TestMethodNotAllowed(t *testing.T) {
 	if allow := resp.Header().Get("Allow"); allow != "GET, POST" {
 		t.Fatalf("Allow = %q, want GET, POST", allow)
 	}
+}
+
+func wsURL(baseURL, path string) string {
+	return "ws" + strings.TrimPrefix(baseURL, "http") + path
 }
 
 func TestBearerAuth(t *testing.T) {
