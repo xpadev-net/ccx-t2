@@ -336,6 +336,132 @@ func TestPatchRejectsEmptyStatus(t *testing.T) {
 	}
 }
 
+func TestDeleteTaskRemovesTask(t *testing.T) {
+	l := newTestLedger(t)
+	if err := l.Add(ledger.Task{ID: "task-001", Title: "Delete me", Status: "unstarted", Body: "body"}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	resp := performRequest(New(Deps{Ledger: l, AuthDisabled: true}), http.MethodDelete, "/api/tasks/task-001")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	var deleted taskDeleteResponse
+	if err := json.Unmarshal(resp.Body.Bytes(), &deleted); err != nil {
+		t.Fatalf("decode delete response: %v", err)
+	}
+	if deleted.Deleted.ID != "task-001" || deleted.Deleted.Body != "body" {
+		t.Fatalf("deleted = %#v, want task-001 with body", deleted.Deleted)
+	}
+	tasks, err := l.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(tasks) != 0 {
+		t.Fatalf("len(tasks) = %d, want 0", len(tasks))
+	}
+}
+
+func TestDeleteTaskNotFound(t *testing.T) {
+	resp := performRequest(New(Deps{Ledger: newTestLedger(t), AuthDisabled: true}), http.MethodDelete, "/api/tasks/missing")
+	if resp.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", resp.Code, http.StatusNotFound)
+	}
+}
+
+func TestDeleteInProgressTaskCleansWorker(t *testing.T) {
+	l := newTestLedger(t)
+	if err := l.Add(ledger.Task{
+		ID:       "task-001",
+		Title:    "Delete worker",
+		Status:   "in_progress",
+		WorkerID: "worker-task-001",
+		Branch:   "feature/task-001",
+	}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	cleaner := &fakeCleaner{}
+
+	resp := performRequest(New(Deps{Ledger: l, Cleaner: cleaner, AuthDisabled: true}), http.MethodDelete, "/api/tasks/task-001")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	if len(cleaner.tasks) != 1 || cleaner.tasks[0].WorkerID != "worker-task-001" {
+		t.Fatalf("cleaner tasks = %#v, want worker-task-001", cleaner.tasks)
+	}
+	var deleted taskDeleteResponse
+	if err := json.Unmarshal(resp.Body.Bytes(), &deleted); err != nil {
+		t.Fatalf("decode delete response: %v", err)
+	}
+	if !deleted.WorkerCleaned {
+		t.Fatal("WorkerCleaned = false, want true")
+	}
+}
+
+func TestDeleteInProgressTaskReportsCleanupFailure(t *testing.T) {
+	l := newTestLedger(t)
+	if err := l.Add(ledger.Task{ID: "task-001", Title: "Delete worker", Status: "in_progress", WorkerID: "worker-task-001"}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	resp := performRequest(New(Deps{
+		Ledger:       l,
+		Cleaner:      &fakeCleaner{err: errors.New("tmux unavailable")},
+		AuthDisabled: true,
+	}), http.MethodDelete, "/api/tasks/task-001")
+	if resp.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusAccepted, resp.Body.String())
+	}
+	var deleted taskDeleteResponse
+	if err := json.Unmarshal(resp.Body.Bytes(), &deleted); err != nil {
+		t.Fatalf("decode delete response: %v", err)
+	}
+	if deleted.CleanupError == "" {
+		t.Fatal("CleanupError is empty, want cleanup failure marker")
+	}
+	tasks, err := l.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(tasks) != 1 || tasks[0].ID != "task-001" {
+		t.Fatalf("tasks after cleanup failure = %#v, want task-001 retained", tasks)
+	}
+}
+
+func TestDeleteBlockedTaskCleansWorker(t *testing.T) {
+	l := newTestLedger(t)
+	if err := l.Add(ledger.Task{
+		ID:       "task-001",
+		Title:    "Delete blocked worker",
+		Status:   "blocked",
+		WorkerID: "worker-task-001",
+		Branch:   "feature/task-001",
+	}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	cleaner := &fakeCleaner{}
+
+	resp := performRequest(New(Deps{Ledger: l, Cleaner: cleaner, AuthDisabled: true}), http.MethodDelete, "/api/tasks/task-001")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	if len(cleaner.tasks) != 1 || cleaner.tasks[0].Status != "blocked" {
+		t.Fatalf("cleaner tasks = %#v, want blocked task", cleaner.tasks)
+	}
+}
+
+func TestCleanupMissingResourceErrorsAreRetrySafe(t *testing.T) {
+	for _, err := range []error{
+		errors.New("tmux [kill-window -t session:worker-task-001]: exit status 1: can't find window: worker-task-001"),
+		errors.New("git [-C /repo worktree remove --force /tmp/missing]: exit status 128: '/tmp/missing' is not a working tree"),
+		errors.New("git [-C /repo branch -D feature/task-001]: exit status 1: error: branch 'feature/task-001' not found"),
+	} {
+		if !(isMissingTmuxWindowError(err) || isMissingWorktreeError(err) || isMissingBranchError(err)) {
+			t.Fatalf("error %q was not classified as retry-safe missing resource", err)
+		}
+	}
+}
+
 func TestPostTasksRejectsEmptyTask(t *testing.T) {
 	resp := performJSONRequest(New(Deps{Ledger: newTestLedger(t), AuthDisabled: true}), http.MethodPost, "/api/tasks", `{}`)
 	if resp.Code != http.StatusBadRequest {
@@ -519,8 +645,8 @@ func TestCORSPreflight(t *testing.T) {
 	if got := resp.Header().Get("Vary"); got != "Origin" {
 		t.Fatalf("Vary = %q, want Origin", got)
 	}
-	if got := resp.Header().Get("Access-Control-Allow-Methods"); got != "GET, POST, PATCH, OPTIONS" {
-		t.Fatalf("Access-Control-Allow-Methods = %q, want GET, POST, PATCH, OPTIONS", got)
+	if got := resp.Header().Get("Access-Control-Allow-Methods"); got != "GET, POST, PATCH, DELETE, OPTIONS" {
+		t.Fatalf("Access-Control-Allow-Methods = %q, want GET, POST, PATCH, DELETE, OPTIONS", got)
 	}
 	if got := resp.Header().Get("Access-Control-Allow-Headers"); !strings.Contains(got, "Authorization") {
 		t.Fatalf("Access-Control-Allow-Headers = %q, want Authorization", got)
@@ -601,5 +727,15 @@ type fakeTrigger struct {
 
 func (f *fakeTrigger) Trigger(ctx context.Context, reason string) error {
 	f.reasons = append(f.reasons, reason)
+	return f.err
+}
+
+type fakeCleaner struct {
+	tasks []ledger.Task
+	err   error
+}
+
+func (f *fakeCleaner) CleanupWorker(ctx context.Context, task ledger.Task) error {
+	f.tasks = append(f.tasks, task)
 	return f.err
 }

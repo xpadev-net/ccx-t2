@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -17,7 +18,9 @@ import (
 
 	"github.com/xpadev/ccx-t2/internal/config"
 	"github.com/xpadev/ccx-t2/internal/ledger"
+	"github.com/xpadev/ccx-t2/internal/tmux"
 	"github.com/xpadev/ccx-t2/internal/worker"
+	"github.com/xpadev/ccx-t2/internal/worktree"
 )
 
 // Server serves the browser-facing REST API.
@@ -26,6 +29,7 @@ type Server struct {
 	ledger         *ledger.Ledger
 	registry       *worker.Registry
 	trigger        Triggerer
+	cleaner        WorkerCleaner
 	secret         string
 	authDisabled   bool
 	allowedOrigins map[string]bool
@@ -39,6 +43,8 @@ type Deps struct {
 	Ledger         *ledger.Ledger
 	Registry       *worker.Registry
 	Trigger        Triggerer
+	Cleaner        WorkerCleaner
+	Session        string
 	Secret         string
 	AuthDisabled   bool
 	AllowedOrigins []string
@@ -51,6 +57,7 @@ func New(deps Deps) *Server {
 		ledger:         deps.Ledger,
 		registry:       deps.Registry,
 		trigger:        deps.Trigger,
+		cleaner:        workerCleanerFromDeps(deps),
 		secret:         deps.Secret,
 		authDisabled:   deps.AuthDisabled,
 		allowedOrigins: allowedOriginSet(deps.AllowedOrigins),
@@ -67,6 +74,83 @@ func New(deps Deps) *Server {
 // Triggerer starts or wakes the orchestrator after a web mutation.
 type Triggerer interface {
 	Trigger(ctx context.Context, reason string) error
+}
+
+// WorkerCleaner removes runtime resources for a task-owned worker.
+type WorkerCleaner interface {
+	CleanupWorker(ctx context.Context, task ledger.Task) error
+}
+
+type defaultWorkerCleaner struct {
+	cfg      *config.Config
+	registry *worker.Registry
+	session  string
+}
+
+func workerCleanerFromDeps(deps Deps) WorkerCleaner {
+	if deps.Cleaner != nil {
+		return deps.Cleaner
+	}
+	return defaultWorkerCleaner{cfg: deps.Config, registry: deps.Registry, session: deps.Session}
+}
+
+func (c defaultWorkerCleaner) CleanupWorker(ctx context.Context, task ledger.Task) error {
+	if c.cfg == nil {
+		return fmt.Errorf("config is not configured")
+	}
+	workerID := task.WorkerID
+	if workerID == "" {
+		workerID = "worker-" + task.ID
+	}
+	var errs []error
+	if workerID != "" && c.session == "" {
+		errs = append(errs, fmt.Errorf("tmux session is not configured"))
+	}
+	if workerID != "" && c.session != "" {
+		if err := tmux.KillWindowContext(ctx, c.session, workerID); err != nil {
+			if !isMissingTmuxWindowError(err) {
+				errs = append(errs, fmt.Errorf("kill worker window: %w", err))
+			}
+		}
+	}
+	worktreePath := filepath.Join(c.cfg.Project.WorktreeBase, c.cfg.Project.Slug+"-"+task.ID)
+	if err := worktree.Remove(c.cfg.Project.RepoPath, worktreePath); err != nil {
+		if !isMissingWorktreeError(err) {
+			errs = append(errs, fmt.Errorf("remove worktree: %w", err))
+		}
+	}
+	if task.Branch != "" {
+		if err := exec.CommandContext(ctx, "git", "-C", c.cfg.Project.RepoPath, "branch", "-D", task.Branch).Run(); err != nil {
+			if !isMissingBranchError(err) {
+				errs = append(errs, fmt.Errorf("delete branch: %w", err))
+			}
+		}
+	}
+	if c.registry != nil && workerID != "" {
+		c.registry.Remove(workerID)
+	}
+	return errors.Join(errs...)
+}
+
+func isMissingTmuxWindowError(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "can't find window") ||
+		strings.Contains(msg, "can't find pane") ||
+		strings.Contains(msg, "can't find session") ||
+		strings.Contains(msg, "no such session")
+}
+
+func isMissingWorktreeError(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "is not a working tree") ||
+		strings.Contains(msg, "not a working tree") ||
+		strings.Contains(msg, "No such file or directory") ||
+		strings.Contains(msg, "no such file or directory")
+}
+
+func isMissingBranchError(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "branch") && strings.Contains(msg, "not found")
 }
 
 // ServeHTTP implements http.Handler.
@@ -108,7 +192,7 @@ func (s *Server) setCORSHeaders(w http.ResponseWriter, r *http.Request) {
 	if s.allowedOrigins[r.Header.Get("Origin")] {
 		w.Header().Set("Access-Control-Allow-Origin", r.Header.Get("Origin"))
 	}
-	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
 }
 
@@ -150,8 +234,10 @@ func (s *Server) handleTaskByID(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodPatch:
 		s.updateTask(w, r, id)
+	case http.MethodDelete:
+		s.deleteTask(w, r, id)
 	default:
-		methodNotAllowed(w, http.MethodPatch)
+		methodNotAllowed(w, http.MethodPatch, http.MethodDelete)
 	}
 }
 
@@ -299,6 +385,48 @@ func (s *Server) updateTask(w http.ResponseWriter, r *http.Request, id string) {
 	writeJSON(w, http.StatusOK, taskResponseFromLedger(updated))
 }
 
+func (s *Server) deleteTask(w http.ResponseWriter, r *http.Request, id string) {
+	if s.ledger == nil {
+		writeError(w, http.StatusInternalServerError, "ledger is not configured")
+		return
+	}
+	task, ok, err := s.loadTaskIfExists(id)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "load task")
+		return
+	}
+	if !ok {
+		writeError(w, http.StatusNotFound, "task not found")
+		return
+	}
+	resp := taskDeleteResponse{Deleted: taskResponseFromLedger(task)}
+	needsCleanup := task.Status == "in_progress" || task.Status == "blocked"
+	if needsCleanup {
+		if s.cleaner == nil {
+			writeError(w, http.StatusInternalServerError, "worker cleaner is not configured")
+			return
+		}
+		if err := s.cleaner.CleanupWorker(context.WithoutCancel(r.Context()), task); err != nil {
+			log.Printf("web: cleanup after task delete failed: %v", err)
+			resp.CleanupError = "worker cleanup failed"
+			writeJSON(w, http.StatusAccepted, resp)
+			return
+		}
+		resp.WorkerCleaned = true
+	}
+	deleted, err := s.ledger.DeleteTaskReturnPrev(id)
+	if err != nil {
+		if errors.Is(err, ledger.ErrTaskNotFound) {
+			writeError(w, http.StatusNotFound, "task not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "delete task")
+		return
+	}
+	resp.Deleted = taskResponseFromLedger(deleted)
+	writeJSON(w, http.StatusOK, resp)
+}
+
 func (s *Server) loadTaskIfExists(id string) (ledger.Task, bool, error) {
 	return s.ledger.LoadByID(id)
 }
@@ -364,6 +492,12 @@ type taskCreateResponse struct {
 	Task                  taskResponse `json:"task"`
 	OrchestratorTriggered bool         `json:"orchestrator_triggered"`
 	TriggerError          string       `json:"trigger_error,omitempty"`
+}
+
+type taskDeleteResponse struct {
+	Deleted       taskResponse `json:"deleted"`
+	WorkerCleaned bool         `json:"worker_cleaned,omitempty"`
+	CleanupError  string       `json:"cleanup_error,omitempty"`
 }
 
 type taskMutationRequest struct {

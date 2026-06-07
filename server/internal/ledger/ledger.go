@@ -332,6 +332,42 @@ func (l *Ledger) DeleteTasks(ids []string) error {
 	return err
 }
 
+// DeleteTaskReturnPrev removes one task and returns the removed snapshot.
+func (l *Ledger) DeleteTaskReturnPrev(id string) (Task, error) {
+	l.mu.Lock()
+	tasks, err := l.load()
+	if err != nil {
+		l.mu.Unlock()
+		return Task{}, err
+	}
+	idx := -1
+	var prev Task
+	for i, task := range tasks {
+		if task.ID == id {
+			idx = i
+			prev = task
+			break
+		}
+	}
+	if idx == -1 {
+		l.mu.Unlock()
+		return Task{}, fmt.Errorf("%w: %s", ErrTaskNotFound, id)
+	}
+	remaining := make([]Task, 0, len(tasks)-1)
+	remaining = append(remaining, tasks[:idx]...)
+	remaining = append(remaining, tasks[idx+1:]...)
+	err = l.save(remaining)
+	onChange := l.onChange
+	l.mu.Unlock()
+	if err != nil {
+		return Task{}, err
+	}
+	if onChange != nil {
+		onChange()
+	}
+	return prev, nil
+}
+
 // UpdateIfStatus modifies task fields only when the task's current status
 // matches expectedStatus. Returns an error if the status has changed (e.g.,
 // due to a concurrent split_task or stop_worker call). Use this for transitions

@@ -237,6 +237,39 @@ func TestUpdateMissingReturnsErrTaskNotFound(t *testing.T) {
 	}
 }
 
+func TestDeleteTaskReturnPrevRemovesTask(t *testing.T) {
+	dir := t.TempDir()
+	l := NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
+
+	if err := l.Add(Task{ID: "task-001", Title: "T", Status: "unstarted", Body: "body"}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	prev, err := l.DeleteTaskReturnPrev("task-001")
+	if err != nil {
+		t.Fatalf("DeleteTaskReturnPrev: %v", err)
+	}
+	if prev.ID != "task-001" || prev.Body != "body" {
+		t.Fatalf("deleted task = %#v, want task-001 with body", prev)
+	}
+	tasks, err := l.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(tasks) != 0 {
+		t.Fatalf("len(tasks) = %d, want 0", len(tasks))
+	}
+}
+
+func TestDeleteTaskReturnPrevMissingReturnsErrTaskNotFound(t *testing.T) {
+	dir := t.TempDir()
+	l := NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
+
+	_, err := l.DeleteTaskReturnPrev("missing")
+	if !errors.Is(err, ErrTaskNotFound) {
+		t.Fatalf("DeleteTaskReturnPrev missing error = %v, want ErrTaskNotFound", err)
+	}
+}
+
 // ---- Archive tests ----
 
 func TestArchiveSlug(t *testing.T) {
