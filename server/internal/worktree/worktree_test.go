@@ -89,6 +89,19 @@ func TestDeleteTaskBranchIfSafeSkipsNonTaskScopedBranch(t *testing.T) {
 	}
 }
 
+func TestDeleteTaskBranchIfSafeRequiresTaskIDBoundary(t *testing.T) {
+	repoPath := initRepo(t)
+	runGit(t, repoPath, "branch", "feature/task-0012")
+
+	err := DeleteTaskBranchIfSafe(repoPath, "feature/task-0012", "task-001")
+	if !errors.Is(err, ErrUnsafeBranchDelete) {
+		t.Fatalf("DeleteTaskBranchIfSafe(prefix task ID) error = %v, want ErrUnsafeBranchDelete", err)
+	}
+	if !branchExists(t, repoPath, "feature/task-0012") {
+		t.Fatal("feature/task-0012 was deleted, want preserved")
+	}
+}
+
 func TestDeleteTaskBranchIfSafeSkipsRemoteBranchAsPullRequestRisk(t *testing.T) {
 	repoPath := initRepo(t)
 	remotePath := filepath.Join(t.TempDir(), "origin.git")

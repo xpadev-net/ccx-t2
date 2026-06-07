@@ -233,7 +233,27 @@ func branchMatchesTaskID(branch, taskID string) bool {
 	if taskID == "" {
 		return false
 	}
-	return strings.Contains(branch, taskID)
+	idx := strings.Index(branch, taskID)
+	for idx >= 0 {
+		end := idx + len(taskID)
+		prevOK := idx == 0 || !isAlphaNumeric(branch[idx-1])
+		nextOK := end == len(branch) || !isAlphaNumeric(branch[end])
+		if prevOK && nextOK {
+			return true
+		}
+		next := strings.Index(branch[idx+1:], taskID)
+		if next < 0 {
+			break
+		}
+		idx += next + 1
+	}
+	return false
+}
+
+func isAlphaNumeric(b byte) bool {
+	return (b >= 'a' && b <= 'z') ||
+		(b >= 'A' && b <= 'Z') ||
+		(b >= '0' && b <= '9')
 }
 
 func run(name string, args ...string) error {

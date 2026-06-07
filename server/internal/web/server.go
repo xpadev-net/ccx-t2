@@ -183,7 +183,9 @@ func (c defaultWorkerCleaner) CleanupWorker(ctx context.Context, task ledger.Tas
 	}
 	if task.Branch != "" {
 		if err := worktree.DeleteTaskBranchIfSafeContext(ctx, deps.cfg.Project.RepoPath, task.Branch, task.ID); err != nil {
-			if !errors.Is(err, worktree.ErrUnsafeBranchDelete) && !isMissingBranchError(err) {
+			if errors.Is(err, worktree.ErrUnsafeBranchDelete) {
+				log.Printf("web cleanup skipped unsafe branch delete for task %s: %v", task.ID, err)
+			} else if !isMissingBranchError(err) {
 				errs = append(errs, fmt.Errorf("delete branch: %w", err))
 			}
 		}
