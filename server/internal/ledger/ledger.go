@@ -16,6 +16,8 @@ var (
 	ErrTaskExists = errors.New("task ID already exists")
 	// ErrTaskNotFound reports a requested task ID that is not present.
 	ErrTaskNotFound = errors.New("task not found")
+	// ErrTaskDeleteInProgress reports a task that is already reserved for deletion.
+	ErrTaskDeleteInProgress = errors.New("task delete already in progress")
 )
 
 // Task represents a single task in the ledger.
@@ -330,6 +332,215 @@ func (l *Ledger) DeleteTasks(ids []string) error {
 		onChange()
 	}
 	return err
+}
+
+// DeleteTaskReturnPrev removes one task and returns the removed snapshot.
+func (l *Ledger) DeleteTaskReturnPrev(id string) (Task, error) {
+	l.mu.Lock()
+	tasks, err := l.load()
+	if err != nil {
+		l.mu.Unlock()
+		return Task{}, err
+	}
+	idx := -1
+	var prev Task
+	for i, task := range tasks {
+		if task.ID == id {
+			idx = i
+			prev = task
+			break
+		}
+	}
+	if idx == -1 {
+		l.mu.Unlock()
+		return Task{}, fmt.Errorf("%w: %s", ErrTaskNotFound, id)
+	}
+	remaining := make([]Task, 0, len(tasks)-1)
+	remaining = append(remaining, tasks[:idx]...)
+	remaining = append(remaining, tasks[idx+1:]...)
+	err = l.save(remaining)
+	onChange := l.onChange
+	l.mu.Unlock()
+	if err != nil {
+		return Task{}, err
+	}
+	if onChange != nil {
+		onChange()
+	}
+	return prev, nil
+}
+
+// PrepareDeleteReturnPrev either marks a task as deleting or removes it under
+// one ledger lock. shouldMark receives the current snapshot; when it returns
+// true the task remains in the ledger with status "deleting", marker contains
+// that reserved row, and marked is true. When the task is already deleting and
+// shouldMark returns false, the task is left unchanged and ErrTaskDeleteInProgress
+// is returned. Otherwise the task is removed and marked is false.
+func (l *Ledger) PrepareDeleteReturnPrev(id string, shouldMark func(Task) bool) (prev Task, marker Task, marked bool, err error) {
+	l.mu.Lock()
+	tasks, err := l.load()
+	if err != nil {
+		l.mu.Unlock()
+		return Task{}, Task{}, false, err
+	}
+	idx := -1
+	for i, task := range tasks {
+		if task.ID == id {
+			idx = i
+			prev = task
+			break
+		}
+	}
+	if idx == -1 {
+		l.mu.Unlock()
+		return Task{}, Task{}, false, fmt.Errorf("%w: %s", ErrTaskNotFound, id)
+	}
+	mark := shouldMark(prev)
+	if prev.Status == "deleting" && !mark {
+		l.mu.Unlock()
+		return prev, prev, false, fmt.Errorf("%w: %s", ErrTaskDeleteInProgress, id)
+	}
+	if mark {
+		tasks[idx].Status = "deleting"
+		tasks[idx].UpdatedAt = time.Now().Format(time.RFC3339Nano)
+		marker = tasks[idx]
+		err = l.save(tasks)
+		onChange := l.onChange
+		l.mu.Unlock()
+		if err != nil {
+			return Task{}, Task{}, false, err
+		}
+		if onChange != nil {
+			onChange()
+		}
+		return prev, marker, true, nil
+	}
+	remaining := make([]Task, 0, len(tasks)-1)
+	remaining = append(remaining, tasks[:idx]...)
+	remaining = append(remaining, tasks[idx+1:]...)
+	err = l.save(remaining)
+	onChange := l.onChange
+	l.mu.Unlock()
+	if err != nil {
+		return Task{}, Task{}, false, err
+	}
+	if onChange != nil {
+		onChange()
+	}
+	return prev, Task{}, false, nil
+}
+
+// DeleteTaskIfCurrent removes the task only when its current deleting marker
+// still matches expected. It returns false when another caller already deleted
+// or replaced the marker.
+func (l *Ledger) DeleteTaskIfCurrent(expected Task) (bool, error) {
+	l.mu.Lock()
+	tasks, err := l.load()
+	if err != nil {
+		l.mu.Unlock()
+		return false, err
+	}
+	idx := -1
+	for i, task := range tasks {
+		if task.ID == expected.ID {
+			if !sameDeleteMarker(task, expected) {
+				l.mu.Unlock()
+				return false, nil
+			}
+			idx = i
+			break
+		}
+	}
+	if idx == -1 {
+		l.mu.Unlock()
+		return false, nil
+	}
+	remaining := make([]Task, 0, len(tasks)-1)
+	remaining = append(remaining, tasks[:idx]...)
+	remaining = append(remaining, tasks[idx+1:]...)
+	err = l.save(remaining)
+	onChange := l.onChange
+	l.mu.Unlock()
+	if err != nil {
+		return false, err
+	}
+	if onChange != nil {
+		onChange()
+	}
+	return true, nil
+}
+
+// RestoreTaskSnapshotIfCurrent replaces a matching deleting marker with the
+// snapshot. It returns false when another caller already deleted or replaced the
+// marker.
+func (l *Ledger) RestoreTaskSnapshotIfCurrent(snapshot Task, expected Task) (bool, error) {
+	l.mu.Lock()
+	tasks, err := l.load()
+	if err != nil {
+		l.mu.Unlock()
+		return false, err
+	}
+	for i, task := range tasks {
+		if task.ID == expected.ID {
+			if !sameDeleteMarker(task, expected) {
+				l.mu.Unlock()
+				return false, nil
+			}
+			tasks[i] = snapshot
+			err = l.save(tasks)
+			onChange := l.onChange
+			l.mu.Unlock()
+			if err != nil {
+				return false, err
+			}
+			if onChange != nil {
+				onChange()
+			}
+			return true, nil
+		}
+	}
+	l.mu.Unlock()
+	return false, nil
+}
+
+func sameDeleteMarker(a, b Task) bool {
+	return a.ID == b.ID &&
+		a.Status == "deleting" &&
+		b.Status == "deleting" &&
+		a.UpdatedAt == b.UpdatedAt
+}
+
+// RestoreTaskSnapshot replaces an existing task with the snapshot, or appends
+// it when the ID is currently missing. The snapshot is written as-is, including
+// UpdatedAt.
+func (l *Ledger) RestoreTaskSnapshot(task Task) error {
+	l.mu.Lock()
+	tasks, err := l.load()
+	if err != nil {
+		l.mu.Unlock()
+		return err
+	}
+	replaced := false
+	for i := range tasks {
+		if tasks[i].ID == task.ID {
+			tasks[i] = task
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		tasks = append(tasks, task)
+	}
+	err = l.save(tasks)
+	onChange := l.onChange
+	l.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	if onChange != nil {
+		onChange()
+	}
+	return nil
 }
 
 // UpdateIfStatus modifies task fields only when the task's current status

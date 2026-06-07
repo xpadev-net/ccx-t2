@@ -237,6 +237,221 @@ func TestUpdateMissingReturnsErrTaskNotFound(t *testing.T) {
 	}
 }
 
+func TestDeleteTaskReturnPrevRemovesTask(t *testing.T) {
+	dir := t.TempDir()
+	l := NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
+
+	if err := l.Add(Task{ID: "task-001", Title: "T", Status: "unstarted", Body: "body"}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	prev, err := l.DeleteTaskReturnPrev("task-001")
+	if err != nil {
+		t.Fatalf("DeleteTaskReturnPrev: %v", err)
+	}
+	if prev.ID != "task-001" || prev.Body != "body" {
+		t.Fatalf("deleted task = %#v, want task-001 with body", prev)
+	}
+	tasks, err := l.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(tasks) != 0 {
+		t.Fatalf("len(tasks) = %d, want 0", len(tasks))
+	}
+}
+
+func TestDeleteTaskReturnPrevMissingReturnsErrTaskNotFound(t *testing.T) {
+	dir := t.TempDir()
+	l := NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
+
+	_, err := l.DeleteTaskReturnPrev("missing")
+	if !errors.Is(err, ErrTaskNotFound) {
+		t.Fatalf("DeleteTaskReturnPrev missing error = %v, want ErrTaskNotFound", err)
+	}
+}
+
+func TestPrepareDeleteReturnPrevDeletesUnmarkedTask(t *testing.T) {
+	dir := t.TempDir()
+	l := NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
+
+	if err := l.Add(Task{ID: "task-001", Title: "T", Status: "unstarted"}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	prev, marker, marked, err := l.PrepareDeleteReturnPrev("task-001", func(Task) bool { return false })
+	if err != nil {
+		t.Fatalf("PrepareDeleteReturnPrev: %v", err)
+	}
+	if marker.ID != "" {
+		t.Fatalf("marker = %#v, want empty marker", marker)
+	}
+	if marked {
+		t.Fatal("marked = true, want false")
+	}
+	if prev.ID != "task-001" {
+		t.Fatalf("prev.ID = %q, want task-001", prev.ID)
+	}
+	tasks, err := l.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(tasks) != 0 {
+		t.Fatalf("len(tasks) = %d, want 0", len(tasks))
+	}
+}
+
+func TestPrepareDeleteReturnPrevMarksTask(t *testing.T) {
+	dir := t.TempDir()
+	l := NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
+
+	if err := l.Add(Task{ID: "task-001", Title: "T", Status: "in_progress", WorkerID: "worker-task-001"}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	prev, marker, marked, err := l.PrepareDeleteReturnPrev("task-001", func(Task) bool { return true })
+	if err != nil {
+		t.Fatalf("PrepareDeleteReturnPrev: %v", err)
+	}
+	if !marked {
+		t.Fatal("marked = false, want true")
+	}
+	if prev.Status != "in_progress" || prev.WorkerID != "worker-task-001" {
+		t.Fatalf("prev = %#v, want original worker snapshot", prev)
+	}
+	if marker.Status != "deleting" || marker.UpdatedAt == "" {
+		t.Fatalf("marker = %#v, want deleting marker with updated_at", marker)
+	}
+	tasks, err := l.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(tasks) != 1 || tasks[0].Status != "deleting" || tasks[0].WorkerID != "worker-task-001" {
+		t.Fatalf("tasks = %#v, want deleting marker with worker metadata", tasks)
+	}
+}
+
+func TestPrepareDeleteReturnPrevKeepsDeletingTask(t *testing.T) {
+	dir := t.TempDir()
+	l := NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
+
+	if err := l.Add(Task{ID: "task-001", Title: "T", Status: "deleting", WorkerID: "worker-task-001"}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	prev, marker, marked, err := l.PrepareDeleteReturnPrev("task-001", func(Task) bool { return false })
+	if !errors.Is(err, ErrTaskDeleteInProgress) {
+		t.Fatalf("PrepareDeleteReturnPrev error = %v, want ErrTaskDeleteInProgress", err)
+	}
+	if marked {
+		t.Fatal("marked = true, want false")
+	}
+	if prev.ID != "task-001" || prev.Status != "deleting" {
+		t.Fatalf("prev = %#v, want deleting task snapshot", prev)
+	}
+	if marker.ID != "task-001" || marker.Status != "deleting" {
+		t.Fatalf("marker = %#v, want deleting task snapshot", marker)
+	}
+	tasks, err := l.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(tasks) != 1 || tasks[0].ID != "task-001" || tasks[0].Status != "deleting" {
+		t.Fatalf("tasks = %#v, want deleting task retained", tasks)
+	}
+}
+
+func TestDeleteTaskIfCurrentRequiresMatchingMarker(t *testing.T) {
+	dir := t.TempDir()
+	l := NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
+
+	if err := l.Add(Task{ID: "task-001", Title: "T", Status: "in_progress"}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	_, marker, marked, err := l.PrepareDeleteReturnPrev("task-001", func(Task) bool { return true })
+	if err != nil {
+		t.Fatalf("PrepareDeleteReturnPrev: %v", err)
+	}
+	if !marked {
+		t.Fatal("marked = false, want true")
+	}
+	stale := marker
+	stale.UpdatedAt = "2026-06-07T00:00:00Z"
+	deleted, err := l.DeleteTaskIfCurrent(stale)
+	if err != nil {
+		t.Fatalf("DeleteTaskIfCurrent stale: %v", err)
+	}
+	if deleted {
+		t.Fatal("deleted stale marker = true, want false")
+	}
+	deleted, err = l.DeleteTaskIfCurrent(marker)
+	if err != nil {
+		t.Fatalf("DeleteTaskIfCurrent: %v", err)
+	}
+	if !deleted {
+		t.Fatal("deleted = false, want true")
+	}
+}
+
+func TestRestoreTaskSnapshotIfCurrentRequiresMatchingMarker(t *testing.T) {
+	dir := t.TempDir()
+	l := NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
+	original := Task{ID: "task-001", Title: "T", Status: "in_progress"}
+
+	if err := l.Add(original); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	_, marker, marked, err := l.PrepareDeleteReturnPrev("task-001", func(Task) bool { return true })
+	if err != nil {
+		t.Fatalf("PrepareDeleteReturnPrev: %v", err)
+	}
+	if !marked {
+		t.Fatal("marked = false, want true")
+	}
+	stale := marker
+	stale.UpdatedAt = "2026-06-07T00:00:00Z"
+	restored, err := l.RestoreTaskSnapshotIfCurrent(original, stale)
+	if err != nil {
+		t.Fatalf("RestoreTaskSnapshotIfCurrent stale: %v", err)
+	}
+	if restored {
+		t.Fatal("restored stale marker = true, want false")
+	}
+	restored, err = l.RestoreTaskSnapshotIfCurrent(original, marker)
+	if err != nil {
+		t.Fatalf("RestoreTaskSnapshotIfCurrent: %v", err)
+	}
+	if !restored {
+		t.Fatal("restored = false, want true")
+	}
+	tasks, err := l.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(tasks) != 1 || tasks[0].Status != "in_progress" {
+		t.Fatalf("tasks = %#v, want original task restored", tasks)
+	}
+}
+
+func TestRestoreTaskSnapshotRestoresSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	l := NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
+	task := Task{ID: "task-001", Title: "T", Status: "in_progress", UpdatedAt: "2026-06-07T00:00:00Z", Body: "body"}
+
+	if err := l.RestoreTaskSnapshot(task); err != nil {
+		t.Fatalf("RestoreTaskSnapshot: %v", err)
+	}
+	if err := l.RestoreTaskSnapshot(Task{ID: "task-001", Title: "Restored", Status: "blocked"}); err != nil {
+		t.Fatalf("second RestoreTaskSnapshot: %v", err)
+	}
+	tasks, err := l.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("len(tasks) = %d, want 1", len(tasks))
+	}
+	if tasks[0].Title != "Restored" || tasks[0].Status != "blocked" {
+		t.Fatalf("restored task = %#v, want replacement snapshot", tasks[0])
+	}
+}
+
 // ---- Archive tests ----
 
 func TestArchiveSlug(t *testing.T) {

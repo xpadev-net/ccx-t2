@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -135,6 +136,16 @@ func TestPostTasksDefaultsEmptyStatus(t *testing.T) {
 	}
 	if created.Task.Status != "unstarted" {
 		t.Fatalf("task status = %q, want unstarted", created.Task.Status)
+	}
+}
+
+func TestPostTasksRejectsDeletingStatus(t *testing.T) {
+	resp := performJSONRequest(New(Deps{Ledger: newTestLedger(t), AuthDisabled: true}), http.MethodPost, "/api/tasks", `{
+		"title": "New task",
+		"status": "deleting"
+	}`)
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", resp.Code, http.StatusBadRequest)
 	}
 }
 
@@ -336,6 +347,351 @@ func TestPatchRejectsEmptyStatus(t *testing.T) {
 	}
 }
 
+func TestPatchRejectsDeletingStatus(t *testing.T) {
+	l := newTestLedger(t)
+	if err := l.Add(ledger.Task{ID: "task-001", Title: "Old", Status: "unstarted"}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	resp := performJSONRequest(New(Deps{Ledger: l, AuthDisabled: true}), http.MethodPatch, "/api/tasks/task-001", `{"status": "deleting"}`)
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", resp.Code, http.StatusBadRequest)
+	}
+	tasks, err := l.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(tasks) != 1 || tasks[0].Status != "unstarted" {
+		t.Fatalf("tasks = %#v, want status unchanged", tasks)
+	}
+}
+
+func TestDeleteTaskRemovesTask(t *testing.T) {
+	l := newTestLedger(t)
+	if err := l.Add(ledger.Task{ID: "task-001", Title: "Delete me", Status: "unstarted", Body: "body"}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	resp := performRequest(New(Deps{Ledger: l, AuthDisabled: true}), http.MethodDelete, "/api/tasks/task-001")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	var deleted taskDeleteResponse
+	if err := json.Unmarshal(resp.Body.Bytes(), &deleted); err != nil {
+		t.Fatalf("decode delete response: %v", err)
+	}
+	if deleted.Deleted.ID != "task-001" || deleted.Deleted.Body != "body" {
+		t.Fatalf("deleted = %#v, want task-001 with body", deleted.Deleted)
+	}
+	tasks, err := l.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(tasks) != 0 {
+		t.Fatalf("len(tasks) = %d, want 0", len(tasks))
+	}
+}
+
+func TestDeleteTaskNotFound(t *testing.T) {
+	resp := performRequest(New(Deps{Ledger: newTestLedger(t), AuthDisabled: true}), http.MethodDelete, "/api/tasks/missing")
+	if resp.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", resp.Code, http.StatusNotFound)
+	}
+}
+
+func TestDeleteInProgressTaskCleansWorker(t *testing.T) {
+	l := newTestLedger(t)
+	if err := l.Add(ledger.Task{
+		ID:       "task-001",
+		Title:    "Delete worker",
+		Status:   "in_progress",
+		WorkerID: "worker-task-001",
+		Branch:   "feature/task-001",
+	}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	cleaner := &fakeCleaner{}
+
+	resp := performRequest(New(Deps{Ledger: l, Cleaner: cleaner, AuthDisabled: true}), http.MethodDelete, "/api/tasks/task-001")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	if len(cleaner.tasks) != 1 || cleaner.tasks[0].WorkerID != "worker-task-001" {
+		t.Fatalf("cleaner tasks = %#v, want worker-task-001", cleaner.tasks)
+	}
+	var deleted taskDeleteResponse
+	if err := json.Unmarshal(resp.Body.Bytes(), &deleted); err != nil {
+		t.Fatalf("decode delete response: %v", err)
+	}
+	if !deleted.WorkerCleaned {
+		t.Fatal("WorkerCleaned = false, want true")
+	}
+}
+
+func TestDeleteInProgressTaskReportsCleanupFailure(t *testing.T) {
+	l := newTestLedger(t)
+	if err := l.Add(ledger.Task{ID: "task-001", Title: "Delete worker", Status: "in_progress", WorkerID: "worker-task-001"}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	resp := performRequest(New(Deps{
+		Ledger:       l,
+		Cleaner:      &fakeCleaner{err: errors.New("tmux unavailable")},
+		AuthDisabled: true,
+	}), http.MethodDelete, "/api/tasks/task-001")
+	if resp.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusAccepted, resp.Body.String())
+	}
+	var deleted taskDeleteResponse
+	if err := json.Unmarshal(resp.Body.Bytes(), &deleted); err != nil {
+		t.Fatalf("decode delete response: %v", err)
+	}
+	if deleted.CleanupError == "" {
+		t.Fatal("CleanupError is empty, want cleanup failure marker")
+	}
+	tasks, err := l.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(tasks) != 1 || tasks[0].ID != "task-001" {
+		t.Fatalf("tasks after cleanup failure = %#v, want task-001 retained", tasks)
+	}
+	if tasks[0].Status != "in_progress" || tasks[0].WorkerID != "worker-task-001" {
+		t.Fatalf("restored task = %#v, want original worker metadata", tasks[0])
+	}
+}
+
+func TestDeleteInProgressTaskReservesIDDuringCleanup(t *testing.T) {
+	l := newTestLedger(t)
+	id, err := l.AddNew(ledger.Task{Title: "Delete worker", Status: "in_progress", WorkerID: "worker-task"})
+	if err != nil {
+		t.Fatalf("AddNew: %v", err)
+	}
+	cleaner := &fakeCleaner{
+		fn: func() error {
+			newID, err := l.AddNew(ledger.Task{Title: "Concurrent create", Status: "unstarted"})
+			if err != nil {
+				return err
+			}
+			if newID == id {
+				return errors.New("concurrent create reused deleting task ID")
+			}
+			return nil
+		},
+	}
+
+	resp := performRequest(New(Deps{Ledger: l, Cleaner: cleaner, AuthDisabled: true}), http.MethodDelete, "/api/tasks/"+id)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	tasks, err := l.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(tasks) != 1 || tasks[0].Title != "Concurrent create" {
+		t.Fatalf("tasks after delete = %#v, want only concurrent create", tasks)
+	}
+}
+
+func TestDeleteInProgressTaskRejectsConcurrentCleanup(t *testing.T) {
+	l := newTestLedger(t)
+	if err := l.Add(ledger.Task{ID: "task-001", Title: "Delete worker", Status: "in_progress", WorkerID: "worker-task-001"}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	var handler http.Handler
+	cleaner := &fakeCleaner{}
+	cleaner.fn = func() error {
+		resp := performRequest(handler, http.MethodDelete, "/api/tasks/task-001")
+		if resp.Code != http.StatusAccepted {
+			return fmt.Errorf("concurrent status = %d, want %d; body=%s", resp.Code, http.StatusAccepted, resp.Body.String())
+		}
+		var deleted taskDeleteResponse
+		if err := json.Unmarshal(resp.Body.Bytes(), &deleted); err != nil {
+			return fmt.Errorf("decode concurrent delete response: %w", err)
+		}
+		if !deleted.DeletePending {
+			return errors.New("DeletePending = false, want true")
+		}
+		return nil
+	}
+	handler = New(Deps{Ledger: l, Cleaner: cleaner, AuthDisabled: true})
+
+	resp := performRequest(handler, http.MethodDelete, "/api/tasks/task-001")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	if len(cleaner.tasks) != 1 {
+		t.Fatalf("cleanup calls = %d, want 1", len(cleaner.tasks))
+	}
+	tasks, err := l.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(tasks) != 0 {
+		t.Fatalf("tasks after delete = %#v, want empty ledger", tasks)
+	}
+}
+
+func TestPatchDeletingTaskRejectedDuringCleanup(t *testing.T) {
+	l := newTestLedger(t)
+	if err := l.Add(ledger.Task{ID: "task-001", Title: "Delete worker", Status: "in_progress", WorkerID: "worker-task-001"}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	var handler http.Handler
+	cleaner := &fakeCleaner{}
+	cleaner.fn = func() error {
+		resp := performJSONRequest(handler, http.MethodPatch, "/api/tasks/task-001", `{"title":"mutated"}`)
+		if resp.Code != http.StatusConflict {
+			return fmt.Errorf("patch status = %d, want %d; body=%s", resp.Code, http.StatusConflict, resp.Body.String())
+		}
+		return nil
+	}
+	handler = New(Deps{Ledger: l, Cleaner: cleaner, AuthDisabled: true})
+
+	resp := performRequest(handler, http.MethodDelete, "/api/tasks/task-001")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("delete status = %d, want %d; body=%s", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	if len(cleaner.tasks) != 1 {
+		t.Fatalf("cleanup calls = %d, want 1", len(cleaner.tasks))
+	}
+	tasks, err := l.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(tasks) != 0 {
+		t.Fatalf("tasks after delete = %#v, want empty ledger", tasks)
+	}
+}
+
+func TestDeletingMarkerWithNanoTimestampIsFresh(t *testing.T) {
+	now := time.Date(2026, 6, 7, 12, 0, 0, 123456789, time.UTC)
+	task := ledger.Task{
+		ID:        "task-001",
+		Status:    "deleting",
+		UpdatedAt: now.Format(time.RFC3339Nano),
+	}
+
+	if taskNeedsDeleteCleanup(task, now.Add(time.Minute)) {
+		t.Fatal("taskNeedsDeleteCleanup = true, want fresh deleting marker to be pending")
+	}
+}
+
+func TestDeleteStaleDeletingTaskRetriesCleanup(t *testing.T) {
+	l := newTestLedger(t)
+	task := ledger.Task{
+		ID:        "task-001",
+		Title:     "Delete worker",
+		Status:    "deleting",
+		WorkerID:  "worker-task-001",
+		UpdatedAt: time.Now().Add(-deleteCleanupLease - time.Minute).Format(time.RFC3339),
+	}
+	if err := l.RestoreTaskSnapshot(task); err != nil {
+		t.Fatalf("RestoreTaskSnapshot: %v", err)
+	}
+	cleaner := &fakeCleaner{}
+
+	resp := performRequest(New(Deps{Ledger: l, Cleaner: cleaner, AuthDisabled: true}), http.MethodDelete, "/api/tasks/task-001")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	if len(cleaner.tasks) != 1 || cleaner.tasks[0].Status != "deleting" {
+		t.Fatalf("cleaner tasks = %#v, want stale deleting task", cleaner.tasks)
+	}
+}
+
+func TestDeleteExpiredMarkerTakeoverDoesNotRestoreStaleCleanupFailure(t *testing.T) {
+	l := newTestLedger(t)
+	if err := l.Add(ledger.Task{ID: "task-001", Title: "Delete worker", Status: "in_progress", WorkerID: "worker-task-001"}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	var handler http.Handler
+	cleaner := &fakeCleaner{}
+	cleaner.fn = func() error {
+		if len(cleaner.tasks) == 1 {
+			tasks, err := l.Load()
+			if err != nil {
+				return err
+			}
+			if len(tasks) != 1 || tasks[0].Status != "deleting" {
+				return fmt.Errorf("tasks before takeover = %#v, want deleting marker", tasks)
+			}
+			staleMarker := tasks[0]
+			staleMarker.UpdatedAt = time.Now().Add(-deleteCleanupLease - time.Minute).Format(time.RFC3339)
+			if err := l.RestoreTaskSnapshot(staleMarker); err != nil {
+				return err
+			}
+			resp := performRequest(handler, http.MethodDelete, "/api/tasks/task-001")
+			if resp.Code != http.StatusOK {
+				return fmt.Errorf("takeover status = %d, want %d; body=%s", resp.Code, http.StatusOK, resp.Body.String())
+			}
+			return errors.New("original cleanup failed after takeover")
+		}
+		return nil
+	}
+	handler = New(Deps{Ledger: l, Cleaner: cleaner, AuthDisabled: true})
+
+	resp := performRequest(handler, http.MethodDelete, "/api/tasks/task-001")
+	if resp.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusAccepted, resp.Body.String())
+	}
+	var deleted taskDeleteResponse
+	if err := json.Unmarshal(resp.Body.Bytes(), &deleted); err != nil {
+		t.Fatalf("decode delete response: %v", err)
+	}
+	if deleted.CleanupError == "" || !deleted.DeletePending {
+		t.Fatalf("delete response = %#v, want cleanup_error and delete_pending", deleted)
+	}
+	if len(cleaner.tasks) != 2 {
+		t.Fatalf("cleanup calls = %d, want 2", len(cleaner.tasks))
+	}
+	tasks, err := l.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(tasks) != 0 {
+		t.Fatalf("tasks after takeover = %#v, want empty ledger", tasks)
+	}
+}
+
+func TestDeleteBlockedTaskCleansWorker(t *testing.T) {
+	l := newTestLedger(t)
+	if err := l.Add(ledger.Task{
+		ID:       "task-001",
+		Title:    "Delete blocked worker",
+		Status:   "blocked",
+		WorkerID: "worker-task-001",
+		Branch:   "feature/task-001",
+	}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	cleaner := &fakeCleaner{}
+
+	resp := performRequest(New(Deps{Ledger: l, Cleaner: cleaner, AuthDisabled: true}), http.MethodDelete, "/api/tasks/task-001")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	if len(cleaner.tasks) != 1 || cleaner.tasks[0].Status != "blocked" {
+		t.Fatalf("cleaner tasks = %#v, want blocked task", cleaner.tasks)
+	}
+}
+
+func TestCleanupMissingResourceErrorsAreRetrySafe(t *testing.T) {
+	for _, err := range []error{
+		errors.New("tmux [kill-window -t session:worker-task-001]: exit status 1: can't find window: worker-task-001"),
+		errors.New("git [-C /repo worktree remove --force /tmp/missing]: exit status 128: '/tmp/missing' is not a working tree"),
+		errors.New("git [-C /repo branch -D feature/task-001]: exit status 1: error: branch 'feature/task-001' not found"),
+		errors.New("git branch -D feature/task-001: exit status 1: error: branch 'feature/task-001' not found"),
+	} {
+		if !(isMissingTmuxWindowError(err) || isMissingWorktreeError(err) || isMissingBranchError(err)) {
+			t.Fatalf("error %q was not classified as retry-safe missing resource", err)
+		}
+	}
+	if isMissingWorktreeError(errors.New("stat /bad/repo: no such file or directory")) {
+		t.Fatal("repo path error was classified as missing worktree")
+	}
+}
+
 func TestPostTasksRejectsEmptyTask(t *testing.T) {
 	resp := performJSONRequest(New(Deps{Ledger: newTestLedger(t), AuthDisabled: true}), http.MethodPost, "/api/tasks", `{}`)
 	if resp.Code != http.StatusBadRequest {
@@ -519,8 +875,8 @@ func TestCORSPreflight(t *testing.T) {
 	if got := resp.Header().Get("Vary"); got != "Origin" {
 		t.Fatalf("Vary = %q, want Origin", got)
 	}
-	if got := resp.Header().Get("Access-Control-Allow-Methods"); got != "GET, POST, PATCH, OPTIONS" {
-		t.Fatalf("Access-Control-Allow-Methods = %q, want GET, POST, PATCH, OPTIONS", got)
+	if got := resp.Header().Get("Access-Control-Allow-Methods"); got != "GET, POST, PATCH, DELETE, OPTIONS" {
+		t.Fatalf("Access-Control-Allow-Methods = %q, want GET, POST, PATCH, DELETE, OPTIONS", got)
 	}
 	if got := resp.Header().Get("Access-Control-Allow-Headers"); !strings.Contains(got, "Authorization") {
 		t.Fatalf("Access-Control-Allow-Headers = %q, want Authorization", got)
@@ -601,5 +957,19 @@ type fakeTrigger struct {
 
 func (f *fakeTrigger) Trigger(ctx context.Context, reason string) error {
 	f.reasons = append(f.reasons, reason)
+	return f.err
+}
+
+type fakeCleaner struct {
+	tasks []ledger.Task
+	err   error
+	fn    func() error
+}
+
+func (f *fakeCleaner) CleanupWorker(ctx context.Context, task ledger.Task) error {
+	f.tasks = append(f.tasks, task)
+	if f.fn != nil {
+		return f.fn()
+	}
 	return f.err
 }
