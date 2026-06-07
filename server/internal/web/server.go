@@ -387,11 +387,11 @@ func taskFromCreateRequest(req taskMutationRequest) (ledger.Task, error) {
 		task.ID = strings.TrimSpace(*req.IdempotencyKey)
 	}
 	fields := fieldsFromUpdateRequest(req)
-	if status, ok := fields["status"].(string); ok && status != "" {
-		task.Status = status
-	}
 	task = taskSnapshotWithFields(task, fields)
 	task.UpdatedAt = ""
+	if strings.TrimSpace(task.Status) == "" {
+		task.Status = "unstarted"
+	}
 	if strings.TrimSpace(task.Title) == "" && strings.TrimSpace(task.Body) == "" {
 		return ledger.Task{}, fmt.Errorf("title or body is required")
 	}

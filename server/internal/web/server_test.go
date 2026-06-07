@@ -110,6 +110,24 @@ func TestPostTasksSupportsIdempotencyKey(t *testing.T) {
 	}
 }
 
+func TestPostTasksDefaultsEmptyStatus(t *testing.T) {
+	resp := performJSONRequest(New(Deps{Ledger: newTestLedger(t), AuthDisabled: true}), http.MethodPost, "/api/tasks", `{
+		"title": "New task",
+		"status": ""
+	}`)
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusCreated, resp.Body.String())
+	}
+
+	var created taskCreateResponse
+	if err := json.Unmarshal(resp.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if created.Task.Status != "unstarted" {
+		t.Fatalf("task status = %q, want unstarted", created.Task.Status)
+	}
+}
+
 func TestPostTasksDuplicateIdempotencyKeyReturnsExistingTask(t *testing.T) {
 	l := newTestLedger(t)
 	if err := l.Add(ledger.Task{ID: "client-task-1", Title: "Existing", Status: "unstarted"}); err != nil {
