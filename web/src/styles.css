@@ -61,6 +61,23 @@ button:disabled {
   padding: 20px 28px;
 }
 
+.topbar-actions {
+  display: flex;
+  align-items: flex-end;
+  gap: 12px;
+}
+
+.project-switcher {
+  display: grid;
+  gap: 4px;
+  color: #627284;
+  font-size: 12px;
+}
+
+.project-switcher select {
+  min-width: 180px;
+}
+
 .topbar h1,
 .section-heading h2 {
   margin: 0;

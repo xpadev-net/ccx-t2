@@ -35,6 +35,11 @@ type WorkerInfo = {
   started_at?: string;
 };
 
+type ProjectInfo = {
+  slug: string;
+  repo_path: string;
+};
+
 type ConfigResponse = {
   project: {
     slug: string;
@@ -43,6 +48,10 @@ type ConfigResponse = {
   };
   server: {
     port: number;
+  };
+  runtime?: {
+    tmux_session: string;
+    worktree_base: string;
   };
   orchestrator: {
     harness: string;
@@ -55,6 +64,15 @@ type ConfigResponse = {
     owner?: string;
     repo?: string;
   };
+  projects?: Record<
+    string,
+    {
+      slug: string;
+      repo_path: string;
+      worktree_base: string;
+      ledger_path?: string;
+    }
+  >;
 };
 
 type ConfigDraft = {
@@ -96,6 +114,8 @@ function App() {
   const [workers, setWorkers] = useState<WorkerInfo[]>([]);
   const [selectedWorkerID, setSelectedWorkerID] = useState("");
   const [workerLog, setWorkerLog] = useState<string[]>([]);
+  const [projects, setProjects] = useState<ProjectInfo[]>([]);
+  const [selectedProjectSlug, setSelectedProjectSlug] = useState("");
   const [config, setConfig] = useState<ConfigResponse | null>(null);
   const [configDraft, setConfigDraft] = useState<ConfigDraft>(() => emptyConfigDraft());
   const [settingsDirty, setSettingsDirty] = useState(false);
@@ -129,9 +149,18 @@ function App() {
   }, []);
 
   useEffect(() => {
+    if (selectedProjectSlug) {
+      void refreshProjectData(true);
+    }
+  }, [selectedProjectSlug]);
+
+  useEffect(() => {
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
     const tokenQuery = token ? `?token=${encodeURIComponent(token)}` : "";
-    const socket = new WebSocket(`${protocol}//${window.location.host}/ws/ledger${tokenQuery}`);
+    const ledgerPath = selectedProjectSlug
+      ? `/ws/projects/${encodeURIComponent(selectedProjectSlug)}/ledger`
+      : "/ws/ledger";
+    const socket = new WebSocket(`${protocol}//${window.location.host}${ledgerPath}${tokenQuery}`);
     socket.addEventListener("message", (event) => {
       try {
         const msg = JSON.parse(String(event.data)) as { type?: string };
@@ -144,7 +173,7 @@ function App() {
       }
     });
     return () => socket.close();
-  }, [token]);
+  }, [selectedProjectSlug, token]);
 
   useEffect(() => {
     if (!selectedWorker) {
@@ -165,7 +194,7 @@ function App() {
         return;
       }
       socket = new WebSocket(
-        `${protocol}//${window.location.host}/ws/worker/${encodeURIComponent(selectedWorker.worker_id)}${tokenQuery}`
+        `${protocol}//${window.location.host}${workerLogPath(selectedProjectSlug, selectedWorker.worker_id)}${tokenQuery}`
       );
       socket.addEventListener("message", (event) => {
         try {
@@ -199,7 +228,7 @@ function App() {
       }
       socket?.close();
     };
-  }, [selectedWorker?.worker_id, token]);
+  }, [selectedProjectSlug, selectedWorker?.worker_id, token]);
 
   useEffect(() => {
     if (!selectedTask) {
@@ -221,7 +250,7 @@ function App() {
     }
     setError("");
     try {
-      const data = await api<Task[]>("/api/tasks", {}, authToken);
+      const data = await api<Task[]>(tasksPath(selectedProjectSlug), {}, authToken);
       setTasks(data);
       setSelectedID((current) => current || data[0]?.id || "");
     } catch (err) {
@@ -233,7 +262,7 @@ function App() {
 
   async function refreshWorkers(authToken = token) {
     try {
-      const data = await api<WorkerInfo[]>("/api/workers", {}, authToken);
+      const data = await api<WorkerInfo[]>(workersPath(selectedProjectSlug), {}, authToken);
       setWorkers(data);
       setSelectedWorkerID((current) => current || data[0]?.worker_id || "");
     } catch (err) {
@@ -242,21 +271,25 @@ function App() {
   }
 
   async function refreshAll(showLoading = true, authToken = token, replaceSettingsDraft = false) {
-    await Promise.all([
-      refreshTasks(showLoading, authToken),
-      refreshWorkers(authToken),
-      refreshSettings(authToken, replaceSettingsDraft)
-    ]);
+    await refreshSettings(authToken, replaceSettingsDraft);
+    await refreshProjectData(showLoading, authToken);
+  }
+
+  async function refreshProjectData(showLoading = true, authToken = token) {
+    await Promise.all([refreshTasks(showLoading, authToken), refreshWorkers(authToken)]);
   }
 
   async function refreshSettings(authToken = token, replaceDraft = false) {
     setSettingsLoading(true);
     try {
-      const [configData, harnessData] = await Promise.all([
+      const [configData, harnessData, projectData] = await Promise.all([
         api<ConfigResponse>("/api/config", {}, authToken),
-        api<HarnessInfo[]>("/api/harnesses", {}, authToken)
+        api<HarnessInfo[]>("/api/harnesses", {}, authToken),
+        api<ProjectInfo[]>("/api/projects", {}, authToken)
       ]);
       setConfig(configData);
+      setProjects(projectData);
+      setSelectedProjectSlug((current) => current || projectData[0]?.slug || configData.project.slug || "");
       if (replaceDraft || !settingsDirtyRef.current) {
         setConfigDraft(configToDraft(configData));
         settingsDirtyRef.current = false;
@@ -277,7 +310,7 @@ function App() {
     setMessage("");
     try {
       const response = await api<TaskCreateResponse>(
-        "/api/tasks",
+        tasksPath(selectedProjectSlug),
         {
           method: "POST",
           body: JSON.stringify({
@@ -314,7 +347,7 @@ function App() {
     setMessage("");
     try {
       await api<Task>(
-        `/api/tasks/${encodeURIComponent(selectedTask.id)}`,
+        taskPath(selectedProjectSlug, selectedTask.id),
         {
           method: "PATCH",
           body: JSON.stringify({ title, body, status })
@@ -339,7 +372,7 @@ function App() {
     setMessage("");
     try {
       const response = await api<TaskDeleteResponse>(
-        `/api/tasks/${encodeURIComponent(selectedTask.id)}`,
+        taskPath(selectedProjectSlug, selectedTask.id),
         { method: "DELETE" },
         token
       );
@@ -415,9 +448,29 @@ function App() {
           <h1>ccx-t2</h1>
           <p>Task ledger and worker orchestration</p>
         </div>
-        <button className="secondary" type="button" onClick={() => void refreshAll()} disabled={loading}>
-          Refresh
-        </button>
+        <div className="topbar-actions">
+          <label className="project-switcher">
+            Project
+            <select
+              value={selectedProjectSlug}
+              onChange={(event) => {
+                setSelectedProjectSlug(event.target.value);
+                setSelectedID("");
+                setSelectedWorkerID("");
+              }}
+            >
+              {projects.map((project) => (
+                <option key={project.slug} value={project.slug}>
+                  {project.slug}
+                </option>
+              ))}
+              {projects.length === 0 && <option value={selectedProjectSlug}>{selectedProjectSlug || "default"}</option>}
+            </select>
+          </label>
+          <button className="secondary" type="button" onClick={() => void refreshAll()} disabled={loading}>
+            Refresh
+          </button>
+        </div>
       </header>
 
       <section className="notice-row" aria-live="polite">
@@ -776,6 +829,26 @@ function configPatchFromDraft(draft: ConfigDraft) {
       repo: draft.githubRepo
     }
   };
+}
+
+function tasksPath(projectSlug: string) {
+  return projectSlug ? `/api/projects/${encodeURIComponent(projectSlug)}/tasks` : "/api/tasks";
+}
+
+function workersPath(projectSlug: string) {
+  return projectSlug ? `/api/projects/${encodeURIComponent(projectSlug)}/workers` : "/api/workers";
+}
+
+function taskPath(projectSlug: string, taskID: string) {
+  return projectSlug
+    ? `/api/projects/${encodeURIComponent(projectSlug)}/tasks/${encodeURIComponent(taskID)}`
+    : `/api/tasks/${encodeURIComponent(taskID)}`;
+}
+
+function workerLogPath(projectSlug: string, workerID: string) {
+  return projectSlug
+    ? `/ws/projects/${encodeURIComponent(projectSlug)}/worker/${encodeURIComponent(workerID)}`
+    : `/ws/worker/${encodeURIComponent(workerID)}`;
 }
 
 async function api<T>(path: string, init: RequestInit = {}, token = ""): Promise<T> {

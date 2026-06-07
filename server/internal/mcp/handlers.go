@@ -14,6 +14,7 @@ import (
 	githubpkg "github.com/xpadev/ccx-t2/internal/github"
 	"github.com/xpadev/ccx-t2/internal/harness"
 	"github.com/xpadev/ccx-t2/internal/ledger"
+	runtimepkg "github.com/xpadev/ccx-t2/internal/runtime"
 	"github.com/xpadev/ccx-t2/internal/tmux"
 	"github.com/xpadev/ccx-t2/internal/worker"
 	"github.com/xpadev/ccx-t2/internal/worktree"
@@ -21,50 +22,58 @@ import (
 
 // Deps holds the dependencies used by MCP tool handlers.
 type Deps struct {
-	Ledger   *ledger.Ledger
-	Registry *worker.Registry
-	Config   *config.Config
-	GitHub   *githubpkg.Client // may be nil if GitHub is not configured
-	Session  string            // tmux session name
-	BaseURL  string            // e.g. "http://localhost:8080"
+	Ledger      *ledger.Ledger
+	Registry    *worker.Registry
+	Config      *config.Config
+	GitHub      *githubpkg.Client // may be nil if GitHub is not configured
+	Session     string            // tmux session name
+	BaseURL     string            // e.g. "http://localhost:8080"
+	Manager     *runtimepkg.Manager
+	ProjectSlug string
 }
 
-// RegisterOrchestratorTools registers the 10 Orchestrator tools on s.
+// RegisterOrchestratorTools registers the Orchestrator tools on s.
 func RegisterOrchestratorTools(s *Server, deps *Deps) {
+	s.Register(ToolDef{
+		Name:        "list_projects",
+		Description: "Return the configured project list.",
+		InputSchema: inSchema(map[string]any{}, nil),
+	}, handleListProjects(deps))
+
 	s.Register(ToolDef{
 		Name:        "list_tasks",
 		Description: "Return the current task ledger snapshot.",
-		InputSchema: inSchema(map[string]any{}, nil),
+		InputSchema: inSchema(projectProps(nil), nil),
 	}, handleListTasks(deps))
 
 	s.Register(ToolDef{
 		Name:        "create_task",
 		Description: "Add an unstarted task to the ledger.",
-		InputSchema: inSchema(map[string]any{
+		InputSchema: inSchema(projectProps(map[string]any{
 			"title":           prop("string", "Task title"),
 			"description":     prop("string", "Task description (body text)"),
 			"allowed_files":   arrayProp("string", "Paths worker may edit"),
 			"forbidden_files": arrayProp("string", "Paths worker must not edit"),
-		}, []string{"title"}),
+		}), []string{"title"}),
 	}, handleCreateTask(deps))
 
 	s.Register(ToolDef{
 		Name:        "update_task",
 		Description: "Update allowed fields of an existing task. Status cannot be changed here.",
-		InputSchema: inSchema(map[string]any{
+		InputSchema: inSchema(projectProps(map[string]any{
 			"id":              prop("string", "Task ID"),
 			"title":           prop("string", "New title"),
 			"description":     prop("string", "New body text"),
 			"allowed_files":   arrayProp("string", "New allowed_files list"),
 			"forbidden_files": arrayProp("string", "New forbidden_files list"),
 			"reason":          prop("string", "Reason note"),
-		}, []string{"id"}),
+		}), []string{"id"}),
 	}, handleUpdateTask(deps))
 
 	s.Register(ToolDef{
 		Name:        "split_task",
 		Description: "Split a task into sub-tasks.",
-		InputSchema: inSchema(map[string]any{
+		InputSchema: inSchema(projectProps(map[string]any{
 			"id":     prop("string", "Task ID"),
 			"reason": prop("string", "Reason for split"),
 			"slices": map[string]any{
@@ -81,15 +90,15 @@ func RegisterOrchestratorTools(s *Server, deps *Deps) {
 					"required": []string{"title"},
 				},
 			},
-		}, []string{"id", "reason", "slices"}),
+		}), []string{"id", "reason", "slices"}),
 	}, handleSplitTask(deps))
 
 	s.Register(ToolDef{
 		Name:        "archive_task",
 		Description: "Archive a completed task.",
-		InputSchema: inSchema(map[string]any{
+		InputSchema: inSchema(projectProps(map[string]any{
 			"id": prop("string", "Task ID"),
-		}, []string{"id"}),
+		}), []string{"id"}),
 	}, handleArchiveTask(deps))
 
 	s.Register(ToolDef{
@@ -101,38 +110,38 @@ func RegisterOrchestratorTools(s *Server, deps *Deps) {
 	s.Register(ToolDef{
 		Name:        "spawn_worker",
 		Description: "Create a worktree and tmux window, then start a worker harness.",
-		InputSchema: inSchema(map[string]any{
+		InputSchema: inSchema(projectProps(map[string]any{
 			"task_id":         prop("string", "Task ID"),
 			"branch":          prop("string", "Git branch name"),
 			"allowed_files":   arrayProp("string", "Paths the worker may edit (required, >= 1)"),
 			"forbidden_files": arrayProp("string", "Paths the worker must not edit"),
 			"harness":         prop("string", "Harness name (optional if only one worker_harness)"),
-		}, []string{"task_id", "branch", "allowed_files"}),
+		}), []string{"task_id", "branch", "allowed_files"}),
 	}, handleSpawnWorker(deps))
 
 	s.Register(ToolDef{
 		Name:        "stop_worker",
 		Description: "Kill a worker window, remove its worktree, and reset the task to unstarted.",
-		InputSchema: inSchema(map[string]any{
+		InputSchema: inSchema(projectProps(map[string]any{
 			"worker_id": prop("string", "Worker ID (tmux window name)"),
-		}, []string{"worker_id"}),
+		}), []string{"worker_id"}),
 	}, handleStopWorker(deps))
 
 	s.Register(ToolDef{
 		Name:        "followup_worker",
 		Description: "Send a follow-up message to a worker via tmux send-keys.",
-		InputSchema: inSchema(map[string]any{
+		InputSchema: inSchema(projectProps(map[string]any{
 			"worker_id": prop("string", "Worker ID"),
 			"message":   prop("string", "Message text"),
-		}, []string{"worker_id", "message"}),
+		}), []string{"worker_id", "message"}),
 	}, handleFollowupWorker(deps))
 
 	s.Register(ToolDef{
 		Name:        "get_pr_status",
 		Description: "Return the current GitHub PR state and CI checks.",
-		InputSchema: inSchema(map[string]any{
+		InputSchema: inSchema(projectProps(map[string]any{
 			"pr_number": prop("integer", "Pull request number"),
-		}, []string{"pr_number"}),
+		}), []string{"pr_number"}),
 	}, handleGetPRStatus(deps))
 }
 
@@ -146,6 +155,7 @@ func RegisterWorkerTools(s *Server, deps *Deps) {
 			"payload": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
+					"project_slug":    prop("string", "Project slug"),
 					"task_id":         prop("string", "Task ID"),
 					"worker_id":       prop("string", "Caller's worker_id for ownership verification (optional but recommended)"),
 					"pr_url":          prop("string", "PR URL (completed)"),
@@ -163,7 +173,11 @@ func RegisterWorkerTools(s *Server, deps *Deps) {
 
 func handleListTasks(deps *Deps) ToolHandler {
 	return func(ctx context.Context, args map[string]any) (any, error) {
-		tasks, err := deps.Ledger.Load()
+		toolDeps, err := depsForArgs(deps, args)
+		if err != nil {
+			return nil, err
+		}
+		tasks, err := toolDeps.Ledger.Load()
 		if err != nil {
 			return nil, err
 		}
@@ -171,8 +185,27 @@ func handleListTasks(deps *Deps) ToolHandler {
 	}
 }
 
+func handleListProjects(deps *Deps) ToolHandler {
+	return func(ctx context.Context, args map[string]any) (any, error) {
+		if deps.Manager != nil {
+			return deps.Manager.Projects(), nil
+		}
+		if deps.Config == nil {
+			return nil, fmt.Errorf("config is not configured")
+		}
+		return []runtimepkg.ProjectInfo{{
+			Slug:     deps.Config.Project.Slug,
+			RepoPath: deps.Config.Project.RepoPath,
+		}}, nil
+	}
+}
+
 func handleCreateTask(deps *Deps) ToolHandler {
 	return func(ctx context.Context, args map[string]any) (any, error) {
+		toolDeps, err := depsForArgs(deps, args)
+		if err != nil {
+			return nil, err
+		}
 		title, err := stringArg(args, "title")
 		if err != nil {
 			return nil, err
@@ -200,7 +233,7 @@ func handleCreateTask(deps *Deps) ToolHandler {
 			ForbiddenFiles: forbiddenFiles,
 			Body:           description,
 		}
-		id, err := deps.Ledger.AddNew(t)
+		id, err := toolDeps.Ledger.AddNew(t)
 		if err != nil {
 			return nil, err
 		}
@@ -210,6 +243,10 @@ func handleCreateTask(deps *Deps) ToolHandler {
 
 func handleUpdateTask(deps *Deps) ToolHandler {
 	return func(ctx context.Context, args map[string]any) (any, error) {
+		toolDeps, err := depsForArgs(deps, args)
+		if err != nil {
+			return nil, err
+		}
 		id, err := stringArg(args, "id")
 		if err != nil {
 			return nil, err
@@ -250,7 +287,7 @@ func handleUpdateTask(deps *Deps) ToolHandler {
 		// Atomically reject updates to terminal tasks (completed, split) using
 		// UpdateIfStatuses so the status check and write are in the same mutex lock,
 		// preventing a concurrent transition from sneaking in between Load and Update.
-		return nil, deps.Ledger.UpdateIfStatuses(id,
+		return nil, toolDeps.Ledger.UpdateIfStatuses(id,
 			[]string{"unstarted", "in_progress", "blocked"},
 			fields)
 	}
@@ -258,6 +295,10 @@ func handleUpdateTask(deps *Deps) ToolHandler {
 
 func handleSplitTask(deps *Deps) ToolHandler {
 	return func(ctx context.Context, args map[string]any) (any, error) {
+		toolDeps, err := depsForArgs(deps, args)
+		if err != nil {
+			return nil, err
+		}
 		id, err := stringArg(args, "id")
 		if err != nil {
 			return nil, err
@@ -274,7 +315,7 @@ func handleSplitTask(deps *Deps) ToolHandler {
 			return nil, fmt.Errorf("slices must be a non-empty array")
 		}
 
-		tasks, err := deps.Ledger.Load()
+		tasks, err := toolDeps.Ledger.Load()
 		if err != nil {
 			return nil, err
 		}
@@ -333,7 +374,7 @@ func handleSplitTask(deps *Deps) ToolHandler {
 		}
 		// Generate all IDs in one read pass — loop GenerateID would return
 		// duplicate IDs because the IDs are not on-disk until AddAll.
-		childIDs, err := deps.Ledger.GenerateIDs(len(pending))
+		childIDs, err := toolDeps.Ledger.GenerateIDs(len(pending))
 		if err != nil {
 			return nil, err
 		}
@@ -362,7 +403,7 @@ func handleSplitTask(deps *Deps) ToolHandler {
 				Body:           c.desc,
 			}
 		}
-		if err := deps.Ledger.AddAll(childTasks); err != nil {
+		if err := toolDeps.Ledger.AddAll(childTasks); err != nil {
 			return nil, err
 		}
 
@@ -373,7 +414,7 @@ func handleSplitTask(deps *Deps) ToolHandler {
 		if original.Status == "in_progress" || original.Status == "blocked" {
 			allowedStatuses = []string{"in_progress", "blocked"}
 		}
-		prevTask, err := deps.Ledger.UpdateIfStatusesReturnPrev(id, allowedStatuses, map[string]any{
+		prevTask, err := toolDeps.Ledger.UpdateIfStatusesReturnPrev(id, allowedStatuses, map[string]any{
 			"status":    "split",
 			"reason":    reason,
 			"worker_id": "",
@@ -382,14 +423,14 @@ func handleSplitTask(deps *Deps) ToolHandler {
 		})
 		if err != nil {
 			// Roll back the children to avoid orphans on retry.
-			_ = deps.Ledger.DeleteTasks(childIDs)
+			_ = toolDeps.Ledger.DeleteTasks(childIDs)
 			return nil, err
 		}
 
 		// Clean up worker resources based on the actual previous status and
 		// worker_id/branch from the atomic snapshot, not the stale preflight read.
 		if prevTask.Status == "in_progress" || prevTask.Status == "blocked" {
-			stopWorkerCleanup(deps, prevTask.WorkerID, prevTask.Branch, id)
+			stopWorkerCleanup(toolDeps, prevTask.WorkerID, prevTask.Branch, id)
 		}
 
 		return map[string]any{"child_ids": childIDs}, nil
@@ -398,12 +439,16 @@ func handleSplitTask(deps *Deps) ToolHandler {
 
 func handleArchiveTask(deps *Deps) ToolHandler {
 	return func(ctx context.Context, args map[string]any) (any, error) {
+		toolDeps, err := depsForArgs(deps, args)
+		if err != nil {
+			return nil, err
+		}
 		id, err := stringArg(args, "id")
 		if err != nil {
 			return nil, err
 		}
 
-		tasks, err := deps.Ledger.Load()
+		tasks, err := toolDeps.Ledger.Load()
 		if err != nil {
 			return nil, err
 		}
@@ -415,12 +460,12 @@ func handleArchiveTask(deps *Deps) ToolHandler {
 			}
 		}
 		if t == nil {
-			archivedTask, archived, err := deps.Ledger.ArchivedTask(id)
+			archivedTask, archived, err := toolDeps.Ledger.ArchivedTask(id)
 			if err != nil {
 				return nil, err
 			}
 			if archived {
-				cleanupArchivedTaskResources(deps, id, archivedTask.Branch)
+				cleanupArchivedTaskResources(toolDeps, id, archivedTask.Branch)
 				return map[string]any{"archived": id}, nil
 			}
 			return nil, fmt.Errorf("task not found: %s", id)
@@ -432,11 +477,11 @@ func handleArchiveTask(deps *Deps) ToolHandler {
 		// Extract merge_commit from body comment.
 		mergeCommit := extractMergeCommit(t.Body)
 
-		if err := deps.Ledger.Archive(id, mergeCommit); err != nil {
+		if err := toolDeps.Ledger.Archive(id, mergeCommit); err != nil {
 			return nil, err
 		}
 
-		cleanupArchivedTaskResources(deps, id, t.Branch)
+		cleanupArchivedTaskResources(toolDeps, id, t.Branch)
 
 		return map[string]any{"archived": id}, nil
 	}
@@ -449,7 +494,7 @@ func handleListHarnesses(deps *Deps) ToolHandler {
 }
 
 func cleanupArchivedTaskResources(deps *Deps, taskID, branch string) {
-	workerID := "worker-" + taskID
+	workerID := workerIDFor(deps, taskID)
 	_ = tmux.KillWindow(deps.Session, workerID)
 	deps.Registry.Remove(workerID)
 	wPath := filepath.Join(deps.Config.Project.WorktreeBase,
@@ -479,6 +524,10 @@ func ensureWorkerTaskActive(l *ledger.Ledger, workerID string) error {
 
 func handleSpawnWorker(deps *Deps) ToolHandler {
 	return func(ctx context.Context, args map[string]any) (any, error) {
+		toolDeps, err := depsForArgs(deps, args)
+		if err != nil {
+			return nil, err
+		}
 		taskID, err := stringArg(args, "task_id")
 		if err != nil {
 			return nil, err
@@ -501,7 +550,7 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 		harnessName := optionalStringArg(args, "harness")
 
 		// Preflight checks.
-		tasks, err := deps.Ledger.Load()
+		tasks, err := toolDeps.Ledger.Load()
 		if err != nil {
 			return nil, err
 		}
@@ -531,7 +580,7 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 		}
 
 		// Resolve harness.
-		resolvedHarness, hCfg, err := harness.Resolve(deps.Config, harnessName)
+		resolvedHarness, hCfg, err := harness.Resolve(toolDeps.Config, harnessName)
 		if err != nil {
 			return nil, err
 		}
@@ -540,12 +589,12 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 		// Split the *template* before expanding {url}/{secret} so that the expanded
 		// values (which may contain spaces or other shell metacharacters) are treated
 		// as atomic tokens. Each token then has its placeholders substituted individually.
-		mcpTokens, err := buildMCPTokens(hCfg.McpArgs, deps.BaseURL+"/mcp/worker", deps.Config.Server.McpSecret)
+		mcpTokens, err := buildMCPTokens(hCfg.McpArgs, toolDeps.BaseURL+"/mcp/worker", toolDeps.Config.Server.McpSecret)
 		if err != nil {
 			return nil, fmt.Errorf("invalid mcp_args shell syntax: %w", err)
 		}
 
-		branchExists, err := gitBranchExists(deps.Config.Project.RepoPath, branch)
+		branchExists, err := gitBranchExists(toolDeps.Config.Project.RepoPath, branch)
 		if err != nil {
 			return nil, err
 		}
@@ -554,9 +603,9 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 		}
 
 		// Build paths.
-		repoPath := deps.Config.Project.RepoPath
-		worktreePath := filepath.Join(deps.Config.Project.WorktreeBase,
-			deps.Config.Project.Slug+"-"+taskID)
+		repoPath := toolDeps.Config.Project.RepoPath
+		worktreePath := filepath.Join(toolDeps.Config.Project.WorktreeBase,
+			toolDeps.Config.Project.Slug+"-"+taskID)
 
 		// Get current HEAD as base ref.
 		headOut, err := exec.Command("git", "-C", repoPath, "rev-parse", "HEAD").Output()
@@ -570,10 +619,10 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 			return nil, fmt.Errorf("create worktree: %w", err)
 		}
 
-		workerID := "worker-" + taskID
+		workerID := workerIDFor(toolDeps, taskID)
 
 		// Step 2: Create tmux window.
-		if err := tmux.CreateWindow(deps.Session, workerID, worktreePath); err != nil {
+		if err := tmux.CreateWindow(toolDeps.Session, workerID, worktreePath); err != nil {
 			_ = worktree.Remove(repoPath, worktreePath)
 			_ = exec.Command("git", "-C", repoPath, "branch", "-D", branch).Run()
 			return nil, fmt.Errorf("create tmux window: %w", err)
@@ -582,7 +631,7 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 		// Step 3: Update ledger — use UpdateIfStatus to reject concurrent
 		// modifications (e.g., a split_task that changed the status to "split"
 		// between our preflight check and this write).
-		updateErr := deps.Ledger.UpdateIfStatus(taskID, "unstarted", map[string]any{
+		updateErr := toolDeps.Ledger.UpdateIfStatus(taskID, "unstarted", map[string]any{
 			"status":          "in_progress",
 			"branch":          branch,
 			"worker_id":       workerID,
@@ -591,19 +640,19 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 			"forbidden_files": forbiddenFiles,
 		})
 		if updateErr != nil {
-			_ = tmux.KillWindow(deps.Session, workerID)
+			_ = tmux.KillWindow(toolDeps.Session, workerID)
 			_ = worktree.Remove(repoPath, worktreePath)
 			_ = exec.Command("git", "-C", repoPath, "branch", "-D", branch).Run()
 			return nil, fmt.Errorf("update ledger: %w", updateErr)
 		}
-		promptTask, err := loadTaskByID(deps.Ledger, taskID)
+		promptTask, err := loadTaskByID(toolDeps.Ledger, taskID)
 		if err != nil {
-			rollbackSpawnAfterLedgerUpdate(deps, workerID, branch, taskID, repoPath, worktreePath)
+			rollbackSpawnAfterLedgerUpdate(toolDeps, workerID, branch, taskID, repoPath, worktreePath)
 			return nil, fmt.Errorf("reload task after update: %w", err)
 		}
 
 		// Register worker.
-		deps.Registry.Register(worker.Info{
+		toolDeps.Registry.Register(worker.Info{
 			TaskID:    taskID,
 			WorkerID:  workerID,
 			Harness:   resolvedHarness,
@@ -614,21 +663,21 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 		// Rebuild the command by single-quoting each split token so that expanded
 		// URL/secret values with shell metacharacters are not interpreted by the shell.
 		harnessCmd := buildHarnessCommand(hCfg.Command, mcpTokens)
-		if err := tmux.SendKeys(deps.Session, workerID, harnessCmd); err != nil {
-			rollbackSpawnAfterLedgerUpdate(deps, workerID, branch, taskID, repoPath, worktreePath)
+		if err := tmux.SendKeys(toolDeps.Session, workerID, harnessCmd); err != nil {
+			rollbackSpawnAfterLedgerUpdate(toolDeps, workerID, branch, taskID, repoPath, worktreePath)
 			return nil, fmt.Errorf("send harness command: %w", err)
 		}
-		if err := waitForHarnessProcess(deps.Session, workerID, 2*time.Second); err != nil {
+		if err := waitForHarnessProcess(toolDeps.Session, workerID, 2*time.Second); err != nil {
 			log.Printf("warn: wait for harness process: %v", err)
 		}
 
 		// Step 5: Send task prompt (best-effort — worker is already running).
 		// If this fails, include prompt_sent:false in the response so the orchestrator
 		// knows to call followup_worker to deliver the task description.
-		prompt := buildWorkerPromptFromTask(promptTask, taskID, workerID, branch,
-			worktreePath, deps.Config.Project.ValidationCommand)
+		prompt := buildWorkerPromptFromTaskWithDeps(toolDeps, promptTask, taskID, workerID, branch,
+			worktreePath, toolDeps.Config.Project.ValidationCommand)
 		promptSent := true
-		if err := tmux.SendKeys(deps.Session, workerID, prompt); err != nil {
+		if err := tmux.SendKeys(toolDeps.Session, workerID, prompt); err != nil {
 			log.Printf("warn: send task prompt: %v", err)
 			promptSent = false
 		}
@@ -643,6 +692,10 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 
 func handleStopWorker(deps *Deps) ToolHandler {
 	return func(ctx context.Context, args map[string]any) (any, error) {
+		toolDeps, err := depsForArgs(deps, args)
+		if err != nil {
+			return nil, err
+		}
 		workerID, err := stringArg(args, "worker_id")
 		if err != nil {
 			return nil, err
@@ -651,11 +704,11 @@ func handleStopWorker(deps *Deps) ToolHandler {
 		// Find task in registry or ledger.
 		// Always load branch from the ledger: the registry does not store it.
 		var taskID string
-		if info, ok := deps.Registry.Get(workerID); ok {
+		if info, ok := toolDeps.Registry.Get(workerID); ok {
 			taskID = info.TaskID
 		}
 		// Ledger search fills taskID as fallback when not in registry.
-		tasks, err := deps.Ledger.Load()
+		tasks, err := toolDeps.Ledger.Load()
 		if err != nil {
 			return nil, err
 		}
@@ -672,7 +725,7 @@ func handleStopWorker(deps *Deps) ToolHandler {
 		// error so the caller knows the ID was wrong. Best-effort kill the tmux
 		// window in case it exists as an orphan.
 		if taskID == "" {
-			_ = tmux.KillWindow(deps.Session, workerID)
+			_ = tmux.KillWindow(toolDeps.Session, workerID)
 			return nil, fmt.Errorf("worker %q not found in registry or ledger", workerID)
 		}
 
@@ -680,7 +733,7 @@ func handleStopWorker(deps *Deps) ToolHandler {
 		// Reject if the task is already terminal to prevent overwriting
 		// "completed" or "split" tasks back to "unstarted" in a narrow race
 		// with notify(completed) or split_request cleanup.
-		prevTask, err := deps.Ledger.UpdateIfStatusesReturnPrev(taskID,
+		prevTask, err := toolDeps.Ledger.UpdateIfStatusesReturnPrev(taskID,
 			[]string{"in_progress", "blocked", "unstarted"},
 			map[string]any{
 				"status":    "unstarted",
@@ -696,7 +749,7 @@ func handleStopWorker(deps *Deps) ToolHandler {
 		if cleanupWorkerID == "" {
 			cleanupWorkerID = workerID
 		}
-		stopWorkerCleanup(deps, cleanupWorkerID, prevTask.Branch, taskID)
+		stopWorkerCleanup(toolDeps, cleanupWorkerID, prevTask.Branch, taskID)
 
 		return map[string]any{"stopped": workerID}, nil
 	}
@@ -704,6 +757,10 @@ func handleStopWorker(deps *Deps) ToolHandler {
 
 func handleFollowupWorker(deps *Deps) ToolHandler {
 	return func(ctx context.Context, args map[string]any) (any, error) {
+		toolDeps, err := depsForArgs(deps, args)
+		if err != nil {
+			return nil, err
+		}
 		workerID, err := stringArg(args, "worker_id")
 		if err != nil {
 			return nil, err
@@ -713,24 +770,24 @@ func handleFollowupWorker(deps *Deps) ToolHandler {
 			return nil, err
 		}
 
-		if err := ensureWorkerTaskActive(deps.Ledger, workerID); err != nil {
+		if err := ensureWorkerTaskActive(toolDeps.Ledger, workerID); err != nil {
 			return nil, err
 		}
 
 		// Verify window exists.
 		windowName := workerID
-		alive, err := tmux.IsWindowAlive(deps.Session, windowName)
+		alive, err := tmux.IsWindowAlive(toolDeps.Session, windowName)
 		if err != nil {
 			return nil, fmt.Errorf("check window: %w", err)
 		}
 		if !alive {
 			return nil, fmt.Errorf("tmux window %q does not exist", windowName)
 		}
-		if err := ensureWorkerTaskActive(deps.Ledger, workerID); err != nil {
+		if err := ensureWorkerTaskActive(toolDeps.Ledger, workerID); err != nil {
 			return nil, err
 		}
 
-		if err := tmux.SendKeys(deps.Session, windowName, message); err != nil {
+		if err := tmux.SendKeys(toolDeps.Session, windowName, message); err != nil {
 			return nil, fmt.Errorf("send keys: %w", err)
 		}
 		return map[string]any{"sent": true}, nil
@@ -739,6 +796,10 @@ func handleFollowupWorker(deps *Deps) ToolHandler {
 
 func handleGetPRStatus(deps *Deps) ToolHandler {
 	return func(ctx context.Context, args map[string]any) (any, error) {
+		toolDeps, err := depsForArgs(deps, args)
+		if err != nil {
+			return nil, err
+		}
 		prNumber, err := intArg(args, "pr_number")
 		if err != nil {
 			return nil, err
@@ -747,10 +808,10 @@ func handleGetPRStatus(deps *Deps) ToolHandler {
 		if prNumber <= 0 {
 			return nil, fmt.Errorf("pr_number must be a positive integer")
 		}
-		if deps.GitHub == nil {
+		if toolDeps.GitHub == nil {
 			return nil, fmt.Errorf("github.token, github.owner, and github.repo must be configured")
 		}
-		return deps.GitHub.GetPRStatus(ctx, prNumber)
+		return toolDeps.GitHub.GetPRStatus(ctx, prNumber)
 	}
 }
 
@@ -769,6 +830,10 @@ func handleNotify(deps *Deps) ToolHandler {
 		if !ok {
 			return nil, fmt.Errorf("payload must be an object")
 		}
+		toolDeps, err := depsForPayload(deps, payload)
+		if err != nil {
+			return nil, err
+		}
 
 		taskID, err := stringArg(payload, "task_id")
 		if err != nil {
@@ -780,7 +845,7 @@ func handleNotify(deps *Deps) ToolHandler {
 		// ownership check preventing a buggy worker from notifying sibling tasks.
 		callerWorkerID := optionalStringArg(payload, "worker_id")
 
-		tasks, err := deps.Ledger.Load()
+		tasks, err := toolDeps.Ledger.Load()
 		if err != nil {
 			return nil, err
 		}
@@ -818,7 +883,7 @@ func handleNotify(deps *Deps) ToolHandler {
 			prURL, _ := payload["pr_url"].(string)
 			mergeCommit, _ := payload["merge_commit"].(string)
 
-			prevTask, err := deps.Ledger.UpdateIfStatusesReturnPrevWith(taskID, []string{"in_progress", "blocked"},
+			prevTask, err := toolDeps.Ledger.UpdateIfStatusesReturnPrevWith(taskID, []string{"in_progress", "blocked"},
 				func(current ledger.Task) (map[string]any, error) {
 					if callerWorkerID != "" && current.WorkerID != callerWorkerID {
 						return nil, fmt.Errorf("worker %q is not assigned to task %s (assigned to %q)",
@@ -854,17 +919,17 @@ func handleNotify(deps *Deps) ToolHandler {
 			// design for completed tasks.
 			wid := prevTask.WorkerID
 			if wid == "" {
-				wid = "worker-" + taskID // fallback
+				wid = workerIDFor(toolDeps, taskID) // fallback
 			}
-			_ = tmux.KillWindow(deps.Session, wid)
-			_ = worktree.Remove(deps.Config.Project.RepoPath,
-				filepath.Join(deps.Config.Project.WorktreeBase,
-					deps.Config.Project.Slug+"-"+taskID))
-			deps.Registry.Remove(wid)
+			_ = tmux.KillWindow(toolDeps.Session, wid)
+			_ = worktree.Remove(toolDeps.Config.Project.RepoPath,
+				filepath.Join(toolDeps.Config.Project.WorktreeBase,
+					toolDeps.Config.Project.Slug+"-"+taskID))
+			toolDeps.Registry.Remove(wid)
 
 		case "blocked":
 			reason, _ := payload["reason"].(string)
-			if _, err := deps.Ledger.UpdateIfStatusesReturnPrevWith(taskID, []string{"in_progress", "blocked"},
+			if _, err := toolDeps.Ledger.UpdateIfStatusesReturnPrevWith(taskID, []string{"in_progress", "blocked"},
 				func(current ledger.Task) (map[string]any, error) {
 					if callerWorkerID != "" && current.WorkerID != callerWorkerID {
 						return nil, fmt.Errorf("worker %q is not assigned to task %s (assigned to %q)",
@@ -922,7 +987,7 @@ func handleNotify(deps *Deps) ToolHandler {
 			}
 			// Generate all IDs in one read pass (loop GenerateID returns duplicates
 			// since IDs are not on-disk yet).
-			srIDs, err := deps.Ledger.GenerateIDs(len(pendingSRs))
+			srIDs, err := toolDeps.Ledger.GenerateIDs(len(pendingSRs))
 			if err != nil {
 				return nil, err
 			}
@@ -948,7 +1013,7 @@ func handleNotify(deps *Deps) ToolHandler {
 					Body:           c.desc,
 				}
 			}
-			if err := deps.Ledger.AddAll(childTasks); err != nil {
+			if err := toolDeps.Ledger.AddAll(childTasks); err != nil {
 				return nil, err
 			}
 
@@ -957,7 +1022,7 @@ func handleNotify(deps *Deps) ToolHandler {
 			for i, c := range srChildren {
 				srChildIDs[i] = c.id
 			}
-			prevTask, updateErr := deps.Ledger.UpdateIfStatusesReturnPrevWith(taskID, []string{"in_progress", "blocked"},
+			prevTask, updateErr := toolDeps.Ledger.UpdateIfStatusesReturnPrevWith(taskID, []string{"in_progress", "blocked"},
 				func(current ledger.Task) (map[string]any, error) {
 					if callerWorkerID != "" && current.WorkerID != callerWorkerID {
 						return nil, fmt.Errorf("worker %q is not assigned to task %s (assigned to %q)",
@@ -973,7 +1038,7 @@ func handleNotify(deps *Deps) ToolHandler {
 				},
 			)
 			if updateErr != nil {
-				_ = deps.Ledger.DeleteTasks(srChildIDs)
+				_ = toolDeps.Ledger.DeleteTasks(srChildIDs)
 				return nil, updateErr
 			}
 
@@ -982,17 +1047,17 @@ func handleNotify(deps *Deps) ToolHandler {
 			// between the initial load and UpdateReturnPrev is handled correctly.
 			wid := prevTask.WorkerID
 			if wid == "" {
-				wid = "worker-" + taskID
+				wid = workerIDFor(toolDeps, taskID)
 			}
-			_ = tmux.KillWindow(deps.Session, wid)
-			_ = worktree.Remove(deps.Config.Project.RepoPath,
-				filepath.Join(deps.Config.Project.WorktreeBase,
-					deps.Config.Project.Slug+"-"+taskID))
+			_ = tmux.KillWindow(toolDeps.Session, wid)
+			_ = worktree.Remove(toolDeps.Config.Project.RepoPath,
+				filepath.Join(toolDeps.Config.Project.WorktreeBase,
+					toolDeps.Config.Project.Slug+"-"+taskID))
 			if prevTask.Branch != "" {
-				_ = exec.Command("git", "-C", deps.Config.Project.RepoPath,
+				_ = exec.Command("git", "-C", toolDeps.Config.Project.RepoPath,
 					"branch", "-D", prevTask.Branch).Run()
 			}
-			deps.Registry.Remove(wid)
+			toolDeps.Registry.Remove(wid)
 
 		}
 
@@ -1001,6 +1066,60 @@ func handleNotify(deps *Deps) ToolHandler {
 }
 
 // ---- helpers ----
+
+func projectProps(props map[string]any) map[string]any {
+	if props == nil {
+		props = make(map[string]any)
+	}
+	props["project_slug"] = prop("string", "Project slug")
+	return props
+}
+
+func depsForArgs(deps *Deps, args map[string]any) (*Deps, error) {
+	if deps.Manager == nil {
+		return deps, nil
+	}
+	slug, err := stringArg(args, "project_slug")
+	if err != nil {
+		return nil, err
+	}
+	return depsForProject(deps, slug)
+}
+
+func depsForPayload(deps *Deps, payload map[string]any) (*Deps, error) {
+	if deps.Manager == nil {
+		return deps, nil
+	}
+	slug, err := stringArg(payload, "project_slug")
+	if err != nil {
+		return nil, err
+	}
+	return depsForProject(deps, slug)
+}
+
+func depsForProject(deps *Deps, slug string) (*Deps, error) {
+	project, err := deps.Manager.Project(slug)
+	if err != nil {
+		return nil, err
+	}
+	return &Deps{
+		Ledger:      project.Ledger,
+		Registry:    project.Registry,
+		Config:      project.Config,
+		GitHub:      project.GitHub,
+		Session:     project.Session,
+		BaseURL:     project.BaseURL,
+		Manager:     deps.Manager,
+		ProjectSlug: project.Slug,
+	}, nil
+}
+
+func workerIDFor(deps *Deps, taskID string) string {
+	if deps.ProjectSlug != "" {
+		return deps.ProjectSlug + "-worker-" + taskID
+	}
+	return "worker-" + taskID
+}
 
 // stopWorkerCleanup is best-effort cleanup: it kills the tmux window,
 // removes the worktree, deletes the git branch, and evicts the registry entry.
@@ -1138,17 +1257,28 @@ func waitForHarnessProcess(session, window string, timeout time.Duration) error 
 }
 
 func buildWorkerPromptFromTask(task *ledger.Task, taskID, workerID, branch, worktreePath, validationCmd string) string {
-	return buildWorkerPrompt(task, taskID, workerID, branch, task.AllowedFiles, task.ForbiddenFiles,
+	return buildWorkerPromptWithDeps(nil, task, taskID, workerID, branch, task.AllowedFiles, task.ForbiddenFiles,
 		worktreePath, validationCmd)
 }
 
-// buildWorkerPrompt constructs the stdin prompt sent to the worker harness.
-// workerID is included so the worker can pass it in notify payloads for
-// ownership verification by the server.
+func buildWorkerPromptFromTaskWithDeps(deps *Deps, task *ledger.Task, taskID, workerID, branch, worktreePath, validationCmd string) string {
+	return buildWorkerPromptWithDeps(deps, task, taskID, workerID, branch, task.AllowedFiles, task.ForbiddenFiles,
+		worktreePath, validationCmd)
+}
+
 func buildWorkerPrompt(task *ledger.Task, taskID, workerID, branch string, allowedFiles, forbiddenFiles []string,
+	worktreePath, validationCmd string) string {
+	return buildWorkerPromptWithDeps(nil, task, taskID, workerID, branch, allowedFiles, forbiddenFiles,
+		worktreePath, validationCmd)
+}
+
+func buildWorkerPromptWithDeps(deps *Deps, task *ledger.Task, taskID, workerID, branch string, allowedFiles, forbiddenFiles []string,
 	worktreePath, validationCmd string) string {
 	var sb strings.Builder
 	sb.WriteString("You are a Worker agent. Complete the following task:\n\n")
+	if deps != nil && deps.ProjectSlug != "" {
+		sb.WriteString("Project slug: " + deps.ProjectSlug + "\n")
+	}
 	sb.WriteString("Task ID: " + taskID + "\n")
 	sb.WriteString("Worker ID: " + workerID + "\n")
 	sb.WriteString("Title: " + task.Title + "\n")
@@ -1176,9 +1306,10 @@ Instructions:
 - Do not edit any forbidden_files.
 - Implement the task, validate, self-review, create a PR, and merge it.
 - Always include your worker_id in notify payloads for ownership verification.
-- When complete: call notify(type="completed", payload={task_id, worker_id, pr_url, merge_commit}).
-- If blocked: call notify(type="blocked", payload={task_id, worker_id, reason}).
-- If you need to split: call notify(type="split_request", payload={task_id, worker_id, reason, proposed_slices}).
+- Always include project_slug in notify payloads when it is present above.
+- When complete: call notify(type="completed", payload={project_slug, task_id, worker_id, pr_url, merge_commit}).
+- If blocked: call notify(type="blocked", payload={project_slug, task_id, worker_id, reason}).
+- If you need to split: call notify(type="split_request", payload={project_slug, task_id, worker_id, reason, proposed_slices}).
 `)
 	return sb.String()
 }

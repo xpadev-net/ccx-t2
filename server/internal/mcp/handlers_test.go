@@ -7,10 +7,12 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	shellquote "github.com/kballard/go-shellquote"
 	"github.com/xpadev/ccx-t2/internal/config"
 	"github.com/xpadev/ccx-t2/internal/ledger"
+	runtimepkg "github.com/xpadev/ccx-t2/internal/runtime"
 	"github.com/xpadev/ccx-t2/internal/worker"
 )
 
@@ -105,6 +107,66 @@ func TestBuildWorkerPromptFromTaskUsesTaskRestrictions(t *testing.T) {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("prompt does not contain %q:\n%s", want, prompt)
 		}
+	}
+}
+
+func TestProjectScopedListTasksUsesSelectedProject(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.Config{
+		Server:  config.ServerConfig{Port: 8080},
+		Runtime: config.RuntimeConfig{TmuxSession: "ccx-test", WorktreeBase: filepath.Join(dir, "worktrees")},
+		Orchestrator: config.OrchestratorConfig{
+			Harness:           "sh",
+			HeartbeatInterval: time.Minute,
+			Timeout:           time.Minute,
+		},
+		WorkerHarnesses: []string{"sh"},
+		Harnesses: map[string]config.HarnessConfig{
+			"sh": {Command: "sh", McpArgs: "--mcp-url {url}"},
+		},
+		Projects: map[string]config.ProjectConfig{
+			"alpha": {
+				RepoPath:     filepath.Join(dir, "alpha"),
+				LedgerPath:   filepath.Join(dir, "alpha", "tasks", "ledger.md"),
+				WorktreeBase: filepath.Join(dir, "worktrees"),
+			},
+			"beta": {
+				RepoPath:     filepath.Join(dir, "beta"),
+				LedgerPath:   filepath.Join(dir, "beta", "tasks", "ledger.md"),
+				WorktreeBase: filepath.Join(dir, "worktrees"),
+			},
+		},
+	}
+	if err := config.Prepare(cfg); err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	manager, err := runtimepkg.NewManager(cfg, "http://127.0.0.1:8080")
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	beta, err := manager.Project("beta")
+	if err != nil {
+		t.Fatalf("Project beta: %v", err)
+	}
+	if err := beta.Ledger.Add(ledger.Task{ID: "task-20260101-0001", Title: "Beta", Status: "unstarted"}); err != nil {
+		t.Fatalf("Add beta: %v", err)
+	}
+
+	result, err := handleListTasks(&Deps{Config: cfg, Manager: manager})(context.Background(), map[string]any{
+		"project_slug": "beta",
+	})
+	if err != nil {
+		t.Fatalf("handleListTasks: %v", err)
+	}
+	tasks := result.([]ledger.Task)
+	if len(tasks) != 1 || tasks[0].Title != "Beta" {
+		t.Fatalf("tasks = %#v, want beta task", tasks)
+	}
+
+	if _, err := handleListTasks(&Deps{Config: cfg, Manager: manager})(context.Background(), map[string]any{
+		"project_slug": "missing",
+	}); err == nil {
+		t.Fatal("handleListTasks missing project error = nil")
 	}
 }
 

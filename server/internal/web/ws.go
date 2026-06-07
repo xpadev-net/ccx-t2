@@ -47,6 +47,13 @@ func (s *Server) handleWorkerLogWS(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "tmux session is not configured")
 		return
 	}
+	session := s.tmuxSession
+	if session == "" {
+		session = cfg.Runtime.TmuxSession
+	}
+	if session == "" {
+		session = cfg.Project.Slug
+	}
 	if !s.reserveWorkerStream(window) {
 		writeError(w, http.StatusConflict, "worker log stream already open")
 		return
@@ -57,7 +64,7 @@ func (s *Server) handleWorkerLogWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.Close()
-	lines, cleanup, err := s.pipeOutput(cfg.Project.Slug, window)
+	lines, cleanup, err := s.pipeOutput(session, window)
 	if err != nil {
 		_ = writeWSJSON(conn, wsMessage{Type: "error", Data: "open worker log stream"})
 		return
@@ -81,6 +88,35 @@ func (s *Server) handleWorkerLogWS(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+}
+
+func (s *Server) handleProjectWS(w http.ResponseWriter, r *http.Request) {
+	rest := strings.TrimPrefix(r.URL.Path, "/ws/projects/")
+	parts := strings.Split(rest, "/")
+	if len(parts) < 2 || parts[0] == "" {
+		writeError(w, http.StatusNotFound, "project websocket route not found")
+		return
+	}
+	projectServer, err := s.projectServer(parts[0])
+	if err != nil {
+		writeError(w, http.StatusNotFound, "project not found")
+		return
+	}
+	switch parts[1] {
+	case "ledger":
+		if len(parts) == 2 {
+			projectServer.handleLedgerWS(w, r)
+			return
+		}
+	case "worker":
+		if len(parts) == 3 {
+			r2 := r.Clone(r.Context())
+			r2.URL.Path = "/ws/worker/" + parts[2]
+			projectServer.handleWorkerLogWS(w, r2)
+			return
+		}
+	}
+	writeError(w, http.StatusNotFound, "project websocket route not found")
 }
 
 func (s *Server) handleLedgerWS(w http.ResponseWriter, r *http.Request) {

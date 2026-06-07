@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -22,16 +23,25 @@ type HarnessConfig struct {
 
 // ProjectConfig holds project-level settings.
 type ProjectConfig struct {
-	Slug              string `yaml:"slug"`
-	RepoPath          string `yaml:"repo_path"`
-	WorktreeBase      string `yaml:"worktree_base"`
-	ValidationCommand string `yaml:"validation_command"`
+	Slug              string             `yaml:"slug"`
+	RepoPath          string             `yaml:"repo_path"`
+	WorktreeBase      string             `yaml:"worktree_base"`
+	LedgerPath        string             `yaml:"ledger_path,omitempty"`
+	ValidationCommand string             `yaml:"validation_command"`
+	Orchestrator      OrchestratorConfig `yaml:"orchestrator,omitempty"`
+	GitHub            GitHubConfig       `yaml:"github,omitempty"`
 }
 
 // ServerConfig holds HTTP server settings.
 type ServerConfig struct {
 	Port      int    `yaml:"port"`
 	McpSecret string `yaml:"mcp_secret"` // optional Bearer token for MCP endpoints
+}
+
+// RuntimeConfig holds process-wide runtime settings.
+type RuntimeConfig struct {
+	TmuxSession  string `yaml:"tmux_session"`
+	WorktreeBase string `yaml:"worktree_base"`
 }
 
 // OrchestratorConfig holds Orchestrator settings.
@@ -52,10 +62,12 @@ type GitHubConfig struct {
 type Config struct {
 	Project         ProjectConfig            `yaml:"project"`
 	Server          ServerConfig             `yaml:"server"`
+	Runtime         RuntimeConfig            `yaml:"runtime"`
 	Orchestrator    OrchestratorConfig       `yaml:"orchestrator"`
 	WorkerHarnesses []string                 `yaml:"worker_harnesses"`
 	Harnesses       map[string]HarnessConfig `yaml:"harnesses"`
 	GitHub          GitHubConfig             `yaml:"github"`
+	Projects        map[string]ProjectConfig `yaml:"projects"`
 }
 
 // Load reads and validates the config from the given file path.
@@ -123,6 +135,7 @@ func Save(path string, cfg *Config) error {
 func Prepare(cfg *Config) error {
 	expandEnv(cfg)
 	applyDefaults(cfg)
+	normalizeProjects(cfg)
 
 	if err := validate(cfg); err != nil {
 		return err
@@ -140,6 +153,10 @@ func Clone(cfg *Config) *Config {
 	out.Harnesses = make(map[string]HarnessConfig, len(cfg.Harnesses))
 	for name, h := range cfg.Harnesses {
 		out.Harnesses[name] = h
+	}
+	out.Projects = make(map[string]ProjectConfig, len(cfg.Projects))
+	for slug, project := range cfg.Projects {
+		out.Projects[slug] = project
 	}
 	return &out
 }
@@ -170,7 +187,14 @@ func expandEnv(cfg *Config) {
 	cfg.Project.Slug = expand(cfg.Project.Slug)
 	cfg.Project.RepoPath = expand(cfg.Project.RepoPath)
 	cfg.Project.WorktreeBase = expand(cfg.Project.WorktreeBase)
+	cfg.Project.LedgerPath = expand(cfg.Project.LedgerPath)
 	cfg.Project.ValidationCommand = expand(cfg.Project.ValidationCommand)
+	cfg.Project.Orchestrator.Harness = expand(cfg.Project.Orchestrator.Harness)
+	cfg.Project.GitHub.Token = expand(cfg.Project.GitHub.Token)
+	cfg.Project.GitHub.Owner = expand(cfg.Project.GitHub.Owner)
+	cfg.Project.GitHub.Repo = expand(cfg.Project.GitHub.Repo)
+	cfg.Runtime.TmuxSession = expand(cfg.Runtime.TmuxSession)
+	cfg.Runtime.WorktreeBase = expand(cfg.Runtime.WorktreeBase)
 	cfg.Orchestrator.Harness = expand(cfg.Orchestrator.Harness)
 	cfg.GitHub.Token = expand(cfg.GitHub.Token)
 	cfg.GitHub.Owner = expand(cfg.GitHub.Owner)
@@ -185,12 +209,27 @@ func expandEnv(cfg *Config) {
 		h.McpArgs = expand(h.McpArgs)
 		cfg.Harnesses[name] = h
 	}
+	for slug, project := range cfg.Projects {
+		project.Slug = expand(project.Slug)
+		project.RepoPath = expand(project.RepoPath)
+		project.WorktreeBase = expand(project.WorktreeBase)
+		project.LedgerPath = expand(project.LedgerPath)
+		project.ValidationCommand = expand(project.ValidationCommand)
+		project.Orchestrator.Harness = expand(project.Orchestrator.Harness)
+		project.GitHub.Token = expand(project.GitHub.Token)
+		project.GitHub.Owner = expand(project.GitHub.Owner)
+		project.GitHub.Repo = expand(project.GitHub.Repo)
+		cfg.Projects[slug] = project
+	}
 }
 
 // applyDefaults sets default values for optional fields.
 func applyDefaults(cfg *Config) {
 	if cfg.Server.Port == 0 {
 		cfg.Server.Port = 8080
+	}
+	if cfg.Runtime.TmuxSession == "" {
+		cfg.Runtime.TmuxSession = "ccx-t2"
 	}
 	if cfg.Orchestrator.HeartbeatInterval == 0 {
 		cfg.Orchestrator.HeartbeatInterval = 60 * time.Second
@@ -200,23 +239,67 @@ func applyDefaults(cfg *Config) {
 	}
 }
 
+func normalizeProjects(cfg *Config) {
+	if cfg.Projects == nil {
+		cfg.Projects = make(map[string]ProjectConfig)
+	}
+	if len(cfg.Projects) == 0 && strings.TrimSpace(cfg.Project.Slug) != "" {
+		project := cfg.Project
+		if project.GitHub == (GitHubConfig{}) {
+			project.GitHub = cfg.GitHub
+		}
+		if project.Orchestrator == (OrchestratorConfig{}) {
+			project.Orchestrator = cfg.Orchestrator
+		}
+		cfg.Projects[project.Slug] = project
+	}
+	for slug, project := range cfg.Projects {
+		if project.Slug == "" {
+			project.Slug = slug
+		}
+		if project.WorktreeBase == "" {
+			project.WorktreeBase = cfg.Runtime.WorktreeBase
+		}
+		if project.LedgerPath == "" && project.RepoPath != "" {
+			project.LedgerPath = filepath.Join(project.RepoPath, "tasks", "ledger.md")
+		}
+		if project.Orchestrator.Harness == "" {
+			project.Orchestrator.Harness = cfg.Orchestrator.Harness
+		}
+		if project.Orchestrator.HeartbeatInterval == 0 {
+			project.Orchestrator.HeartbeatInterval = cfg.Orchestrator.HeartbeatInterval
+		}
+		if project.Orchestrator.Timeout == 0 {
+			project.Orchestrator.Timeout = cfg.Orchestrator.Timeout
+		}
+		if project.GitHub == (GitHubConfig{}) {
+			project.GitHub = cfg.GitHub
+		}
+		cfg.Projects[slug] = project
+	}
+	if cfg.Project.Slug == "" && len(cfg.Projects) > 0 {
+		slugs := make([]string, 0, len(cfg.Projects))
+		for slug := range cfg.Projects {
+			slugs = append(slugs, slug)
+		}
+		sort.Strings(slugs)
+		project := cfg.Projects[slugs[0]]
+		project.Slug = slugs[0]
+		cfg.Project = project
+		cfg.GitHub = project.GitHub
+	}
+}
+
 // validate checks required fields and harness configuration.
 func validate(cfg *Config) error {
-	// Check required string fields in a deterministic order.
-	type requiredField struct{ name, val string }
-	for _, f := range []requiredField{
-		{"project.slug", cfg.Project.Slug},
-		{"project.repo_path", cfg.Project.RepoPath},
-		{"project.worktree_base", cfg.Project.WorktreeBase},
-		{"orchestrator.harness", cfg.Orchestrator.Harness},
-	} {
-		if strings.TrimSpace(f.val) == "" {
-			return fmt.Errorf("config: required field %q is empty", f.name)
-		}
-	}
-
 	if cfg.Server.Port < 1 || cfg.Server.Port > 65535 {
 		return fmt.Errorf("config: server.port %d out of range [1, 65535]", cfg.Server.Port)
+	}
+	if strings.TrimSpace(cfg.Runtime.TmuxSession) == "" {
+		return fmt.Errorf("config: required field %q is empty", "runtime.tmux_session")
+	}
+	if strings.TrimSpace(cfg.Runtime.WorktreeBase) == "" && strings.TrimSpace(cfg.Project.WorktreeBase) != "" {
+		cfg.Runtime.WorktreeBase = cfg.Project.WorktreeBase
 	}
 	if cfg.Orchestrator.HeartbeatInterval <= 0 {
 		return fmt.Errorf("config: orchestrator.heartbeat_interval must be positive")
@@ -227,6 +310,9 @@ func validate(cfg *Config) error {
 
 	if len(cfg.WorkerHarnesses) == 0 {
 		return fmt.Errorf("config: worker_harnesses must have at least one entry")
+	}
+	if len(cfg.Projects) == 0 {
+		return fmt.Errorf("config: projects must have at least one entry")
 	}
 
 	// Validate orchestrator harness.
@@ -240,8 +326,50 @@ func validate(cfg *Config) error {
 			return fmt.Errorf("config: worker harness %q: %w", name, err)
 		}
 	}
+	for slug, project := range cfg.Projects {
+		if strings.TrimSpace(slug) == "" {
+			return fmt.Errorf("config: project slug cannot be empty")
+		}
+		for _, f := range []struct{ name, val string }{
+			{"projects." + slug + ".repo_path", project.RepoPath},
+			{"projects." + slug + ".worktree_base", project.WorktreeBase},
+			{"projects." + slug + ".ledger_path", project.LedgerPath},
+			{"projects." + slug + ".orchestrator.harness", project.Orchestrator.Harness},
+		} {
+			if strings.TrimSpace(f.val) == "" {
+				return fmt.Errorf("config: required field %q is empty", f.name)
+			}
+		}
+		if project.Orchestrator.HeartbeatInterval <= 0 {
+			return fmt.Errorf("config: projects.%s.orchestrator.heartbeat_interval must be positive", slug)
+		}
+		if project.Orchestrator.Timeout <= 0 {
+			return fmt.Errorf("config: projects.%s.orchestrator.timeout must be positive", slug)
+		}
+		if err := validateHarness(cfg, project.Orchestrator.Harness, true); err != nil {
+			return fmt.Errorf("config: project %q orchestrator harness %q: %w", slug, project.Orchestrator.Harness, err)
+		}
+	}
 
 	return nil
+}
+
+// Project returns a project-scoped copy of cfg. Shared harness/server/runtime
+// settings are preserved while Project, Orchestrator, and GitHub are resolved
+// for the requested project.
+func Project(cfg *Config, slug string) (*Config, bool) {
+	if cfg == nil {
+		return nil, false
+	}
+	project, ok := cfg.Projects[slug]
+	if !ok {
+		return nil, false
+	}
+	out := Clone(cfg)
+	out.Project = project
+	out.Orchestrator = project.Orchestrator
+	out.GitHub = project.GitHub
+	return out, true
 }
 
 func validateHarness(cfg *Config, name string, checkBinary bool) error {
