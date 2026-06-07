@@ -238,6 +238,8 @@ Worker からのイベントを直列に処理し、Orchestrator を適切なタ
   - `GET /api/projects` — 登録済みプロジェクト一覧
   - `GET /api/projects/:slug/tasks` — 対象プロジェクトの台帳一覧
   - `POST /api/projects/:slug/tasks` — タスク追加（対象プロジェクトの Orchestrator にトリガー）
+    - `request` または `body` のみの自然文 intake を許可し、仮タイトル `Natural language intake` で台帳へ保存する
+    - Orchestrator プロンプトは、allowed_files なしの自然文 intake を worker-ready とみなさず、調査後に update/create/split/archive 系 MCP ツールで調査結果・実装範囲・禁止範囲・検証方法またはブロッカーを台帳へ残すよう指示する
   - `PATCH /api/projects/:slug/tasks/:id` — タスク更新
   - `DELETE /api/projects/:slug/tasks/:id` — タスク削除（in_progress の場合は stop_worker・worktree 削除を連動）
   - `GET /api/projects/:slug/workers` — 対象プロジェクトの Worker 一覧（内部 Worker レジストリから返す。tmux ウィンドウ一覧と同期）
@@ -258,7 +260,7 @@ Worker からのイベントを直列に処理し、Orchestrator を適切なタ
 - 画面構成
   - プロジェクト切り替え
   - タスク台帳ビュー（一覧・編集・削除）
-  - タスク追加フォーム（自然言語入力 → Orchestrator 経由）
+  - タスク追加フォーム（自然言語入力 → 既存の `POST /api/projects/:slug/tasks` / `POST /api/tasks` 経由で Orchestrator へトリガー。backend が `body` のみの入力を intake として扱うため、追加 UI redesign は不要）
   - Orchestrator console（ログストリーミング）
   - Worker ダッシュボード（ログストリーミング・followup 送信）
   - グローバル設定画面（harness と project 登録）

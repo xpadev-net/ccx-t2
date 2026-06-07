@@ -252,6 +252,40 @@ func TestTriggerIncludesCompletedTasksForArchiveDecision(t *testing.T) {
 	}
 }
 
+func TestTriggerInstructsOrchestratorToInvestigateNaturalLanguageIntake(t *testing.T) {
+	l, cfg := newTestDeps(t)
+	if err := l.Add(ledger.Task{
+		ID:     "task-001",
+		Title:  "Natural language intake",
+		Status: "unstarted",
+		Body:   "Please make task intake work from a plain chat message.",
+	}); err != nil {
+		t.Fatalf("Add intake task: %v", err)
+	}
+	fake := &fakeTmux{idle: true}
+	o := New(l, cfg, "proj", "http://localhost:8080")
+	o.tmux = fake
+
+	if err := o.Trigger(context.Background(), "task created: task-001"); err != nil {
+		t.Fatalf("Trigger: %v", err)
+	}
+
+	fake.mu.Lock()
+	prompt := fake.prompts[0]
+	fake.mu.Unlock()
+	for _, want := range []string{
+		"Natural-language intake tasks may contain only a free-form request",
+		"Treat them as investigation requests, not worker-ready implementation tasks",
+		"record research findings, implementation scope, forbidden scope, and validation method",
+		"If the request is ambiguous or unsafe, do not guess",
+		`"body": "Please make task intake work from a plain chat message."`,
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt does not contain %q:\n%s", want, prompt)
+		}
+	}
+}
+
 func TestTriggerQueuesWhileWindowActiveAndDrainsAfterIdle(t *testing.T) {
 	l, cfg := newTestDeps(t)
 	fake := &fakeTmux{alive: true, idle: false}

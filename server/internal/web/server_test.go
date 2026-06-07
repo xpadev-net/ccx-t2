@@ -214,6 +214,76 @@ func TestProjectPostTaskUsesSelectedProjectRuntimeAndNotifiesLedger(t *testing.T
 	}
 }
 
+func TestProjectPostTaskAcceptsNaturalLanguageRequest(t *testing.T) {
+	dir := t.TempDir()
+	cfg := testConfig()
+	cfg.Runtime = config.RuntimeConfig{TmuxSession: "ccx-test", WorktreeBase: filepath.Join(dir, "worktrees")}
+	cfg.Orchestrator.Timeout = 0
+	cfg.Projects = map[string]config.ProjectConfig{
+		"alpha": {
+			Slug:         "alpha",
+			RepoPath:     filepath.Join(dir, "alpha"),
+			LedgerPath:   filepath.Join(dir, "alpha", "tasks", "ledger.md"),
+			WorktreeBase: cfg.Runtime.WorktreeBase,
+			Orchestrator: cfg.Orchestrator,
+			GitHub:       cfg.GitHub,
+		},
+		"beta": {
+			Slug:         "beta",
+			RepoPath:     filepath.Join(dir, "beta"),
+			LedgerPath:   filepath.Join(dir, "beta", "tasks", "ledger.md"),
+			WorktreeBase: cfg.Runtime.WorktreeBase,
+			Orchestrator: cfg.Orchestrator,
+			GitHub:       cfg.GitHub,
+		},
+	}
+	manager, err := runtimepkg.NewManager(cfg, "http://127.0.0.1:8080")
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	alpha, err := manager.Project("alpha")
+	if err != nil {
+		t.Fatalf("Project alpha: %v", err)
+	}
+	beta, err := manager.Project("beta")
+	if err != nil {
+		t.Fatalf("Project beta: %v", err)
+	}
+	handler := New(Deps{Config: cfg, Manager: manager, AuthDisabled: true})
+
+	resp := performJSONRequest(handler, http.MethodPost, "/api/projects/alpha/tasks", `{
+		"request": "Turn this plain request into researched implementation tasks."
+	}`)
+	if resp.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusAccepted, resp.Body.String())
+	}
+	var created taskCreateResponse
+	if err := json.Unmarshal(resp.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode created task: %v", err)
+	}
+	if created.Task.Title != "Natural language intake" || !strings.Contains(created.Task.Body, "plain request") {
+		t.Fatalf("created task = %#v, want natural-language intake with raw request", created.Task)
+	}
+	if len(created.Task.AllowedFiles) != 0 {
+		t.Fatalf("allowed_files = %#v, want none for raw intake", created.Task.AllowedFiles)
+	}
+
+	alphaTasks, err := alpha.Ledger.Load()
+	if err != nil {
+		t.Fatalf("Load alpha: %v", err)
+	}
+	if len(alphaTasks) != 1 || alphaTasks[0].Title != "Natural language intake" || !strings.Contains(alphaTasks[0].Body, "plain request") {
+		t.Fatalf("alpha tasks = %#v, want raw intake in selected project", alphaTasks)
+	}
+	betaTasks, err := beta.Ledger.Load()
+	if err != nil {
+		t.Fatalf("Load beta: %v", err)
+	}
+	if len(betaTasks) != 0 {
+		t.Fatalf("beta tasks = %#v, want untouched beta ledger", betaTasks)
+	}
+}
+
 func TestPostTasksCreatesTaskAndTriggersOrchestrator(t *testing.T) {
 	l := newTestLedger(t)
 	trigger := &fakeTrigger{}
@@ -240,6 +310,40 @@ func TestPostTasksCreatesTaskAndTriggersOrchestrator(t *testing.T) {
 	}
 	if created.Task.Status != "unstarted" {
 		t.Fatalf("status = %q, want unstarted", created.Task.Status)
+	}
+	if !created.OrchestratorTriggered {
+		t.Fatal("OrchestratorTriggered = false, want true")
+	}
+	if len(trigger.reasons) != 1 || !strings.Contains(trigger.reasons[0], created.Task.ID) {
+		t.Fatalf("trigger reasons = %#v, want created task ID", trigger.reasons)
+	}
+}
+
+func TestPostTasksAcceptsNaturalLanguageRequestWithoutStructuredFields(t *testing.T) {
+	l := newTestLedger(t)
+	trigger := &fakeTrigger{}
+	server := New(Deps{Ledger: l, Trigger: trigger, AuthDisabled: true})
+
+	resp := performJSONRequest(server, http.MethodPost, "/api/tasks", `{
+		"body": "\n",
+		"request": "Please figure out how task intake should work, then create the right implementation tasks."
+	}`)
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusCreated, resp.Body.String())
+	}
+
+	var created taskCreateResponse
+	if err := json.Unmarshal(resp.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode created task: %v", err)
+	}
+	if created.Task.Title != "Natural language intake" {
+		t.Fatalf("title = %q, want natural-language intake title", created.Task.Title)
+	}
+	if !strings.Contains(created.Task.Body, "Please figure out how task intake should work") {
+		t.Fatalf("body = %q, want raw request preserved", created.Task.Body)
+	}
+	if len(created.Task.AllowedFiles) != 0 {
+		t.Fatalf("allowed_files = %#v, want none for raw intake", created.Task.AllowedFiles)
 	}
 	if !created.OrchestratorTriggered {
 		t.Fatal("OrchestratorTriggered = false, want true")

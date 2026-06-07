@@ -240,6 +240,40 @@ func TestProjectScopedListTasksUsesSelectedProject(t *testing.T) {
 	}
 }
 
+func TestHandleCreateTaskAcceptsNaturalLanguageRequestWithoutTitle(t *testing.T) {
+	dir := t.TempDir()
+	l := ledger.NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
+
+	result, err := handleCreateTask(&Deps{Ledger: l})(context.Background(), map[string]any{
+		"description": " \n",
+		"request":     "Please investigate natural language task intake and create the right slices.",
+	})
+	if err != nil {
+		t.Fatalf("handleCreateTask: %v", err)
+	}
+	id, ok := result.(map[string]any)["id"].(string)
+	if !ok || id == "" {
+		t.Fatalf("result = %#v, want generated id", result)
+	}
+
+	tasks, err := l.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("len(tasks) = %d, want 1", len(tasks))
+	}
+	if tasks[0].Title != "Natural language intake" {
+		t.Fatalf("title = %q, want natural-language intake title", tasks[0].Title)
+	}
+	if !strings.Contains(tasks[0].Body, "Please investigate natural language task intake") {
+		t.Fatalf("body = %q, want raw request preserved", tasks[0].Body)
+	}
+	if len(tasks[0].AllowedFiles) != 0 {
+		t.Fatalf("allowed_files = %#v, want none for raw intake", tasks[0].AllowedFiles)
+	}
+}
+
 func TestEnsureWorkerTaskActiveRejectsTerminalOrMissingWorker(t *testing.T) {
 	dir := t.TempDir()
 	l := ledger.NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))

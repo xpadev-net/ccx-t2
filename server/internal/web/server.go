@@ -1185,6 +1185,7 @@ type workerFollowupResponse struct {
 
 type taskMutationRequest struct {
 	IdempotencyKey *string   `json:"idempotency_key"`
+	Request        *string   `json:"request"`
 	Title          *string   `json:"title"`
 	Status         *string   `json:"status"`
 	Branch         *string   `json:"branch"`
@@ -1218,8 +1219,11 @@ func taskFromCreateRequest(req taskMutationRequest) (ledger.Task, error) {
 	if strings.TrimSpace(task.Status) == "deleting" {
 		return ledger.Task{}, fmt.Errorf("status deleting is reserved for task deletion")
 	}
+	if strings.TrimSpace(task.Title) == "" && strings.TrimSpace(task.Body) != "" {
+		task.Title = "Natural language intake"
+	}
 	if strings.TrimSpace(task.Title) == "" && strings.TrimSpace(task.Body) == "" {
-		return ledger.Task{}, fmt.Errorf("title or body is required")
+		return ledger.Task{}, fmt.Errorf("title, body, or request is required")
 	}
 	return task, nil
 }
@@ -1323,7 +1327,13 @@ func fieldsFromUpdateRequest(req taskMutationRequest) map[string]any {
 		fields["reason"] = *req.Reason
 	}
 	if req.Body != nil {
-		fields["body"] = strings.Trim(*req.Body, "\n")
+		body := strings.Trim(*req.Body, "\n")
+		if strings.TrimSpace(body) == "" && req.Request != nil && strings.TrimSpace(*req.Request) != "" {
+			body = strings.Trim(*req.Request, "\n")
+		}
+		fields["body"] = body
+	} else if req.Request != nil {
+		fields["body"] = strings.Trim(*req.Request, "\n")
 	}
 	return fields
 }
