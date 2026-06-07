@@ -59,7 +59,7 @@ func (s *Server) handleWorkerLogWS(w http.ResponseWriter, r *http.Request) {
 	defer conn.Close()
 	lines, cleanup, err := s.pipeOutput(cfg.Project.Slug, window)
 	if err != nil {
-		writeWSJSON(conn, wsMessage{Type: "error", Data: "open worker log stream"})
+		_ = writeWSJSON(conn, wsMessage{Type: "error", Data: "open worker log stream"})
 		return
 	}
 	defer cleanup()
