@@ -715,12 +715,18 @@ func (s *Server) writeTaskCreateResponse(w http.ResponseWriter, r *http.Request,
 			writeJSON(w, status, resp)
 			return
 		}
+		triggered := false
+		defer func() {
+			if !triggered {
+				s.pendingTriggers.mark(key)
+			}
+		}()
 		if err := s.trigger.Trigger(context.WithoutCancel(r.Context()), "task created: "+task.ID); err != nil {
 			log.Printf("web: orchestrator trigger after task create failed: %v", err)
-			s.pendingTriggers.mark(key)
 			resp.TriggerError = "orchestrator trigger failed"
 			status = http.StatusAccepted
 		} else {
+			triggered = true
 			s.pendingTriggers.clear(key)
 			resp.OrchestratorTriggered = true
 		}

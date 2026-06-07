@@ -407,6 +407,42 @@ func TestPostTasksIdempotentRetryRetriesTrigger(t *testing.T) {
 	}
 }
 
+func TestPostTasksIdempotentRetryAfterTriggerPanic(t *testing.T) {
+	l := newTestLedger(t)
+	trigger := &fakeTrigger{
+		fn: func(context.Context, string) error {
+			panic("trigger panic")
+		},
+	}
+	server := New(Deps{Ledger: l, Trigger: trigger, AuthDisabled: true})
+	body := `{"idempotency_key":"task-20260101-0001","title":"New task"}`
+
+	func() {
+		defer func() {
+			if recovered := recover(); recovered == nil {
+				t.Fatal("first request panic = nil, want trigger panic")
+			}
+		}()
+		_ = performJSONRequest(server, http.MethodPost, "/api/tasks", body)
+	}()
+
+	trigger.fn = nil
+	retry := performJSONRequest(server, http.MethodPost, "/api/tasks", body)
+	if retry.Code != http.StatusOK {
+		t.Fatalf("retry status = %d, want %d; body=%s", retry.Code, http.StatusOK, retry.Body.String())
+	}
+	if len(trigger.reasons) != 2 {
+		t.Fatalf("trigger count = %d, want 2", len(trigger.reasons))
+	}
+	var created taskCreateResponse
+	if err := json.Unmarshal(retry.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode retry response: %v", err)
+	}
+	if !created.OrchestratorTriggered {
+		t.Fatal("retry OrchestratorTriggered = false, want true")
+	}
+}
+
 func TestPostTasksReturnsAcceptedWhenTriggerFails(t *testing.T) {
 	l := newTestLedger(t)
 	server := New(Deps{
@@ -1833,10 +1869,14 @@ func performRequestWithHeaders(handler http.Handler, method, target string, head
 type fakeTrigger struct {
 	reasons []string
 	err     error
+	fn      func(context.Context, string) error
 }
 
 func (f *fakeTrigger) Trigger(ctx context.Context, reason string) error {
 	f.reasons = append(f.reasons, reason)
+	if f.fn != nil {
+		return f.fn(ctx, reason)
+	}
 	return f.err
 }
 
