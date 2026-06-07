@@ -144,6 +144,29 @@ func TestHandleSpawnWorkerRejectsBranchWithoutTaskID(t *testing.T) {
 	}
 }
 
+func TestCleanupTaskBranchNormalizesRelativeRepoPath(t *testing.T) {
+	dir := t.TempDir()
+	repoPath := filepath.Join(dir, "repo")
+	if err := exec.Command("git", "init", "-b", "main", repoPath).Run(); err != nil {
+		t.Fatalf("git init: %v", err)
+	}
+	runGit(t, repoPath, "config", "user.email", "test@example.com")
+	runGit(t, repoPath, "config", "user.name", "Test User")
+	runGit(t, repoPath, "commit", "--allow-empty", "-m", "init")
+	runGit(t, repoPath, "branch", "feature/task-001")
+	t.Chdir(dir)
+
+	cleanupTaskBranch(context.Background(), "repo", "feature/task-001", "task-001")
+
+	exists, err := gitBranchExists(repoPath, "feature/task-001")
+	if err != nil {
+		t.Fatalf("gitBranchExists: %v", err)
+	}
+	if exists {
+		t.Fatal("feature/task-001 still exists, want cleanup to delete it")
+	}
+}
+
 func TestProjectScopedListTasksUsesSelectedProject(t *testing.T) {
 	dir := t.TempDir()
 	cfg := &config.Config{

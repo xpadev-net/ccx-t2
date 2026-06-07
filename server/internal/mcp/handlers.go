@@ -1125,7 +1125,12 @@ func workerIDFor(deps *Deps, taskID string) string {
 }
 
 func cleanupTaskBranch(ctx context.Context, repoPath, branch, taskID string) {
-	if err := worktree.DeleteTaskBranchIfSafeContext(ctx, repoPath, branch, taskID); err != nil {
+	absRepoPath, err := filepath.Abs(repoPath)
+	if err != nil {
+		log.Printf("warn: worker cleanup failed to resolve repo path %q for task %s: %v", repoPath, taskID, err)
+		return
+	}
+	if err := worktree.DeleteTaskBranchIfSafeContext(ctx, absRepoPath, branch, taskID); err != nil {
 		if errors.Is(err, worktree.ErrUnsafeBranchDelete) {
 			log.Printf("warn: worker cleanup skipped unsafe branch delete for task %s: %v", taskID, err)
 			return
