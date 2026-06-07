@@ -232,14 +232,11 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	created, err := s.loadTask(id)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "load created task")
-		return
-	}
 
+	task.ID = id
+	task.UpdatedAt = ""
 	w.Header().Set("Idempotency-Key", id)
-	s.writeTaskCreateResponse(w, r, http.StatusCreated, created)
+	s.writeTaskCreateResponse(w, r, http.StatusCreated, task)
 }
 
 func (s *Server) writeTaskCreateResponse(w http.ResponseWriter, r *http.Request, status int, task ledger.Task) {
