@@ -96,8 +96,16 @@ func TestWorkerHarnessesCompleteThroughMCPIntegration(t *testing.T) {
 			if err != nil {
 				t.Fatalf("spawn_worker: %v", err)
 			}
-			if got.(map[string]any)["prompt_sent"] != true {
-				t.Fatalf("spawn_worker result = %#v, want prompt_sent true", got)
+			result, ok := got.(map[string]any)
+			if !ok {
+				t.Fatalf("spawn_worker result type = %T, want map[string]any", got)
+			}
+			promptSent, ok := result["prompt_sent"].(bool)
+			if !ok {
+				t.Fatalf("spawn_worker prompt_sent = %#v, want bool true", result["prompt_sent"])
+			}
+			if !promptSent {
+				t.Fatalf("spawn_worker result = %#v, want prompt_sent true", result)
 			}
 
 			waitForCompletedTask(t, l, taskID, harnessName, session, "worker-"+taskID)

@@ -1122,7 +1122,6 @@ func buildHarnessCommand(command string, mcpTokens []string) string {
 
 func waitForHarnessProcess(session, window string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
-	seen := false
 	for {
 		if time.Now().After(deadline) {
 			return fmt.Errorf("harness process did not start within %v", timeout)
@@ -1132,10 +1131,7 @@ func waitForHarnessProcess(session, window string, timeout time.Duration) error 
 			return err
 		}
 		if !idle {
-			if seen {
-				return nil
-			}
-			seen = true
+			return nil
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
