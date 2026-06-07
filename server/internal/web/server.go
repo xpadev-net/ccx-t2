@@ -175,7 +175,7 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 	}
 	var req taskMutationRequest
 	if err := decodeJSON(w, r, &req); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeDecodeError(w, err)
 		return
 	}
 	task, err := taskFromCreateRequest(req)
@@ -263,7 +263,7 @@ func (s *Server) updateTask(w http.ResponseWriter, r *http.Request, id string) {
 	}
 	var req taskMutationRequest
 	if err := decodeJSON(w, r, &req); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeDecodeError(w, err)
 		return
 	}
 	if req.IdempotencyKey != nil {
@@ -481,7 +481,7 @@ func fieldsFromUpdateRequest(req taskMutationRequest) map[string]any {
 		fields["reason"] = *req.Reason
 	}
 	if req.Body != nil {
-		fields["body"] = *req.Body
+		fields["body"] = strings.Trim(*req.Body, "\n")
 	}
 	return fields
 }
@@ -649,6 +649,10 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, v any) error {
 	dec := json.NewDecoder(limited)
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			return fmt.Errorf("%w: limit %d bytes", errRequestBodyTooLarge, maxBytesErr.Limit)
+		}
 		return fmt.Errorf("invalid JSON: %w", err)
 	}
 	var extra any
@@ -656,6 +660,16 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, v any) error {
 		return fmt.Errorf("invalid JSON: multiple values")
 	}
 	return nil
+}
+
+var errRequestBodyTooLarge = errors.New("request body too large")
+
+func writeDecodeError(w http.ResponseWriter, err error) {
+	if errors.Is(err, errRequestBodyTooLarge) {
+		writeError(w, http.StatusRequestEntityTooLarge, err.Error())
+		return
+	}
+	writeError(w, http.StatusBadRequest, err.Error())
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

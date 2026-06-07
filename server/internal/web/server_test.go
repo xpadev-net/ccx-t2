@@ -267,6 +267,26 @@ func TestPatchTaskUpdatesFields(t *testing.T) {
 	}
 }
 
+func TestPatchTaskNormalizesBodyNewlines(t *testing.T) {
+	l := newTestLedger(t)
+	if err := l.Add(ledger.Task{ID: "task-001", Title: "Old", Status: "unstarted"}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	resp := performJSONRequest(New(Deps{Ledger: l, AuthDisabled: true}), http.MethodPatch, "/api/tasks/task-001", `{"body":"\nhello\n"}`)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusOK, resp.Body.String())
+	}
+
+	var updated taskResponse
+	if err := json.Unmarshal(resp.Body.Bytes(), &updated); err != nil {
+		t.Fatalf("decode updated task: %v", err)
+	}
+	if updated.Body != "hello" {
+		t.Fatalf("body = %q, want hello", updated.Body)
+	}
+}
+
 func TestPatchTaskNotFound(t *testing.T) {
 	resp := performJSONRequest(New(Deps{Ledger: newTestLedger(t), AuthDisabled: true}), http.MethodPatch, "/api/tasks/missing", `{"title":"Updated"}`)
 	if resp.Code != http.StatusNotFound {
@@ -305,6 +325,14 @@ func TestPostTasksRejectsEmptyTask(t *testing.T) {
 	resp := performJSONRequest(New(Deps{Ledger: newTestLedger(t), AuthDisabled: true}), http.MethodPost, "/api/tasks", `{}`)
 	if resp.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want %d", resp.Code, http.StatusBadRequest)
+	}
+}
+
+func TestPostTasksRejectsOversizedJSON(t *testing.T) {
+	body := `{"title":"` + strings.Repeat("x", 1<<20) + `"}`
+	resp := performJSONRequest(New(Deps{Ledger: newTestLedger(t), AuthDisabled: true}), http.MethodPost, "/api/tasks", body)
+	if resp.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want %d", resp.Code, http.StatusRequestEntityTooLarge)
 	}
 }
 
