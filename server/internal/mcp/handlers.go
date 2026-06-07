@@ -466,7 +466,7 @@ func handleArchiveTask(deps *Deps) ToolHandler {
 				return nil, err
 			}
 			if archived {
-				cleanupArchivedTaskResources(toolDeps, id, archivedTask.Branch)
+				cleanupArchivedTaskResources(ctx, toolDeps, id, archivedTask.Branch)
 				return map[string]any{"archived": id}, nil
 			}
 			return nil, fmt.Errorf("task not found: %s", id)
@@ -482,7 +482,7 @@ func handleArchiveTask(deps *Deps) ToolHandler {
 			return nil, err
 		}
 
-		cleanupArchivedTaskResources(toolDeps, id, t.Branch)
+		cleanupArchivedTaskResources(ctx, toolDeps, id, t.Branch)
 
 		return map[string]any{"archived": id}, nil
 	}
@@ -494,7 +494,7 @@ func handleListHarnesses(deps *Deps) ToolHandler {
 	}
 }
 
-func cleanupArchivedTaskResources(deps *Deps, taskID, branch string) {
+func cleanupArchivedTaskResources(ctx context.Context, deps *Deps, taskID, branch string) {
 	workerID := workerIDFor(deps, taskID)
 	_ = tmux.KillWindow(deps.Session, workerID)
 	deps.Registry.Remove(workerID)
@@ -502,7 +502,7 @@ func cleanupArchivedTaskResources(deps *Deps, taskID, branch string) {
 		deps.Config.Project.Slug+"-"+taskID)
 	_ = worktree.Remove(deps.Config.Project.RepoPath, wPath)
 	if branch != "" {
-		cleanupTaskBranch(deps.Config.Project.RepoPath, branch, taskID)
+		cleanupTaskBranch(ctx, deps.Config.Project.RepoPath, branch, taskID)
 	}
 }
 
@@ -579,6 +579,9 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 		if err := validateGitBranchName(branch); err != nil {
 			return nil, err
 		}
+		if !worktree.BranchMatchesTaskID(branch, taskID) {
+			return nil, fmt.Errorf("branch %q must include task_id %q as a path or delimiter-bounded segment", branch, taskID)
+		}
 
 		// Resolve harness.
 		resolvedHarness, hCfg, err := harness.Resolve(toolDeps.Config, harnessName)
@@ -625,7 +628,7 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 		// Step 2: Create tmux window.
 		if err := tmux.CreateWindow(toolDeps.Session, workerID, worktreePath); err != nil {
 			_ = worktree.Remove(repoPath, worktreePath)
-			cleanupTaskBranch(repoPath, branch, taskID)
+			cleanupTaskBranch(ctx, repoPath, branch, taskID)
 			return nil, fmt.Errorf("create tmux window: %w", err)
 		}
 
@@ -643,12 +646,12 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 		if updateErr != nil {
 			_ = tmux.KillWindow(toolDeps.Session, workerID)
 			_ = worktree.Remove(repoPath, worktreePath)
-			cleanupTaskBranch(repoPath, branch, taskID)
+			cleanupTaskBranch(ctx, repoPath, branch, taskID)
 			return nil, fmt.Errorf("update ledger: %w", updateErr)
 		}
 		promptTask, err := loadTaskByID(toolDeps.Ledger, taskID)
 		if err != nil {
-			rollbackSpawnAfterLedgerUpdate(toolDeps, workerID, branch, taskID, repoPath, worktreePath)
+			rollbackSpawnAfterLedgerUpdate(ctx, toolDeps, workerID, branch, taskID, repoPath, worktreePath)
 			return nil, fmt.Errorf("reload task after update: %w", err)
 		}
 
@@ -665,7 +668,7 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 		// URL/secret values with shell metacharacters are not interpreted by the shell.
 		harnessCmd := buildHarnessCommand(hCfg.Command, mcpTokens)
 		if err := tmux.SendKeys(toolDeps.Session, workerID, harnessCmd); err != nil {
-			rollbackSpawnAfterLedgerUpdate(toolDeps, workerID, branch, taskID, repoPath, worktreePath)
+			rollbackSpawnAfterLedgerUpdate(ctx, toolDeps, workerID, branch, taskID, repoPath, worktreePath)
 			return nil, fmt.Errorf("send harness command: %w", err)
 		}
 		if err := waitForHarnessProcess(toolDeps.Session, workerID, 2*time.Second); err != nil {
@@ -1055,7 +1058,7 @@ func handleNotify(deps *Deps) ToolHandler {
 				filepath.Join(toolDeps.Config.Project.WorktreeBase,
 					toolDeps.Config.Project.Slug+"-"+taskID))
 			if prevTask.Branch != "" {
-				cleanupTaskBranch(toolDeps.Config.Project.RepoPath, prevTask.Branch, taskID)
+				cleanupTaskBranch(ctx, toolDeps.Config.Project.RepoPath, prevTask.Branch, taskID)
 			}
 			toolDeps.Registry.Remove(wid)
 
@@ -1121,8 +1124,8 @@ func workerIDFor(deps *Deps, taskID string) string {
 	return "worker-" + taskID
 }
 
-func cleanupTaskBranch(repoPath, branch, taskID string) {
-	if err := worktree.DeleteTaskBranchIfSafe(repoPath, branch, taskID); err != nil {
+func cleanupTaskBranch(ctx context.Context, repoPath, branch, taskID string) {
+	if err := worktree.DeleteTaskBranchIfSafeContext(ctx, repoPath, branch, taskID); err != nil {
 		if errors.Is(err, worktree.ErrUnsafeBranchDelete) {
 			log.Printf("warn: worker cleanup skipped unsafe branch delete for task %s: %v", taskID, err)
 			return
@@ -1144,7 +1147,7 @@ func stopWorkerCleanup(deps *Deps, workerID, branch, taskID string) {
 		_ = worktree.Remove(deps.Config.Project.RepoPath, wPath)
 	}
 	if branch != "" {
-		cleanupTaskBranch(deps.Config.Project.RepoPath, branch, taskID)
+		cleanupTaskBranch(context.Background(), deps.Config.Project.RepoPath, branch, taskID)
 	}
 	if workerID != "" {
 		deps.Registry.Remove(workerID)
@@ -1208,10 +1211,10 @@ func loadTaskByID(l *ledger.Ledger, taskID string) (*ledger.Task, error) {
 	return nil, fmt.Errorf("task not found: %s", taskID)
 }
 
-func rollbackSpawnAfterLedgerUpdate(deps *Deps, workerID, branch, taskID, repoPath, worktreePath string) {
+func rollbackSpawnAfterLedgerUpdate(ctx context.Context, deps *Deps, workerID, branch, taskID, repoPath, worktreePath string) {
 	_ = tmux.KillWindow(deps.Session, workerID)
 	_ = worktree.Remove(repoPath, worktreePath)
-	cleanupTaskBranch(repoPath, branch, taskID)
+	cleanupTaskBranch(ctx, repoPath, branch, taskID)
 	// Reset lifecycle fields only — do not restore allowed/forbidden_files
 	// to avoid overwriting concurrent update_task edits. Use UpdateIfStatuses
 	// so a concurrent split_task that already committed (moving the parent to

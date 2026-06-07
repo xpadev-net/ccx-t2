@@ -183,7 +183,7 @@ Orchestrator・Worker がツールを呼べる HTTP MCP サーバーを立てる
 
 `spawn_worker` の実行順序：
 1. `project_slug` で runtime manager から対象プロジェクトを解決
-2. `worktree.Create(project.repo_path, branch, worktreePath)` — worktree を生成してブランチを作成
+2. `branch` が `task_id` を delimiter-bounded segment として含むことを検証し、`worktree.Create(project.repo_path, branch, worktreePath)` で worktree を生成してブランチを作成
 3. `tmux.CreateWindow(runtime.tmux_session, "{project_slug}-worker-{task_id}")` — tmux ウィンドウを作成
 4. ハーネス起動コマンドを組み立て（project_slug・worktree path・MCP URL `/mcp/worker`・タスク詳細を注入）
 5. `tmux.SendKeys` でハーネスを起動

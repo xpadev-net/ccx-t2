@@ -175,14 +175,19 @@ func (c defaultWorkerCleaner) CleanupWorker(ctx context.Context, task ledger.Tas
 			}
 		}
 	}
+	repoPath, err := filepath.Abs(deps.cfg.Project.RepoPath)
+	if err != nil {
+		errs = append(errs, fmt.Errorf("resolve repo path: %w", err))
+		repoPath = deps.cfg.Project.RepoPath
+	}
 	worktreePath := filepath.Join(deps.cfg.Project.WorktreeBase, deps.cfg.Project.Slug+"-"+task.ID)
-	if err := worktree.RemoveContext(ctx, deps.cfg.Project.RepoPath, worktreePath); err != nil {
+	if err := worktree.RemoveContext(ctx, repoPath, worktreePath); err != nil {
 		if !isMissingWorktreeError(err) {
 			errs = append(errs, fmt.Errorf("remove worktree: %w", err))
 		}
 	}
 	if task.Branch != "" {
-		if err := worktree.DeleteTaskBranchIfSafeContext(ctx, deps.cfg.Project.RepoPath, task.Branch, task.ID); err != nil {
+		if err := worktree.DeleteTaskBranchIfSafeContext(ctx, repoPath, task.Branch, task.ID); err != nil {
 			if errors.Is(err, worktree.ErrUnsafeBranchDelete) {
 				log.Printf("web cleanup skipped unsafe branch delete for task %s: %v", task.ID, err)
 			} else if !isMissingBranchError(err) {

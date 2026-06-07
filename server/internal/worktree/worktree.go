@@ -50,6 +50,7 @@ func RemoveContext(ctx context.Context, repoPath, worktreePath string) error {
 }
 
 var ErrUnsafeBranchDelete = errors.New("unsafe branch delete skipped")
+var ErrOriginUnavailable = errors.New("origin unavailable")
 
 // DeleteTaskBranchIfSafe deletes a local branch only when it is clearly scoped
 // to taskID and passes the normal branch deletion safety checks.
@@ -66,7 +67,7 @@ func DeleteTaskBranchIfSafeContext(ctx context.Context, repoPath, branch, taskID
 	if branch == "" {
 		return nil
 	}
-	if !branchMatchesTaskID(branch, taskID) {
+	if !BranchMatchesTaskID(branch, taskID) {
 		return fmt.Errorf("%w: %q is not scoped to task %q", ErrUnsafeBranchDelete, branch, taskID)
 	}
 	if exists, err := localBranchExists(ctx, repoPath, branch); err != nil {
@@ -111,7 +112,7 @@ func branchDeleteSafety(ctx context.Context, repoPath, branch string) (string, b
 	}
 	existsOnOrigin, err := branchExistsOnOrigin(ctx, repoPath, branch)
 	if err != nil {
-		return fmt.Sprintf("could not confirm %q is absent from origin: %v", branch, err), false, nil
+		return "", false, err
 	}
 	if existsOnOrigin {
 		return fmt.Sprintf("%q exists on origin and may have an open PR", branch), false, nil
@@ -181,11 +182,18 @@ func branchHasRemoteRef(ctx context.Context, repoPath, branch string) (bool, err
 		if ref == "" || strings.HasSuffix(ref, "/HEAD") {
 			continue
 		}
-		if strings.HasSuffix(ref, "/"+branch) {
+		if remoteBranchName(ref) == branch {
 			return true, nil
 		}
 	}
 	return false, nil
+}
+
+func remoteBranchName(ref string) string {
+	if i := strings.IndexByte(ref, '/'); i >= 0 {
+		return ref[i+1:]
+	}
+	return ref
 }
 
 func branchExistsOnOrigin(ctx context.Context, repoPath, branch string) (bool, error) {
@@ -198,11 +206,18 @@ func branchExistsOnOrigin(ctx context.Context, repoPath, branch string) (bool, e
 	}
 	remoteCtx, cancel := contextWithDefaultTimeout(ctx, 5*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(remoteCtx, "git", "-C", repoPath, "ls-remote", "--heads", "origin", branch).CombinedOutput()
+	out, err := exec.CommandContext(remoteCtx, "git", "-C", repoPath, "ls-remote", "--heads", "origin").CombinedOutput()
 	if err != nil {
-		return false, fmt.Errorf("check origin branch: %w: %s", err, strings.TrimSpace(string(out)))
+		return false, fmt.Errorf("%w: check origin branch: %w: %s", ErrOriginUnavailable, err, strings.TrimSpace(string(out)))
 	}
-	return strings.TrimSpace(string(out)) != "", nil
+	want := "refs/heads/" + branch
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 2 && fields[1] == want {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func contextWithDefaultTimeout(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
@@ -229,7 +244,7 @@ func isCommonDefaultBranchName(branch string) bool {
 	}
 }
 
-func branchMatchesTaskID(branch, taskID string) bool {
+func BranchMatchesTaskID(branch, taskID string) bool {
 	if taskID == "" {
 		return false
 	}

@@ -113,6 +113,37 @@ func TestBuildWorkerPromptFromTaskUsesTaskRestrictions(t *testing.T) {
 	}
 }
 
+func TestHandleSpawnWorkerRejectsBranchWithoutTaskID(t *testing.T) {
+	dir := t.TempDir()
+	l := ledger.NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
+	if err := l.Add(ledger.Task{ID: "task-001", Title: "Task", Status: "unstarted"}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	deps := &Deps{
+		Ledger:   l,
+		Registry: worker.NewRegistry(),
+		Config: &config.Config{
+			Project: config.ProjectConfig{
+				Slug:         "proj",
+				RepoPath:     dir,
+				WorktreeBase: filepath.Join(dir, "worktrees"),
+			},
+		},
+	}
+
+	_, err := handleSpawnWorker(deps)(context.Background(), map[string]any{
+		"task_id":       "task-001",
+		"branch":        "feature/my-work",
+		"allowed_files": []any{"server/internal/mcp"},
+	})
+	if err == nil {
+		t.Fatal("handleSpawnWorker error = nil, want task-scoped branch validation error")
+	}
+	if !strings.Contains(err.Error(), "must include task_id") {
+		t.Fatalf("handleSpawnWorker error = %v, want task-scoped branch validation error", err)
+	}
+}
+
 func TestProjectScopedListTasksUsesSelectedProject(t *testing.T) {
 	dir := t.TempDir()
 	cfg := &config.Config{

@@ -206,6 +206,7 @@ list_harnesses()
 spawn_worker(project_slug, task_id, branch, allowed_files, forbidden_files, harness)
   → ブランチを作成（git worktree add -b）し、tmux ウィンドウを作成してハーネスを起動。
     台帳の status を in_progress に更新し、branch / worker_id / harness フィールドを設定する。
+    branch は task_id を delimiter-bounded segment として含む必要がある。
     Worker には task ごとの worktree path と branch を注入し、親リポジトリ checkout を直接編集しないことを明示する。
     default branch または PR が存在するブランチでは履歴を書き換えず、force push しない。
     ハーネスバイナリが見つからない場合はエラーを返し台帳を更新しない。

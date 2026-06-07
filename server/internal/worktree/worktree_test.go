@@ -67,7 +67,7 @@ func TestDeleteTaskBranchIfSafeDeletesLocalOnlyWorkerBranch(t *testing.T) {
 func TestDeleteTaskBranchIfSafeSkipsDefaultBranch(t *testing.T) {
 	repoPath := initRepo(t)
 
-	err := DeleteTaskBranchIfSafe(repoPath, "main", "task-001")
+	err := DeleteTaskBranchIfSafe(repoPath, "main", "main")
 	if !errors.Is(err, ErrUnsafeBranchDelete) {
 		t.Fatalf("DeleteTaskBranchIfSafe(main) error = %v, want ErrUnsafeBranchDelete", err)
 	}
@@ -99,6 +99,40 @@ func TestDeleteTaskBranchIfSafeRequiresTaskIDBoundary(t *testing.T) {
 	}
 	if !branchExists(t, repoPath, "feature/task-0012") {
 		t.Fatal("feature/task-0012 was deleted, want preserved")
+	}
+}
+
+func TestDeleteTaskBranchIfSafeRemoteRefRequiresExactBranchName(t *testing.T) {
+	repoPath := initRepo(t)
+	remotePath := filepath.Join(t.TempDir(), "origin.git")
+	runGitNoC(t, "init", "--bare", remotePath)
+	runGit(t, repoPath, "remote", "add", "origin", remotePath)
+	runGit(t, repoPath, "branch", "feature/task-001")
+	runGit(t, repoPath, "push", "origin", "feature/task-001")
+	runGit(t, repoPath, "branch", "task-001")
+
+	if err := DeleteTaskBranchIfSafe(repoPath, "task-001", "task-001"); err != nil {
+		t.Fatalf("DeleteTaskBranchIfSafe(short branch): %v", err)
+	}
+	if branchExists(t, repoPath, "task-001") {
+		t.Fatal("task-001 still exists, want deleted")
+	}
+	if !branchExists(t, repoPath, "feature/task-001") {
+		t.Fatal("feature/task-001 was deleted, want preserved")
+	}
+}
+
+func TestDeleteTaskBranchIfSafeReportsOriginUnavailable(t *testing.T) {
+	repoPath := initRepo(t)
+	runGit(t, repoPath, "remote", "add", "origin", filepath.Join(t.TempDir(), "missing.git"))
+	runGit(t, repoPath, "branch", "feature/task-001")
+
+	err := DeleteTaskBranchIfSafe(repoPath, "feature/task-001", "task-001")
+	if !errors.Is(err, ErrOriginUnavailable) {
+		t.Fatalf("DeleteTaskBranchIfSafe(missing origin) error = %v, want ErrOriginUnavailable", err)
+	}
+	if !branchExists(t, repoPath, "feature/task-001") {
+		t.Fatal("feature/task-001 was deleted, want preserved")
 	}
 }
 
