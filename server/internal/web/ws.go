@@ -97,19 +97,23 @@ func (s *Server) handleProjectWS(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "project websocket route not found")
 		return
 	}
-	projectServer, err := s.projectServer(parts[0])
-	if err != nil {
+	if _, err := s.projectServer(parts[0]); err != nil {
 		writeError(w, http.StatusNotFound, "project not found")
 		return
 	}
 	switch parts[1] {
 	case "ledger":
 		if len(parts) == 2 {
-			projectServer.handleLedgerWS(w, r)
+			s.handleLedgerWS(w, r)
 			return
 		}
 	case "worker":
 		if len(parts) == 3 {
+			projectServer, err := s.projectServer(parts[0])
+			if err != nil {
+				writeError(w, http.StatusNotFound, "project not found")
+				return
+			}
 			r2 := r.Clone(r.Context())
 			r2.URL.Path = "/ws/worker/" + parts[2]
 			projectServer.handleWorkerLogWS(w, r2)

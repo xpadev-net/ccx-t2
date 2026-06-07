@@ -1266,12 +1266,6 @@ func buildWorkerPromptFromTaskWithDeps(deps *Deps, task *ledger.Task, taskID, wo
 		worktreePath, validationCmd)
 }
 
-func buildWorkerPrompt(task *ledger.Task, taskID, workerID, branch string, allowedFiles, forbiddenFiles []string,
-	worktreePath, validationCmd string) string {
-	return buildWorkerPromptWithDeps(nil, task, taskID, workerID, branch, allowedFiles, forbiddenFiles,
-		worktreePath, validationCmd)
-}
-
 func buildWorkerPromptWithDeps(deps *Deps, task *ledger.Task, taskID, workerID, branch string, allowedFiles, forbiddenFiles []string,
 	worktreePath, validationCmd string) string {
 	var sb strings.Builder

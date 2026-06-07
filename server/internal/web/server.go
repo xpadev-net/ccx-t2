@@ -343,19 +343,26 @@ func (s *Server) projectServer(slug string) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	out := *s
-	out.cfg = project.Config
-	out.ledger = project.Ledger
-	out.registry = project.Registry
-	out.trigger = project.Orchestrator
-	out.tmuxSession = project.Session
+	out := &Server{
+		cfg:            project.Config,
+		ledger:         project.Ledger,
+		manager:        s.manager,
+		registry:       project.Registry,
+		trigger:        project.Orchestrator,
+		pipeOutput:     s.pipeOutput,
+		tmuxSession:    project.Session,
+		secret:         s.secret,
+		authDisabled:   s.authDisabled,
+		allowedOrigins: s.allowedOrigins,
+		harnesses:      s.harnesses,
+	}
 	out.cleaner = defaultWorkerCleaner{
 		deps: func() cleanupDependencies {
 			return cleanupDependencies{cfg: project.Config, session: project.Session}
 		},
 		registry: project.Registry,
 	}
-	return &out, nil
+	return out, nil
 }
 
 func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request) {
