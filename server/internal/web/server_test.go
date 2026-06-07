@@ -57,7 +57,7 @@ func TestGetWorkersReturnsSortedSnapshot(t *testing.T) {
 		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusOK, resp.Body.String())
 	}
 
-	var workers []worker.Info
+	var workers []workerResponse
 	if err := json.Unmarshal(resp.Body.Bytes(), &workers); err != nil {
 		t.Fatalf("decode workers: %v", err)
 	}
@@ -110,6 +110,7 @@ func TestGetConfigRedactsSecrets(t *testing.T) {
 	cfg := testConfig()
 	cfg.Server.McpSecret = "mcp-secret-value"
 	cfg.GitHub.Token = "github-token-value"
+	cfg.Project.ValidationCommand = "GITHUB_TOKEN=nested-validation-secret go test ./..."
 	cfg.Harnesses["worker"] = config.HarnessConfig{
 		Command: "sh",
 		McpArgs: "--mcp-url {url} --token nested-secret-value --secret {secret}",
@@ -120,12 +121,12 @@ func TestGetConfigRedactsSecrets(t *testing.T) {
 		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusOK, resp.Body.String())
 	}
 	body := resp.Body.String()
-	for _, secret := range []string{"mcp-secret-value", "github-token-value", "nested-secret-value", "mcp_secret", "mcp_args", "McpArgs", "token"} {
+	for _, secret := range []string{"mcp-secret-value", "github-token-value", "nested-secret-value", "nested-validation-secret", "mcp_secret", "mcp_args", "McpArgs", "token", "validation_command"} {
 		if strings.Contains(body, secret) {
 			t.Fatalf("config response leaked %q in %s", secret, body)
 		}
 	}
-	for _, want := range []string{"repo_path", "worktree_base", "validation_command", "heartbeat_interval"} {
+	for _, want := range []string{"repo_path", "worktree_base", "heartbeat_interval"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("config response = %s, want snake_case key %q", body, want)
 		}

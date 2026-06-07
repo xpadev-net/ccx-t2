@@ -2,9 +2,11 @@ package web
 
 import (
 	"encoding/json"
+	"log"
 	"net/http"
 	"os/exec"
 	"sort"
+	"time"
 
 	"github.com/xpadev/ccx-t2/internal/config"
 	"github.com/xpadev/ccx-t2/internal/ledger"
@@ -13,10 +15,11 @@ import (
 
 // Server serves the browser-facing REST API.
 type Server struct {
-	cfg      *config.Config
-	ledger   *ledger.Ledger
-	registry *worker.Registry
-	mux      *http.ServeMux
+	cfg       *config.Config
+	ledger    *ledger.Ledger
+	registry  *worker.Registry
+	harnesses []harnessResponse
+	mux       *http.ServeMux
 }
 
 // Deps contains dependencies needed by the web API.
@@ -29,10 +32,11 @@ type Deps struct {
 // New constructs a web API handler.
 func New(deps Deps) *Server {
 	s := &Server{
-		cfg:      deps.Config,
-		ledger:   deps.Ledger,
-		registry: deps.Registry,
-		mux:      http.NewServeMux(),
+		cfg:       deps.Config,
+		ledger:    deps.Ledger,
+		registry:  deps.Registry,
+		harnesses: harnessResponsesFromConfig(deps.Config),
+		mux:       http.NewServeMux(),
 	}
 	s.routes()
 	return s
@@ -82,7 +86,11 @@ func (s *Server) handleWorkers(w http.ResponseWriter, r *http.Request) {
 	sort.Slice(workers, func(i, j int) bool {
 		return workers[i].WorkerID < workers[j].WorkerID
 	})
-	writeJSON(w, http.StatusOK, workers)
+	out := make([]workerResponse, len(workers))
+	for i, info := range workers {
+		out[i] = workerResponseFromRegistry(info)
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (s *Server) handleHarnesses(w http.ResponseWriter, r *http.Request) {
@@ -93,7 +101,7 @@ func (s *Server) handleHarnesses(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "config is not configured")
 		return
 	}
-	writeJSON(w, http.StatusOK, harnessResponsesFromConfig(s.cfg))
+	writeJSON(w, http.StatusOK, s.harnesses)
 }
 
 func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
@@ -121,6 +129,22 @@ type taskResponse struct {
 	Reason         string   `json:"reason,omitempty"`
 	UpdatedAt      string   `json:"updated_at,omitempty"`
 	Body           string   `json:"body,omitempty"`
+}
+
+type workerResponse struct {
+	TaskID    string `json:"task_id"`
+	WorkerID  string `json:"worker_id"`
+	Harness   string `json:"harness"`
+	StartedAt string `json:"started_at"`
+}
+
+func workerResponseFromRegistry(info worker.Info) workerResponse {
+	return workerResponse{
+		TaskID:    info.TaskID,
+		WorkerID:  info.WorkerID,
+		Harness:   info.Harness,
+		StartedAt: info.StartedAt.Format(time.RFC3339Nano),
+	}
 }
 
 func taskResponseFromLedger(task ledger.Task) taskResponse {
@@ -151,10 +175,9 @@ type configResponse struct {
 }
 
 type projectConfigResponse struct {
-	Slug              string `json:"slug"`
-	RepoPath          string `json:"repo_path"`
-	WorktreeBase      string `json:"worktree_base"`
-	ValidationCommand string `json:"validation_command"`
+	Slug         string `json:"slug"`
+	RepoPath     string `json:"repo_path"`
+	WorktreeBase string `json:"worktree_base"`
 }
 
 type serverConfigResponse struct {
@@ -183,6 +206,9 @@ type harnessResponse struct {
 }
 
 func harnessResponsesFromConfig(cfg *config.Config) []harnessResponse {
+	if cfg == nil {
+		return nil
+	}
 	out := make([]harnessResponse, 0, len(cfg.WorkerHarnesses))
 	for _, name := range cfg.WorkerHarnesses {
 		h, ok := cfg.Harnesses[name]
@@ -216,10 +242,9 @@ func configResponseFromConfig(cfg *config.Config) configResponse {
 	}
 	return configResponse{
 		Project: projectConfigResponse{
-			Slug:              cfg.Project.Slug,
-			RepoPath:          cfg.Project.RepoPath,
-			WorktreeBase:      cfg.Project.WorktreeBase,
-			ValidationCommand: cfg.Project.ValidationCommand,
+			Slug:         cfg.Project.Slug,
+			RepoPath:     cfg.Project.RepoPath,
+			WorktreeBase: cfg.Project.WorktreeBase,
 		},
 		Server: serverConfigResponse{
 			Port: cfg.Server.Port,
@@ -250,7 +275,9 @@ func requireMethod(w http.ResponseWriter, r *http.Request, method string) bool {
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		log.Printf("web: json encode error: %v", err)
+	}
 }
 
 func writeError(w http.ResponseWriter, status int, msg string) {
