@@ -221,9 +221,6 @@ func writeWSJSON(conn *websocket.Conn, msg wsMessage) error {
 }
 
 func (s *Server) reserveTmuxStream(key string) bool {
-	if s.tmuxStreams == nil {
-		s.tmuxStreams = &tmuxStreamRegistry{}
-	}
 	s.tmuxStreams.mu.Lock()
 	defer s.tmuxStreams.mu.Unlock()
 	if s.tmuxStreams.streams == nil {
