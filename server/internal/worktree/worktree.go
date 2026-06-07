@@ -91,7 +91,11 @@ func branchDeleteSafety(ctx context.Context, repoPath, branch string) (string, b
 	if isCommonDefaultBranchName(branch) {
 		return fmt.Sprintf("%q is a protected default branch name", branch), false, nil
 	}
-	defaultBranches, err := remoteDefaultBranchNames(ctx, repoPath)
+	remotes, err := gitRemotes(ctx, repoPath)
+	if err != nil {
+		return "", false, err
+	}
+	defaultBranches, err := remoteDefaultBranchNames(ctx, repoPath, remotes)
 	if err != nil {
 		return "", false, err
 	}
@@ -114,7 +118,7 @@ func branchDeleteSafety(ctx context.Context, repoPath, branch string) (string, b
 	if hasRemote {
 		return fmt.Sprintf("%q has a remote ref and may have an open PR", branch), false, nil
 	}
-	existsOnRemote, err := branchExistsOnRemote(ctx, repoPath, branch)
+	existsOnRemote, err := branchExistsOnRemote(ctx, repoPath, remotes, branch)
 	if err != nil {
 		return "", false, err
 	}
@@ -143,11 +147,7 @@ func localBranchExists(ctx context.Context, repoPath, branch string) (bool, erro
 	return false, fmt.Errorf("check local branch %q: %w", branch, err)
 }
 
-func remoteDefaultBranchNames(ctx context.Context, repoPath string) ([]string, error) {
-	remotes, err := gitRemotes(ctx, repoPath)
-	if err != nil {
-		return nil, err
-	}
+func remoteDefaultBranchNames(ctx context.Context, repoPath string, remotes []string) ([]string, error) {
 	var defaults []string
 	seen := make(map[string]bool)
 	for _, remote := range remotes {
@@ -237,18 +237,14 @@ func remoteBranchName(ref string) string {
 	return ref
 }
 
-func branchExistsOnRemote(ctx context.Context, repoPath, branch string) (bool, error) {
-	remotes, err := gitRemotes(ctx, repoPath)
-	if err != nil {
-		return false, err
-	}
+func branchExistsOnRemote(ctx context.Context, repoPath string, remotes []string, branch string) (bool, error) {
 	if len(remotes) == 0 {
 		return false, nil
 	}
 	want := "refs/heads/" + branch
 	for _, remote := range remotes {
 		remoteCtx, cancel := contextWithDefaultTimeout(ctx, 5*time.Second)
-		out, err := exec.CommandContext(remoteCtx, "git", "-C", repoPath, "ls-remote", "--heads", remote).CombinedOutput()
+		out, err := exec.CommandContext(remoteCtx, "git", "-C", repoPath, "ls-remote", "--heads", remote, want).CombinedOutput()
 		cancel()
 		if err != nil {
 			return false, fmt.Errorf("%w: check remote branch on %s: %w: %s", ErrOriginUnavailable, remote, err, strings.TrimSpace(string(out)))
