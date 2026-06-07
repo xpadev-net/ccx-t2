@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"os/exec"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -196,6 +197,15 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 	}
 	id := task.ID
 	if id != "" {
+		archived, err := s.ledger.IsArchived(id)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "check archived task")
+			return
+		}
+		if archived {
+			writeError(w, http.StatusConflict, "task already exists in archive")
+			return
+		}
 		if err := s.ledger.Add(task); err != nil {
 			if errors.Is(err, ledger.ErrTaskExists) {
 				existing, ok, loadErr := s.loadTaskIfExists(id)
@@ -383,6 +393,9 @@ func taskFromCreateRequest(req taskMutationRequest) (ledger.Task, error) {
 	task := ledger.Task{Status: "unstarted"}
 	if req.IdempotencyKey != nil {
 		task.ID = strings.TrimSpace(*req.IdempotencyKey)
+		if !reWebTaskID.MatchString(task.ID) {
+			return ledger.Task{}, fmt.Errorf("idempotency_key must be a task ID like task-YYYYMMDD-0001")
+		}
 	}
 	fields := fieldsFromUpdateRequest(req)
 	task = taskSnapshotWithFields(task, fields)
@@ -432,6 +445,8 @@ func taskSnapshotWithFields(task ledger.Task, fields map[string]any) ledger.Task
 	}
 	return task
 }
+
+var reWebTaskID = regexp.MustCompile(`^task-\d{8}-\d{4}$`)
 
 func fieldsFromUpdateRequest(req taskMutationRequest) map[string]any {
 	fields := make(map[string]any)

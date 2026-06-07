@@ -88,7 +88,7 @@ func TestPostTasksCreatesTaskAndTriggersOrchestrator(t *testing.T) {
 func TestPostTasksSupportsIdempotencyKey(t *testing.T) {
 	l := newTestLedger(t)
 	server := New(Deps{Ledger: l, AuthDisabled: true})
-	body := `{"idempotency_key":"client-task-1","title":"New task"}`
+	body := `{"idempotency_key":"task-20260101-0001","title":"New task"}`
 
 	first := performJSONRequest(server, http.MethodPost, "/api/tasks", body)
 	if first.Code != http.StatusCreated {
@@ -105,8 +105,18 @@ func TestPostTasksSupportsIdempotencyKey(t *testing.T) {
 	if len(tasks) != 1 {
 		t.Fatalf("len(tasks) = %d, want 1", len(tasks))
 	}
-	if tasks[0].ID != "client-task-1" {
-		t.Fatalf("task ID = %q, want client-task-1", tasks[0].ID)
+	if tasks[0].ID != "task-20260101-0001" {
+		t.Fatalf("task ID = %q, want task-20260101-0001", tasks[0].ID)
+	}
+}
+
+func TestPostTasksRejectsInvalidIdempotencyKey(t *testing.T) {
+	resp := performJSONRequest(New(Deps{Ledger: newTestLedger(t), AuthDisabled: true}), http.MethodPost, "/api/tasks", `{
+		"idempotency_key": "client-task-1",
+		"title": "New task"
+	}`)
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", resp.Code, http.StatusBadRequest)
 	}
 }
 
@@ -130,12 +140,12 @@ func TestPostTasksDefaultsEmptyStatus(t *testing.T) {
 
 func TestPostTasksDuplicateIdempotencyKeyReturnsExistingTask(t *testing.T) {
 	l := newTestLedger(t)
-	if err := l.Add(ledger.Task{ID: "client-task-1", Title: "Existing", Status: "unstarted"}); err != nil {
+	if err := l.Add(ledger.Task{ID: "task-20260101-0001", Title: "Existing", Status: "unstarted"}); err != nil {
 		t.Fatalf("Add: %v", err)
 	}
 
 	resp := performJSONRequest(New(Deps{Ledger: l, AuthDisabled: true}), http.MethodPost, "/api/tasks", `{
-		"idempotency_key": "client-task-1",
+		"idempotency_key": "task-20260101-0001",
 		"title": "Duplicate"
 	}`)
 	if resp.Code != http.StatusOK {
@@ -151,11 +161,29 @@ func TestPostTasksDuplicateIdempotencyKeyReturnsExistingTask(t *testing.T) {
 	}
 }
 
+func TestPostTasksRejectsArchivedIdempotencyKey(t *testing.T) {
+	l := newTestLedger(t)
+	if err := l.Add(ledger.Task{ID: "task-20260101-0001", Title: "Existing", Status: "completed"}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if err := l.Archive("task-20260101-0001", "abc123"); err != nil {
+		t.Fatalf("Archive: %v", err)
+	}
+
+	resp := performJSONRequest(New(Deps{Ledger: l, AuthDisabled: true}), http.MethodPost, "/api/tasks", `{
+		"idempotency_key": "task-20260101-0001",
+		"title": "Duplicate"
+	}`)
+	if resp.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusConflict, resp.Body.String())
+	}
+}
+
 func TestPostTasksIdempotentRetryRetriesTrigger(t *testing.T) {
 	l := newTestLedger(t)
 	trigger := &fakeTrigger{err: errors.New("tmux unavailable")}
 	server := New(Deps{Ledger: l, Trigger: trigger, AuthDisabled: true})
-	body := `{"idempotency_key":"client-task-1","title":"New task"}`
+	body := `{"idempotency_key":"task-20260101-0001","title":"New task"}`
 
 	first := performJSONRequest(server, http.MethodPost, "/api/tasks", body)
 	if first.Code != http.StatusAccepted {
@@ -253,7 +281,7 @@ func TestPatchRejectsIdempotencyKey(t *testing.T) {
 	}
 
 	resp := performJSONRequest(New(Deps{Ledger: l, AuthDisabled: true}), http.MethodPatch, "/api/tasks/task-001", `{
-		"idempotency_key": "client-task-1",
+		"idempotency_key": "task-20260101-0001",
 		"title": "Updated"
 	}`)
 	if resp.Code != http.StatusBadRequest {
