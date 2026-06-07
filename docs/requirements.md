@@ -187,8 +187,9 @@ list_projects()
 list_tasks(project_slug)
   → 台帳のスナップショット（全アクティブタスク）
 
-create_task(project_slug, title, description)
+create_task(project_slug, title, description, request)
   → 台帳に unstarted タスクを追加
+  → 自然文 intake の場合は request または description だけを受け取り、title は省略可能
 
 update_task(project_slug, id, fields{})
   → 台帳の front matter フィールドを更新
@@ -248,6 +249,7 @@ notify(type, payload)
 | Web UI からタスク追加 | 対象プロジェクトとユーザー入力を渡して即時起動（コードベース調査 → 台帳反映） |
 
 Orchestrator 起動時は対象プロジェクトの設定、台帳スナップショット、ハーネス一覧をプロンプトに注入する。Orchestrator はステートレスで、起動のたびに現在状態を読んで判断する。
+自然文 intake タスクは、`body` に自由文の要望だけを保持し、`allowed_files` が空のまま作成されてもよい。Orchestrator はこれを worker-ready タスクとして即 spawn せず、リポジトリを調査したうえで `update_task` / `create_task` / `split_task` / `archive_task` を使い、調査結果、実装範囲、禁止範囲、検証方法を台帳本文または子タスクへ明記する。曖昧または危険な要望は、推測で実装へ進まず、台帳本文または reason に不足情報・ブロッカー・確認質問を残す。
 
 台帳が大きい場合はプロンプトがコンテキスト上限を超える可能性がある。タスクの description は簡潔に保つことを推奨する。
 

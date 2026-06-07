@@ -126,14 +126,14 @@ project は Web UI の Settings から追加できます。
 Web UI 向け:
 
 - `GET /api/tasks`
-- `POST /api/tasks`
+- `POST /api/tasks` — `request` または `body` だけの自然文 intake も登録できます
 - `PATCH /api/tasks/{id}`
 - `DELETE /api/tasks/{id}`
 - `GET /api/workers`
 - `POST /api/workers/{worker_id}/followup`
 - `GET /api/projects`
 - `GET /api/projects/{slug}/tasks`
-- `POST /api/projects/{slug}/tasks`
+- `POST /api/projects/{slug}/tasks` — `request` または `body` だけの自然文 intake も登録できます
 - `PATCH /api/projects/{slug}/tasks/{id}`
 - `DELETE /api/projects/{slug}/tasks/{id}`
 - `GET /api/projects/{slug}/workers`
@@ -152,6 +152,11 @@ MCP 向け:
 
 - `POST /mcp/orchestrator`
 - `POST /mcp/worker`
+
+自然文 intake は `Natural language intake` の仮タイトルで台帳に保存され、Orchestrator が
+コードベースを調査してから MCP の `update_task` / `create_task` / `split_task` /
+`archive_task` で調査結果、実装範囲、禁止範囲、検証方法、または不足情報を明記します。
+既存の Add Task UI は同じ backend API に `body` を送っているため、この経路では追加 UI 変更は不要です。
 
 詳細な要件は [docs/requirements.md](docs/requirements.md)、実装の段階計画は
 [docs/implementation-plan.md](docs/implementation-plan.md) を参照してください。

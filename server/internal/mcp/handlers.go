@@ -52,13 +52,14 @@ func RegisterOrchestratorTools(s *Server, deps *Deps) {
 
 	s.Register(ToolDef{
 		Name:        "create_task",
-		Description: "Add an unstarted task to the ledger.",
+		Description: "Add an unstarted task to the ledger. For raw natural-language intake, pass request without title or allowed_files.",
 		InputSchema: inSchema(projectProps(map[string]any{
 			"title":           prop("string", "Task title"),
+			"request":         prop("string", "Raw natural-language request to investigate"),
 			"description":     prop("string", "Task description (body text)"),
 			"allowed_files":   arrayProp("string", "Paths worker may edit"),
 			"forbidden_files": arrayProp("string", "Paths worker must not edit"),
-		}), []string{"title"}),
+		}), nil),
 	}, handleCreateTask(deps))
 
 	s.Register(ToolDef{
@@ -210,14 +211,26 @@ func handleCreateTask(deps *Deps) ToolHandler {
 		if err != nil {
 			return nil, err
 		}
-		title, err := stringArg(args, "title")
-		if err != nil {
-			return nil, err
-		}
-		if strings.TrimSpace(title) == "" {
-			return nil, fmt.Errorf("title must be a non-empty string")
+		title := ""
+		if _, ok := args["title"]; ok {
+			var err error
+			title, err = stringArg(args, "title")
+			if err != nil {
+				return nil, err
+			}
 		}
 		description := optionalStringArg(args, "description")
+		if strings.TrimSpace(description) == "" {
+			if request := optionalStringArg(args, "request"); strings.TrimSpace(request) != "" {
+				description = request
+			}
+		}
+		if strings.TrimSpace(title) == "" && strings.TrimSpace(description) == "" {
+			return nil, fmt.Errorf("title, description, or request is required")
+		}
+		if strings.TrimSpace(title) == "" {
+			title = "Natural language intake"
+		}
 		allowedFiles, _ := stringSliceArg(args, "allowed_files")
 		forbiddenFiles, _ := stringSliceArg(args, "forbidden_files")
 

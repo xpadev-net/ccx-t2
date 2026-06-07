@@ -58,6 +58,22 @@ func (realTmux) IsPaneIdle(ctx context.Context, session, window string) (bool, e
 	return tmux.IsPaneIdleContext(ctx, session, window)
 }
 
+type promptTask struct {
+	ID             string   `json:"id"`
+	Title          string   `json:"title,omitempty"`
+	Status         string   `json:"status,omitempty"`
+	Branch         string   `json:"branch,omitempty"`
+	WorkerID       string   `json:"worker_id,omitempty"`
+	Harness        string   `json:"harness,omitempty"`
+	AllowedFiles   []string `json:"allowed_files,omitempty"`
+	ForbiddenFiles []string `json:"forbidden_files,omitempty"`
+	PrURL          string   `json:"pr_url,omitempty"`
+	MergeCommit    string   `json:"merge_commit,omitempty"`
+	Reason         string   `json:"reason,omitempty"`
+	UpdatedAt      string   `json:"updated_at,omitempty"`
+	Body           string   `json:"body,omitempty"`
+}
+
 // Orchestrator starts and queues stateless orchestrator harness runs.
 type Orchestrator struct {
 	ledger       *ledger.Ledger
@@ -537,7 +553,7 @@ func (o *Orchestrator) buildPrompt(reason string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("load ledger snapshot: %w", err)
 	}
-	taskJSON, err := json.MarshalIndent(tasks, "", "  ")
+	taskJSON, err := json.MarshalIndent(promptTasksFromLedger(tasks), "", "  ")
 	if err != nil {
 		return "", fmt.Errorf("marshal ledger snapshot: %w", err)
 	}
@@ -557,6 +573,10 @@ func (o *Orchestrator) buildPrompt(reason string) (string, error) {
 	sb.WriteString("Decide which unstarted, blocked, or in-progress tasks need action. ")
 	sb.WriteString("Spawn workers for actionable unstarted tasks, archive completed tasks, ")
 	sb.WriteString("stop or follow up workers when appropriate, and create/split/update tasks only through MCP tools.\n\n")
+	sb.WriteString("Natural-language intake tasks may contain only a free-form request in the body and no allowed_files. ")
+	sb.WriteString("Treat them as investigation requests, not worker-ready implementation tasks: inspect the repository first, ")
+	sb.WriteString("then use update_task, create_task, split_task, or archive_task to record research findings, implementation scope, forbidden scope, and validation method before any worker is spawned. ")
+	sb.WriteString("If the request is ambiguous or unsafe, do not guess; update the task body or reason with the missing information, blockers, and clarifying questions.\n\n")
 	sb.WriteString("Project:\n")
 	sb.WriteString("  slug: " + promptLine(o.cfg.Project.Slug) + "\n")
 	sb.WriteString("  repo_path: " + promptLine(o.cfg.Project.RepoPath) + "\n")
@@ -567,6 +587,28 @@ func (o *Orchestrator) buildPrompt(reason string) (string, error) {
 	sb.Write(harnessJSON)
 	sb.WriteString("\n```\n")
 	return sb.String(), nil
+}
+
+func promptTasksFromLedger(tasks []ledger.Task) []promptTask {
+	out := make([]promptTask, len(tasks))
+	for i, task := range tasks {
+		out[i] = promptTask{
+			ID:             task.ID,
+			Title:          task.Title,
+			Status:         task.Status,
+			Branch:         task.Branch,
+			WorkerID:       task.WorkerID,
+			Harness:        task.Harness,
+			AllowedFiles:   task.AllowedFiles,
+			ForbiddenFiles: task.ForbiddenFiles,
+			PrURL:          task.PrURL,
+			MergeCommit:    task.MergeCommit,
+			Reason:         task.Reason,
+			UpdatedAt:      task.UpdatedAt,
+			Body:           task.Body,
+		}
+	}
+	return out
 }
 
 func promptLine(s string) string {
