@@ -382,40 +382,18 @@ func TestTriggerKeepsQueuedWorkWhenWindowBecomesActiveBeforeStart(t *testing.T) 
 	}
 }
 
-func TestTriggerActiveWindowWithZeroTimeoutWaits(t *testing.T) {
+func TestTriggerRejectsNonPositiveTimeout(t *testing.T) {
 	l, cfg := newTestDeps(t)
 	cfg.Orchestrator.Timeout = 0
-	fake := &fakeTmux{alive: true, idle: false}
 	o := New(l, cfg, "proj", "http://localhost:8080")
-	o.tmux = fake
-	o.pollInterval = time.Millisecond
-	t.Cleanup(o.Close)
+	o.tmux = &fakeTmux{}
 
-	if err := o.Trigger(context.Background(), "active"); err != nil {
-		t.Fatalf("Trigger: %v", err)
+	err := o.Trigger(context.Background(), "bad timeout")
+	if err == nil {
+		t.Fatal("Trigger non-positive timeout error = nil, want error")
 	}
-	creates, commands, prompts := fake.counts()
-	if kills := fake.killCount(); kills != 0 || creates != 0 || commands != 0 || prompts != 0 {
-		t.Fatalf("zero-timeout active trigger relaunched: kills=%d creates=%d commands=%d prompts=%d", kills, creates, commands, prompts)
-	}
-	if queued := queuedSnapshot(o); !reflect.DeepEqual(queued, []string{"active"}) {
-		t.Fatalf("queued = %#v, want active trigger preserved", queued)
-	}
-	o.mu.Lock()
-	warned := o.warnedNoTimeout
-	o.mu.Unlock()
-	if !warned {
-		t.Fatal("warnedNoTimeout = false, want warning state recorded")
-	}
-	fake.setIdle(true)
-	if _, err := o.isActive(context.Background()); err != nil {
-		t.Fatalf("isActive idle: %v", err)
-	}
-	o.mu.Lock()
-	warned = o.warnedNoTimeout
-	o.mu.Unlock()
-	if warned {
-		t.Fatal("warnedNoTimeout = true after idle, want reset")
+	if !strings.Contains(err.Error(), "orchestrator timeout must be positive") {
+		t.Fatalf("Trigger error = %v", err)
 	}
 }
 
@@ -1004,6 +982,7 @@ func newTestDeps(t *testing.T) (*ledger.Ledger, *config.Config) {
 		Server: config.ServerConfig{McpSecret: "tok en"},
 		Orchestrator: config.OrchestratorConfig{
 			Harness: "orch",
+			Timeout: time.Minute,
 		},
 		WorkerHarnesses: []string{"worker"},
 		Harnesses: map[string]config.HarnessConfig{

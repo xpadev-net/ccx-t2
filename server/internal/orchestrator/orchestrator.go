@@ -580,6 +580,9 @@ func (o *Orchestrator) validate() error {
 	if strings.TrimSpace(o.baseURL) == "" {
 		return fmt.Errorf("orchestrator base URL is required")
 	}
+	if o.cfg.Orchestrator.Timeout <= 0 {
+		return fmt.Errorf("orchestrator timeout must be positive")
+	}
 	hCfg, ok := o.cfg.Harnesses[o.cfg.Orchestrator.Harness]
 	if !ok {
 		return fmt.Errorf("orchestrator harness %q not configured", o.cfg.Orchestrator.Harness)
