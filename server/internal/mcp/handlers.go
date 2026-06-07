@@ -1135,6 +1135,10 @@ func cleanupTaskBranch(ctx context.Context, repoPath, branch, taskID string) {
 			log.Printf("warn: worker cleanup skipped unsafe branch delete for task %s: %v", taskID, err)
 			return
 		}
+		if errors.Is(err, worktree.ErrOriginUnavailable) {
+			log.Printf("warn: worker cleanup skipped branch delete for task %s (origin unavailable): %v", taskID, err)
+			return
+		}
 		log.Printf("warn: worker cleanup failed to delete branch %q for task %s: %v", branch, taskID, err)
 	}
 }
