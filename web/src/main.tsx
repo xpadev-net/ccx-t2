@@ -27,6 +27,14 @@ type TaskDeleteResponse = {
   delete_pending?: boolean;
 };
 
+type WorkerInfo = {
+  worker_id: string;
+  task_id: string;
+  harness?: string;
+  worktree_path?: string;
+  started_at?: string;
+};
+
 const statusOptions = ["unstarted", "in_progress", "blocked", "completed", "split"];
 const tokenStorageKey = "ccx.webToken";
 
@@ -39,6 +47,10 @@ function App() {
   const [newTitle, setNewTitle] = useState("");
   const [newBody, setNewBody] = useState("");
   const [token, setToken] = useState(() => initialToken());
+  const [tokenDraft, setTokenDraft] = useState(() => initialToken());
+  const [workers, setWorkers] = useState<WorkerInfo[]>([]);
+  const [selectedWorkerID, setSelectedWorkerID] = useState("");
+  const [workerLog, setWorkerLog] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState("");
@@ -48,9 +60,18 @@ function App() {
     () => tasks.find((task) => task.id === selectedID) ?? tasks[0],
     [selectedID, tasks]
   );
+  const selectedWorker = useMemo(
+    () => workers.find((worker) => worker.worker_id === selectedWorkerID) ?? workers[0],
+    [selectedWorkerID, workers]
+  );
+  const selectedWorkerTask = useMemo(
+    () => tasks.find((task) => task.id === selectedWorker?.task_id),
+    [selectedWorker?.task_id, tasks]
+  );
 
   useEffect(() => {
     void refreshTasks();
+    void refreshWorkers();
   }, []);
 
   useEffect(() => {
@@ -62,6 +83,7 @@ function App() {
         const msg = JSON.parse(String(event.data)) as { type?: string };
         if (msg.type === "ledger_changed") {
           void refreshTasks(false);
+          void refreshWorkers();
         }
       } catch {
         // Ignore malformed websocket messages; the next manual refresh will recover.
@@ -69,6 +91,61 @@ function App() {
     });
     return () => socket.close();
   }, [token]);
+
+  useEffect(() => {
+    if (!selectedWorker) {
+      setSelectedWorkerID("");
+      setWorkerLog([]);
+      return;
+    }
+    setSelectedWorkerID(selectedWorker.worker_id);
+    setWorkerLog([]);
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const tokenQuery = token ? `?token=${encodeURIComponent(token)}` : "";
+    let attempts = 0;
+    let closed = false;
+    let retryTimer: number | undefined;
+    let socket: WebSocket | undefined;
+    const connect = () => {
+      if (closed) {
+        return;
+      }
+      socket = new WebSocket(
+        `${protocol}//${window.location.host}/ws/worker/${encodeURIComponent(selectedWorker.worker_id)}${tokenQuery}`
+      );
+      socket.addEventListener("message", (event) => {
+        try {
+          const msg = JSON.parse(String(event.data)) as { type?: string; data?: string };
+          if (msg.type === "line" && typeof msg.data === "string") {
+            setWorkerLog((current) => [...current.slice(-299), msg.data as string]);
+          } else if (msg.type === "closed") {
+            setWorkerLog((current) => [...current, "[stream closed]"]);
+          } else if (msg.type === "error" && msg.data) {
+            setWorkerLog((current) => [...current, `[error] ${msg.data}`]);
+          }
+        } catch {
+          setWorkerLog((current) => [...current, String(event.data)]);
+        }
+      });
+      socket.addEventListener("error", () => {
+        setWorkerLog((current) => [...current, "[stream error]"]);
+      });
+      socket.addEventListener("close", () => {
+        if (!closed && attempts < 3) {
+          attempts += 1;
+          retryTimer = window.setTimeout(connect, 250 * attempts);
+        }
+      });
+    };
+    connect();
+    return () => {
+      closed = true;
+      if (retryTimer !== undefined) {
+        window.clearTimeout(retryTimer);
+      }
+      socket?.close();
+    };
+  }, [selectedWorker?.worker_id, token]);
 
   useEffect(() => {
     if (!selectedTask) {
@@ -84,13 +161,13 @@ function App() {
     setStatus(selectedTask.status || "unstarted");
   }, [selectedTask?.id, selectedTask?.title, selectedTask?.body, selectedTask?.status]);
 
-  async function refreshTasks(showLoading = true) {
+  async function refreshTasks(showLoading = true, authToken = token) {
     if (showLoading) {
       setLoading(true);
     }
     setError("");
     try {
-      const data = await api<Task[]>("/api/tasks", {}, token);
+      const data = await api<Task[]>("/api/tasks", {}, authToken);
       setTasks(data);
       setSelectedID((current) => current || data[0]?.id || "");
     } catch (err) {
@@ -98,6 +175,20 @@ function App() {
     } finally {
       setLoading(false);
     }
+  }
+
+  async function refreshWorkers(authToken = token) {
+    try {
+      const data = await api<WorkerInfo[]>("/api/workers", {}, authToken);
+      setWorkers(data);
+      setSelectedWorkerID((current) => current || data[0]?.worker_id || "");
+    } catch (err) {
+      setError(errorMessage(err));
+    }
+  }
+
+  async function refreshAll(showLoading = true, authToken = token) {
+    await Promise.all([refreshTasks(showLoading, authToken), refreshWorkers(authToken)]);
   }
 
   async function createTask(event: FormEvent) {
@@ -125,7 +216,7 @@ function App() {
           ? "Task created; orchestrator trigger failed."
           : "Task created and orchestrator notified."
       );
-      await refreshTasks(false);
+      await refreshAll(false);
       setSelectedID(response.task.id);
     } catch (err) {
       setError(errorMessage(err));
@@ -181,7 +272,7 @@ function App() {
         setMessage("Task deleted.");
       }
       setSelectedID("");
-      await refreshTasks(false);
+      await refreshAll(false);
     } catch (err) {
       setError(errorMessage(err));
     } finally {
@@ -196,7 +287,7 @@ function App() {
           <h1>ccx-t2</h1>
           <p>Task ledger and worker orchestration</p>
         </div>
-        <button className="secondary" type="button" onClick={() => void refreshTasks()} disabled={loading}>
+        <button className="secondary" type="button" onClick={() => void refreshAll()} disabled={loading}>
           Refresh
         </button>
       </header>
@@ -287,6 +378,36 @@ function App() {
           </form>
         </section>
 
+        <section className="worker-dashboard" aria-label="Worker dashboard">
+          <div className="section-heading">
+            <h2>Workers</h2>
+            <span>{workers.length} active</span>
+          </div>
+          <div className="worker-layout">
+            <div className="worker-list">
+              {workers.map((worker) => (
+                <button
+                  className={`worker-row ${worker.worker_id === selectedWorker?.worker_id ? "selected" : ""}`}
+                  key={worker.worker_id}
+                  type="button"
+                  onClick={() => setSelectedWorkerID(worker.worker_id)}
+                >
+                  <span className="task-title">{worker.worker_id}</span>
+                  <span>{worker.harness || "worker"}</span>
+                </button>
+              ))}
+              {workers.length === 0 && <div className="empty">No active workers.</div>}
+            </div>
+            <div className="log-panel">
+              <div className="log-heading">
+                <span>{selectedWorker?.task_id || "No worker selected"}</span>
+                {selectedWorkerTask?.branch && <span>{selectedWorkerTask.branch}</span>}
+              </div>
+              <pre>{workerLog.length ? workerLog.join("\n") : "Waiting for worker output..."}</pre>
+            </div>
+          </div>
+        </section>
+
         <section className="auth-panel" aria-label="API token">
           <div className="section-heading">
             <h2>API Token</h2>
@@ -296,13 +417,22 @@ function App() {
             Token
             <input
               type="password"
-              value={token}
-              onChange={(event) => {
-                setToken(event.target.value);
-                storeToken(event.target.value);
-              }}
+              value={tokenDraft}
+              onChange={(event) => setTokenDraft(event.target.value)}
             />
           </label>
+          <div className="actions wide">
+            <button
+              type="button"
+              onClick={() => {
+                setToken(tokenDraft);
+                storeToken(tokenDraft);
+                void refreshAll(true, tokenDraft);
+              }}
+            >
+              Apply
+            </button>
+          </div>
         </section>
       </section>
     </main>
