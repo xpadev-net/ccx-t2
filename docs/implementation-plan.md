@@ -7,10 +7,12 @@ ccx-t2/
 ├── server/                        ← Go バックエンド
 │   ├── cmd/
 │   │   └── ccx/
-│   │       └── main.go           ← エントリーポイント
+│   │       └── main.go           ← `ccx serve` エントリーポイント
 │   ├── internal/
 │   │   ├── config/
-│   │   │   └── config.go         ← 設定ファイル読み込み（yaml.v3 で直接 unmarshal）
+│   │   │   └── config.go         ← グローバル設定ファイル読み込み（yaml.v3 で直接 unmarshal）
+│   │   ├── runtime/
+│   │   │   └── manager.go        ← 複数プロジェクト runtime の生成・参照
 │   │   ├── ledger/
 │   │   │   ├── ledger.go         ← 台帳読み書き（ミューテックスで排他制御）
 │   │   │   └── parser.go         ← MD front matter パーサー
@@ -43,11 +45,22 @@ ccx-t2/
 │   ├── vite.config.ts
 │   ├── tsconfig.json
 │   └── package.json
-├── tasks/
-│   ├── ledger.md                  ← タスク台帳（未着手・進行中）
-│   └── archive/                   ← 完了タスク
-└── config.yaml
+└── tasks/
+    ├── ledger.md                  ← このリポジトリ自身のタスク台帳
+    └── archive/                   ← 完了タスク
 ```
+
+---
+
+## 前提アーキテクチャ
+
+- 起動は `ccx serve --config ~/.config/ccx-t2/config.yaml` の単一コマンドに集約する
+- `--config` 省略時は `~/.config/ccx-t2/config.yaml` を読む
+- 設定ファイルはグローバルに1つだけ持ち、`projects` 配下に複数プロジェクトを登録する
+- Go プロセスは REST API / WebSocket / MCP / Web UI 静的配信 / heartbeat scheduler をまとめて起動する
+- 各プロジェクトは `project_slug` をキーに、ledger、worker registry、orchestrator、scheduler を持つ
+- tmux session はプロセスで1つを既定とし、window 名は `{project_slug}-orchestrator`、`{project_slug}-worker-{task_id}` とする
+- API / MCP / WebSocket は `project_slug` を受け取り、対象プロジェクトの runtime にルーティングする
 
 ---
 
@@ -55,7 +68,7 @@ ccx-t2/
 
 ### 目標
 
-`tasks/ledger.md` の読み書きができる状態にする。
+プロジェクトごとに指定された `ledger_path` の読み書きができる状態にする。
 
 ### 実装内容
 
@@ -73,10 +86,18 @@ ccx-t2/
 - `Update(id string, fields map[string]any) error`
 - `Archive(id string) error` — `tasks/archive/` にファイルを切り出し
 - 全メソッドで `sync.Mutex` による排他制御（REST・MCP の両経路からの書き込みに対応）
+- ledger のパスは constructor で受け取り、runtime manager がプロジェクト設定から生成する
 
 **`internal/ledger/ledger_test.go`**
 - パーサーのユニットテスト
 - 複数タスクの読み書きラウンドトリップテスト
+
+**`internal/config/config.go`**
+- `Config` は `server` / `runtime` / `orchestrator` / `worker_harnesses` / `harnesses` / `projects` を持つグローバル設定とする
+- `ProjectConfig` は `repo_path` / `ledger_path` / `validation_command` / `github` / `orchestrator` override を持つ
+- `runtime.worktree_base` と `runtime.tmux_session` はグローバル既定値とする
+- `ledger_path` 未指定時は `{repo_path}/tasks/ledger.md` を使う
+- `${VAR}` 形式の環境変数展開と validation をグローバル設定全体に適用する
 
 ---
 
@@ -99,11 +120,38 @@ tmux ウィンドウの作成・削除・キー送信と git worktree の管理�
 - `Create(repoPath, branch, worktreePath string) error` — `git worktree add -b {branch}`（ブランチを新規作成）
 - `Remove(repoPath, worktreePath string) error` — `git -C {repoPath} worktree remove --force`
 
+worktree path は `runtime.worktree_base/{project_slug}-{task_id}` を既定とする。
+
+---
+
+## フェーズ2.5：単一コマンド起動・runtime manager
+
+### 目標
+
+`ccx serve` でグローバル設定を読み、複数プロジェクトの runtime を単一プロセス内に構築する。
+
+### 実装内容
+
+**`server/cmd/ccx/main.go`**
+- `ccx serve --config <path>` を実装する
+- `--config` 省略時は `~/.config/ccx-t2/config.yaml`
+- 設定をロードし、tmux session を ensure する
+- `runtime.Manager` を生成し、各プロジェクトの ledger / registry / orchestrator / scheduler を初期化する
+- HTTP server を `server.port` で起動する
+- SIGINT / SIGTERM で HTTP server と scheduler を graceful shutdown する
+
+**`internal/runtime/manager.go`**
+- `ProjectRuntime` に `Slug`, `Config`, `Ledger`, `Registry`, `Orchestrator`, `Scheduler` を保持する
+- `Manager.Project(slug)` で登録済みプロジェクトを返す
+- `Manager.Projects()` で Web UI / MCP 用にプロジェクト一覧を返す
+- `Manager.Start(ctx)` で全プロジェクトの scheduler を起動する
+- 未登録 `project_slug` は typed error にして REST / MCP で 404 / tool error に変換する
+
 ---
 
 ## フェーズ3：MCP サーバー
 
-**フェーズ2の完了が前提。** `spawn_worker`・`stop_worker` はフェーズ2の tmux・worktree 実装に依存する。
+**フェーズ2.5の完了が前提。** `spawn_worker`・`stop_worker` はフェーズ2の tmux・worktree 実装とフェーズ2.5の runtime manager に依存する。
 
 ### 目標
 
@@ -118,22 +166,23 @@ Orchestrator・Worker がツールを呼べる HTTP MCP サーバーを立てる
 - エンドポイントでロールを分離し、Orchestrator 向けと Worker 向けを別パスで提供
 
 **エンドポイントによるロール分離：**
-- `POST /mcp/orchestrator` — Orchestrator 向けツール（10本）のみ受け付ける
+- `POST /mcp/orchestrator` — Orchestrator 向けツール（11本）のみ受け付ける
 - `POST /mcp/worker` — Worker 向けツール（notify のみ）のみ受け付ける
 - 各エンドポイントは登録外のツール名を受け取った場合にエラーを返し、ロールを越えた呼び出しを拒否する
 
 実装するツール（要件定義書の MCP セクション参照）：
-- Orchestrator 向け（`/mcp/orchestrator`）: list_tasks, create_task, update_task, split_task, archive_task, list_harnesses, spawn_worker, stop_worker, followup_worker, get_pr_status
+- Orchestrator 向け（`/mcp/orchestrator`）: list_projects, list_tasks, create_task, update_task, split_task, archive_task, list_harnesses, spawn_worker, stop_worker, followup_worker, get_pr_status
 - Worker 向け（`/mcp/worker`）: notify
 
 `spawn_worker` の実行順序：
-1. `worktree.Create(repoPath, branch, worktreePath)` — worktree を生成してブランチを作成
-2. `tmux.CreateWindow(session, "worker-{task_id}")` — tmux ウィンドウを作成
-3. ハーネス起動コマンドを組み立て（worktree path・MCP URL `/mcp/worker`・タスク詳細を注入）
-4. `tmux.SendKeys` でハーネスを起動
-5. 台帳の status を in_progress に更新し branch / worker_id / harness フィールドを設定
+1. `project_slug` で runtime manager から対象プロジェクトを解決
+2. `worktree.Create(project.repo_path, branch, worktreePath)` — worktree を生成してブランチを作成
+3. `tmux.CreateWindow(runtime.tmux_session, "{project_slug}-worker-{task_id}")` — tmux ウィンドウを作成
+4. ハーネス起動コマンドを組み立て（project_slug・worktree path・MCP URL `/mcp/worker`・タスク詳細を注入）
+5. `tmux.SendKeys` でハーネスを起動
+6. 対象プロジェクトの台帳の status を in_progress に更新し branch / worker_id / harness フィールドを設定
 
-ステップ5（台帳更新）が失敗した場合、ウィンドウを `KillWindow` で停止した後に worktree を削除してエラーを返す。ステップ1〜4が失敗した場合、それまでに作成済みのリソース（worktree・ウィンドウ）を逆順で削除してエラーを返す。
+ステップ6（台帳更新）が失敗した場合、ウィンドウを `KillWindow` で停止した後に worktree を削除してエラーを返す。ステップ1〜5が失敗した場合、それまでに作成済みのリソース（worktree・ウィンドウ）を逆順で削除してエラーを返す。
 
 ---
 
@@ -148,6 +197,7 @@ Worker からのイベントを直列に処理し、Orchestrator を適切なタ
 **`internal/event/queue.go`**
 - Worker notify イベントを受け取る FIFO キュー（バッファ付き `chan Event`）
 - goroutine で1件ずつ処理（直列）
+- Event は `project_slug` を必須とし、runtime manager から対象プロジェクトの台帳と orchestrator を解決する
 - イベント種別に応じて台帳を更新してから Orchestrator.Trigger を呼ぶ
   - `completed`：status を `completed` に設定し payload の `pr_url` を台帳に書き込む（`merge_commit` はアーカイブファイルに記録するため台帳には書かない）
   - `blocked`：status を `blocked` に設定し、payload の `reason` を台帳に書き込む
@@ -155,9 +205,9 @@ Worker からのイベントを直列に処理し、Orchestrator を適切なタ
 
 **`internal/orchestrator/orchestrator.go`**
 - `Trigger(ctx context.Context, reason string) error`
-  - 台帳スナップショット・ハーネス一覧をプロンプトに注入
-  - 設定されたハーネスで Orchestrator を tmux の `orchestrator` ウィンドウで起動
-  - 既存の Orchestrator が実行中の場合はキューイングし、完了後に処理
+  - project_slug・対象プロジェクト設定・台帳スナップショット・ハーネス一覧をプロンプトに注入
+  - 設定されたハーネスで Orchestrator を tmux の `{project_slug}-orchestrator` ウィンドウで起動
+  - 同一プロジェクトの既存 Orchestrator が実行中の場合はキューイングし、完了後に処理
 - Orchestrator ウィンドウの実行状態は tmux ウィンドウの存在と pane の状態で判定する
 
 **`internal/scheduler/scheduler.go`**
@@ -177,28 +227,30 @@ Worker からのイベントを直列に処理し、Orchestrator を適切なタ
 
 **`server/internal/web/server.go`**
 - REST API
-  - `GET /api/tasks` — 台帳一覧
-  - `POST /api/tasks` — タスク追加（Orchestrator にトリガー）
-  - `PATCH /api/tasks/:id` — タスク更新
-  - `DELETE /api/tasks/:id` — タスク削除（in_progress の場合は stop_worker・worktree 削除を連動）
-  - `GET /api/workers` — Worker 一覧（内部 Worker レジストリから返す。tmux ウィンドウ一覧と同期）
+  - `GET /api/projects` — 登録済みプロジェクト一覧
+  - `GET /api/projects/:slug/tasks` — 対象プロジェクトの台帳一覧
+  - `POST /api/projects/:slug/tasks` — タスク追加（対象プロジェクトの Orchestrator にトリガー）
+  - `PATCH /api/projects/:slug/tasks/:id` — タスク更新
+  - `DELETE /api/projects/:slug/tasks/:id` — タスク削除（in_progress の場合は stop_worker・worktree 削除を連動）
+  - `GET /api/projects/:slug/workers` — 対象プロジェクトの Worker 一覧（内部 Worker レジストリから返す。tmux ウィンドウ一覧と同期）
   - `GET /api/harnesses` — ハーネス一覧
-  - `GET /api/config` — 設定取得（GitHub トークン等のシークレットは返さない）
-  - `PATCH /api/config` — 設定更新
+  - `GET /api/config` — グローバル設定取得（GitHub トークン等のシークレットは返さない）
+  - `PATCH /api/config` — グローバル設定更新。プロジェクト追加・更新・削除を含む
 - 本番ビルド時は `web/dist/` をビルド済み静的ファイルとして配信
 
 **`server/internal/web/ws.go`**
-- `GET /ws/worker/:window` — tmux pipe-pane をブリッジして Worker ログをストリーミング
-- `GET /ws/ledger` — 台帳の変更（MCP ツール実行・REST 書き込みの後）を push 通知
+- `GET /ws/projects/:slug/worker/:window` — tmux pipe-pane をブリッジして Worker ログをストリーミング
+- `GET /ws/projects/:slug/ledger` — 対象プロジェクトの台帳変更（MCP ツール実行・REST 書き込みの後）を push 通知
 
 **`web/` （Vite + React + TypeScript）**
 - 開発時は Vite dev server（デフォルト `localhost:5173`）を起動し、`/api` と `/ws` を Go サーバー（デフォルト `localhost:8080`）にプロキシする
 - 本番ビルド（`vite build`）の出力 `web/dist/` を Go サーバーが配信する
 - 画面構成
+  - プロジェクト切り替え
   - タスク台帳ビュー（一覧・編集・削除）
   - タスク追加フォーム（自然言語入力 → Orchestrator 経由）
   - Worker ダッシュボード（ログストリーミング）
-  - 設定画面
+  - グローバル設定画面（harness と project 登録）
 
 ---
 
@@ -235,7 +287,8 @@ Worker からのイベントを直列に処理し、Orchestrator を適切なタ
 |---|---|---|---|
 | 1 | 台帳・パーサー | なし | ledger.md の CRUD が動くユニットテストが通る |
 | 2 | tmux・Worktree | なし | tmux ウィンドウの作成・削除・ログ取得ができる |
-| 3 | MCP サーバー | フェーズ2 | curl でツールを呼べる |
+| 2.5 | 単一コマンド起動・runtime manager | フェーズ1,2 | `ccx serve` が複数プロジェクト runtime と HTTP server を起動できる |
+| 3 | MCP サーバー | フェーズ2.5 | curl で project_slug 付きツールを呼べる |
 | 4 | イベントキュー・Orchestrator トリガー | フェーズ3 | Worker notify → Orchestrator 起動が動く |
-| 5 | Web UI | フェーズ4 | ブラウザから台帳操作・Worker ログ閲覧ができる |
+| 5 | Web UI | フェーズ4 | ブラウザからプロジェクトを切り替えて台帳操作・Worker ログ閲覧ができる |
 | 6 | ハーネス統合テスト | フェーズ5 | 対応ハーネスでエンドツーエンドフローが通る |
