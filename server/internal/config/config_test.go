@@ -51,6 +51,7 @@ func TestLoadGlobalProjectsConfig(t *testing.T) {
 	path := filepath.Join(dir, "config.yaml")
 	yaml := `
 server:
+  host: 0.0.0.0
   port: 18080
 runtime:
   tmux_session: ccx-t2-test
@@ -81,6 +82,9 @@ projects:
 	cfg, err := Load(path)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Server.Host != "0.0.0.0" {
+		t.Fatalf("server.host = %q, want 0.0.0.0", cfg.Server.Host)
 	}
 
 	alpha := cfg.Projects["alpha"]

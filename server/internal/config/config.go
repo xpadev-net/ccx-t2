@@ -34,6 +34,7 @@ type ProjectConfig struct {
 
 // ServerConfig holds HTTP server settings.
 type ServerConfig struct {
+	Host      string `yaml:"host"`
 	Port      int    `yaml:"port"`
 	McpSecret string `yaml:"mcp_secret"` // optional Bearer token for MCP endpoints
 }
@@ -193,6 +194,7 @@ func expandEnv(cfg *Config) {
 	cfg.Project.GitHub.Token = expand(cfg.Project.GitHub.Token)
 	cfg.Project.GitHub.Owner = expand(cfg.Project.GitHub.Owner)
 	cfg.Project.GitHub.Repo = expand(cfg.Project.GitHub.Repo)
+	cfg.Server.Host = expand(cfg.Server.Host)
 	cfg.Runtime.TmuxSession = expand(cfg.Runtime.TmuxSession)
 	cfg.Runtime.WorktreeBase = expand(cfg.Runtime.WorktreeBase)
 	cfg.Orchestrator.Harness = expand(cfg.Orchestrator.Harness)
@@ -227,6 +229,9 @@ func expandEnv(cfg *Config) {
 func applyDefaults(cfg *Config) {
 	if cfg.Server.Port == 0 {
 		cfg.Server.Port = 8080
+	}
+	if cfg.Server.Host == "" {
+		cfg.Server.Host = "127.0.0.1"
 	}
 	if cfg.Runtime.TmuxSession == "" {
 		cfg.Runtime.TmuxSession = "ccx-t2"
@@ -294,6 +299,9 @@ func normalizeProjects(cfg *Config) {
 func validate(cfg *Config) error {
 	if cfg.Server.Port < 1 || cfg.Server.Port > 65535 {
 		return fmt.Errorf("config: server.port %d out of range [1, 65535]", cfg.Server.Port)
+	}
+	if strings.ContainsAny(cfg.Server.Host, " \t\r\n") {
+		return fmt.Errorf("config: server.host must not contain whitespace")
 	}
 	if strings.TrimSpace(cfg.Runtime.TmuxSession) == "" {
 		return fmt.Errorf("config: required field %q is empty", "runtime.tmux_session")

@@ -47,6 +47,7 @@ type ConfigResponse = {
     worktree_base: string;
   };
   server: {
+    host: string;
     port: number;
   };
   runtime?: {
@@ -79,6 +80,7 @@ type ConfigDraft = {
   projectSlug: string;
   repoPath: string;
   worktreeBase: string;
+  serverHost: string;
   serverPort: string;
   orchestratorHarness: string;
   heartbeatInterval: string;
@@ -663,6 +665,14 @@ function App() {
                 disabled={!config}
               />
             </label>
+            <label>
+              Listen address
+              <input
+                value={configDraft.serverHost}
+                onChange={(event) => updateConfigDraft({ serverHost: event.target.value })}
+                disabled={!config}
+              />
+            </label>
             <label className="wide">
               Repository path
               <input
@@ -851,6 +861,7 @@ function emptyConfigDraft(): ConfigDraft {
     projectSlug: "",
     repoPath: "",
     worktreeBase: "",
+    serverHost: "",
     serverPort: "",
     orchestratorHarness: "",
     heartbeatInterval: "",
@@ -867,6 +878,7 @@ function configToDraft(config: ConfigResponse): ConfigDraft {
     projectSlug: config.project.slug,
     repoPath: config.project.repo_path,
     worktreeBase: config.project.worktree_base,
+    serverHost: config.server.host || "127.0.0.1",
     serverPort: String(config.server.port),
     orchestratorHarness: config.orchestrator.harness,
     heartbeatInterval: config.orchestrator.heartbeat_interval,
@@ -894,6 +906,7 @@ function configPatchFromDraft(draft: ConfigDraft) {
       worktree_base: draft.worktreeBase
     },
     server: {
+      host: draft.serverHost,
       port: serverPort
     },
     orchestrator: {

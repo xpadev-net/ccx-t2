@@ -44,6 +44,9 @@ func TestEnsureConfigCreatesDefaultConfig(t *testing.T) {
 	if cfg.Server.Port != 8080 {
 		t.Fatalf("server.port = %d, want 8080", cfg.Server.Port)
 	}
+	if cfg.Server.Host != "127.0.0.1" {
+		t.Fatalf("server.host = %q, want 127.0.0.1", cfg.Server.Host)
+	}
 	if len(cfg.Projects) != 0 {
 		t.Fatalf("generated projects = %#v, want empty", cfg.Projects)
 	}
@@ -52,6 +55,20 @@ func TestEnsureConfigCreatesDefaultConfig(t *testing.T) {
 	}
 	if got := cfg.Harnesses["codex"].McpArgs; !strings.Contains(got, "--yolo") || !strings.Contains(got, "{url}") {
 		t.Fatalf("codex mcp_args = %q, want yolo and mcp url", got)
+	}
+}
+
+func TestBaseURLHostForWildcardListenAddress(t *testing.T) {
+	for input, want := range map[string]string{
+		"":          "127.0.0.1",
+		"0.0.0.0":   "127.0.0.1",
+		"::":        "127.0.0.1",
+		"127.0.0.1": "127.0.0.1",
+		"localhost": "localhost",
+	} {
+		if got := baseURLHost(input); got != want {
+			t.Fatalf("baseURLHost(%q) = %q, want %q", input, got, want)
+		}
 	}
 }
 

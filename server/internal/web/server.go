@@ -1002,11 +1002,13 @@ type runtimeConfigPatch struct {
 }
 
 type serverConfigResponse struct {
-	Port int `json:"port"`
+	Host string `json:"host"`
+	Port int    `json:"port"`
 }
 
 type serverConfigPatch struct {
-	Port *int `json:"port"`
+	Host *string `json:"host"`
+	Port *int    `json:"port"`
 }
 
 type orchestratorConfigResponse struct {
@@ -1092,6 +1094,7 @@ func configResponseFromConfig(cfg *config.Config) configResponse {
 	return configResponse{
 		Project: projectConfigResponseFromConfig(cfg.Project),
 		Server: serverConfigResponse{
+			Host: cfg.Server.Host,
 			Port: cfg.Server.Port,
 		},
 		Runtime: runtimeConfigResponse{
@@ -1155,9 +1158,15 @@ func applyConfigPatch(cfg *config.Config, req configPatchRequest) error {
 			changed = true
 		}
 	}
-	if req.Server != nil && req.Server.Port != nil {
-		cfg.Server.Port = *req.Server.Port
-		changed = true
+	if req.Server != nil {
+		if req.Server.Host != nil {
+			cfg.Server.Host = strings.TrimSpace(*req.Server.Host)
+			changed = true
+		}
+		if req.Server.Port != nil {
+			cfg.Server.Port = *req.Server.Port
+			changed = true
+		}
 	}
 	if req.Runtime != nil {
 		if req.Runtime.TmuxSession != nil {
