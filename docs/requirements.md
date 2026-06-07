@@ -268,7 +268,8 @@ Orchestrator 起動時は対象プロジェクトの設定、台帳スナップ�
 | 機能 | 説明 |
 |---|---|
 | タスク台帳 CRUD | タスクの追加・編集・削除。削除は in_progress タスクに対して stop_worker と worktree 削除を連動して実行する。追加は Orchestrator 経由。 |
-| Worker ダッシュボード | 各 Worker（tmux ウィンドウ）のログをリアルタイムストリーミング |
+| Orchestrator console | 選択中プロジェクトの Orchestrator（tmux ウィンドウ）のログをリアルタイムストリーミング |
+| Worker ダッシュボード | 各 Worker（tmux ウィンドウ）のログをリアルタイムストリーミングし、active Worker へ followup 入力を送信 |
 | タスク追加フォーム | 自然言語でタスクを入力 → Orchestrator がコードベースを調査して台帳に反映 |
 | ハーネス設定 | 利用可能ハーネスの登録・usage 確認 |
 | プロジェクト選択 | グローバル設定に登録されたプロジェクトを切り替え、選択中プロジェクトのタスクと worker を表示 |
@@ -278,7 +279,7 @@ Orchestrator 起動時は対象プロジェクトの設定、台帳スナップ�
 
 - フロントエンド：Web（詳細は実装フェーズで決定）
 - バックエンド：Go
-- リアルタイム通信：WebSocket（Worker ログ配信・台帳更新通知）
+- リアルタイム通信：WebSocket（Orchestrator/Worker ログ配信・台帳更新通知）
 - REST と MCP の両方が台帳を書き換えるため、Go プロセス内でミューテックスによる排他制御を行う
 
 ---

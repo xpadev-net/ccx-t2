@@ -11,8 +11,8 @@ worker の tmux セッション、worktree、MCP エンドポイント、PR 状�
 - task ごとの git worktree と tmux worker window の管理
 - orchestrator / worker 向け MCP HTTP エンドポイント
 - worker 完了通知、フォローアップ、PR 状態確認
-- WebSocket による台帳と worker ログの更新通知
-- React Web UI によるプロジェクト切り替え、タスク、worker、harness、設定の操作
+- WebSocket による台帳、orchestrator ログ、worker ログの更新通知
+- React Web UI によるプロジェクト切り替え、タスク、orchestrator/worker console、worker followup、harness、設定の操作
 
 ## リポジトリ構成
 
@@ -130,18 +130,22 @@ Web UI 向け:
 - `PATCH /api/tasks/{id}`
 - `DELETE /api/tasks/{id}`
 - `GET /api/workers`
+- `POST /api/workers/{worker_id}/followup`
 - `GET /api/projects`
 - `GET /api/projects/{slug}/tasks`
 - `POST /api/projects/{slug}/tasks`
 - `PATCH /api/projects/{slug}/tasks/{id}`
 - `DELETE /api/projects/{slug}/tasks/{id}`
 - `GET /api/projects/{slug}/workers`
+- `POST /api/projects/{slug}/workers/{worker_id}/followup`
 - `GET /api/harnesses`
 - `GET /api/config`
 - `PATCH /api/config`
 - `GET /ws/ledger`
+- `GET /ws/orchestrator`
 - `GET /ws/worker/{window}`
 - `GET /ws/projects/{slug}/ledger`
+- `GET /ws/projects/{slug}/orchestrator`
 - `GET /ws/projects/{slug}/worker/{window}`
 
 MCP 向け:
