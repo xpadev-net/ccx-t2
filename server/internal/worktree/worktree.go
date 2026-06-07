@@ -67,7 +67,11 @@ func DeleteTaskBranchIfSafeContext(ctx context.Context, repoPath, branch, taskID
 	if branch == "" {
 		return nil
 	}
-	if !BranchMatchesTaskID(branch, taskID) && !isLegacyCleanupBranchName(branch, taskID) {
+	containsTaskID := strings.Contains(branch, taskID)
+	if containsTaskID && !BranchMatchesTaskID(branch, taskID) {
+		return fmt.Errorf("%w: %q is not scoped to task %q", ErrUnsafeBranchDelete, branch, taskID)
+	}
+	if !containsTaskID && !isLegacyCleanupBranchName(branch) {
 		return fmt.Errorf("%w: %q is not scoped to task %q", ErrUnsafeBranchDelete, branch, taskID)
 	}
 	if exists, err := localBranchExists(ctx, repoPath, branch); err != nil {
@@ -140,22 +144,51 @@ func localBranchExists(ctx context.Context, repoPath, branch string) (bool, erro
 }
 
 func remoteDefaultBranchNames(ctx context.Context, repoPath string) ([]string, error) {
-	out, err := exec.CommandContext(ctx, "git", "-C", repoPath, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD").CombinedOutput()
+	remotesOut, err := exec.CommandContext(ctx, "git", "-C", repoPath, "remote").CombinedOutput()
 	if err != nil {
-		exitErr, ok := err.(*exec.ExitError)
-		if ok && exitErr.ExitCode() == 1 {
-			return nil, nil
+		return nil, fmt.Errorf("list remotes: %w: %s", err, strings.TrimSpace(string(remotesOut)))
+	}
+	var defaults []string
+	seen := make(map[string]bool)
+	for _, remote := range strings.Fields(string(remotesOut)) {
+		remoteDefaults, err := remoteDefaultBranchNamesForRemote(ctx, repoPath, remote)
+		if err != nil {
+			return nil, err
 		}
-		return nil, fmt.Errorf("read remote default branch: %w: %s", err, strings.TrimSpace(string(out)))
+		for _, defaultBranch := range remoteDefaults {
+			if defaultBranch != "" && !seen[defaultBranch] {
+				defaults = append(defaults, defaultBranch)
+				seen[defaultBranch] = true
+			}
+		}
 	}
-	ref := strings.TrimSpace(string(out))
-	if ref == "" {
-		return nil, nil
+	return defaults, nil
+}
+
+func remoteDefaultBranchNamesForRemote(ctx context.Context, repoPath, remote string) ([]string, error) {
+	var defaults []string
+	if out, err := exec.CommandContext(ctx, "git", "-C", repoPath, "symbolic-ref", "--quiet", "--short", "refs/remotes/"+remote+"/HEAD").CombinedOutput(); err == nil {
+		ref := strings.TrimSpace(string(out))
+		if i := strings.IndexByte(ref, '/'); i >= 0 {
+			defaults = append(defaults, ref[i+1:])
+		}
 	}
-	if i := strings.IndexByte(ref, '/'); i >= 0 {
-		ref = ref[i+1:]
+	remoteCtx, cancel := contextWithDefaultTimeout(ctx, 5*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(remoteCtx, "git", "-C", repoPath, "ls-remote", "--symref", remote, "HEAD").CombinedOutput()
+	if err != nil {
+		if len(defaults) > 0 {
+			return defaults, nil
+		}
+		return nil, fmt.Errorf("%w: read remote default branch for %s: %w: %s", ErrOriginUnavailable, remote, err, strings.TrimSpace(string(out)))
 	}
-	return []string{ref}, nil
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 3 && fields[0] == "ref:" && fields[2] == "HEAD" {
+			defaults = append(defaults, strings.TrimPrefix(fields[1], "refs/heads/"))
+		}
+	}
+	return defaults, nil
 }
 
 func branchCheckedOutInWorktree(ctx context.Context, repoPath, branch string) (bool, error) {
@@ -271,8 +304,11 @@ func isAlphaNumeric(b byte) bool {
 		(b >= '0' && b <= '9')
 }
 
-func isLegacyCleanupBranchName(branch, taskID string) bool {
-	return strings.Contains(branch, "/") && !strings.Contains(branch, taskID)
+// isLegacyCleanupBranchName allows namespaced branches from workers spawned
+// before branch names were required to embed task IDs. Callers pass the task's
+// own ledger branch; this helper only rejects flat default-like names.
+func isLegacyCleanupBranchName(branch string) bool {
+	return strings.Contains(branch, "/")
 }
 
 func run(name string, args ...string) error {

@@ -76,6 +76,24 @@ func TestDeleteTaskBranchIfSafeSkipsDefaultBranch(t *testing.T) {
 	}
 }
 
+func TestDeleteTaskBranchIfSafeSkipsCustomRemoteDefaultBranch(t *testing.T) {
+	repoPath := initRepo(t)
+	remotePath := filepath.Join(t.TempDir(), "upstream.git")
+	runGitNoC(t, "init", "--bare", remotePath)
+	runGit(t, repoPath, "remote", "add", "upstream", remotePath)
+	runGit(t, repoPath, "branch", "develop")
+	runGit(t, repoPath, "push", "upstream", "develop")
+	runGitNoC(t, "--git-dir", remotePath, "symbolic-ref", "HEAD", "refs/heads/develop")
+
+	err := DeleteTaskBranchIfSafe(repoPath, "develop", "develop")
+	if !errors.Is(err, ErrUnsafeBranchDelete) {
+		t.Fatalf("DeleteTaskBranchIfSafe(develop) error = %v, want ErrUnsafeBranchDelete", err)
+	}
+	if !branchExists(t, repoPath, "develop") {
+		t.Fatal("develop was deleted, want preserved")
+	}
+}
+
 func TestDeleteTaskBranchIfSafeSkipsNonTaskScopedBranch(t *testing.T) {
 	repoPath := initRepo(t)
 	runGit(t, repoPath, "branch", "develop")
