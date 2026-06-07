@@ -271,27 +271,84 @@ func (s *Server) routes() {
 }
 
 func (s *Server) handleProjects(w http.ResponseWriter, r *http.Request) {
-	if !requireMethod(w, r, http.MethodGet) {
+	switch r.Method {
+	case http.MethodGet:
+		if s.manager != nil {
+			writeJSON(w, http.StatusOK, s.manager.Projects())
+			return
+		}
+		cfg, ok := s.configSnapshot()
+		if !ok {
+			writeError(w, http.StatusInternalServerError, "config is not configured")
+			return
+		}
+		writeJSON(w, http.StatusOK, []runtimepkg.ProjectInfo{{
+			Slug:     cfg.Project.Slug,
+			RepoPath: cfg.Project.RepoPath,
+		}})
+	case http.MethodPost:
+		s.createProject(w, r)
+	default:
+		methodNotAllowed(w, http.MethodGet, http.MethodPost)
+	}
+}
+
+func (s *Server) createProject(w http.ResponseWriter, r *http.Request) {
+	if s.configPath == "" {
+		writeError(w, http.StatusInternalServerError, "config path is not configured")
 		return
 	}
-	if s.manager != nil {
-		writeJSON(w, http.StatusOK, s.manager.Projects())
+	var req projectCreateRequest
+	if err := decodeJSON(w, r, &req); err != nil {
+		writeDecodeError(w, err)
 		return
 	}
-	cfg, ok := s.configSnapshot()
-	if !ok {
-		writeError(w, http.StatusInternalServerError, "config is not configured")
+	slug := strings.TrimSpace(req.Slug)
+	repoPath := strings.TrimSpace(req.RepoPath)
+	if slug == "" || repoPath == "" {
+		writeError(w, http.StatusBadRequest, "project slug and repository path are required")
 		return
 	}
-	writeJSON(w, http.StatusOK, []runtimepkg.ProjectInfo{{
-		Slug:     cfg.Project.Slug,
-		RepoPath: cfg.Project.RepoPath,
-	}})
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
+	raw, err := config.LoadRaw(s.configPath)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "load config")
+		return
+	}
+	if raw.Projects == nil {
+		raw.Projects = make(map[string]config.ProjectConfig)
+	}
+	if _, exists := raw.Projects[slug]; exists {
+		writeError(w, http.StatusConflict, "project already exists")
+		return
+	}
+	worktreeBase := strings.TrimSpace(req.WorktreeBase)
+	if worktreeBase == "" {
+		worktreeBase = raw.Runtime.WorktreeBase
+	}
+	raw.Projects[slug] = config.ProjectConfig{
+		Slug:              slug,
+		RepoPath:          repoPath,
+		WorktreeBase:      worktreeBase,
+		LedgerPath:        strings.TrimSpace(req.LedgerPath),
+		ValidationCommand: strings.TrimSpace(req.ValidationCommand),
+	}
+	updated, err := s.saveReloadConfigLocked(raw)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, configResponseFromConfig(updated).Projects[slug])
 }
 
 func (s *Server) handleProjectRoute(w http.ResponseWriter, r *http.Request) {
 	rest := strings.TrimPrefix(r.URL.Path, "/api/projects/")
 	parts := strings.Split(rest, "/")
+	if len(parts) == 1 && parts[0] != "" && r.Method == http.MethodDelete {
+		s.deleteProject(w, r, parts[0])
+		return
+	}
 	if len(parts) < 2 || parts[0] == "" {
 		writeError(w, http.StatusNotFound, "project route not found")
 		return
@@ -329,6 +386,49 @@ func (s *Server) handleProjectRoute(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeError(w, http.StatusNotFound, "project route not found")
+}
+
+func (s *Server) deleteProject(w http.ResponseWriter, _ *http.Request, slug string) {
+	if s.configPath == "" {
+		writeError(w, http.StatusInternalServerError, "config path is not configured")
+		return
+	}
+	slug = strings.TrimSpace(slug)
+	if slug == "" {
+		writeError(w, http.StatusNotFound, "project not found")
+		return
+	}
+	if s.manager != nil {
+		project, err := s.manager.Project(slug)
+		if err == nil && project.Registry != nil && len(project.Registry.All()) > 0 {
+			writeError(w, http.StatusConflict, "project has active workers")
+			return
+		}
+	}
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
+	raw, err := config.LoadRaw(s.configPath)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "load config")
+		return
+	}
+	if raw.Projects == nil {
+		writeError(w, http.StatusNotFound, "project not found")
+		return
+	}
+	if _, exists := raw.Projects[slug]; !exists {
+		writeError(w, http.StatusNotFound, "project not found")
+		return
+	}
+	delete(raw.Projects, slug)
+	if raw.Project.Slug == slug || len(raw.Projects) == 0 {
+		raw.Project = config.ProjectConfig{}
+	}
+	if _, err := s.saveReloadConfigLocked(raw); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
 func (s *Server) projectServer(slug string) (*Server, error) {
@@ -722,18 +822,30 @@ func (s *Server) patchConfig(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := config.Save(s.configPath, raw); err != nil {
+	updated, err := s.saveReloadConfigLocked(raw)
+	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	writeJSON(w, http.StatusOK, configResponseFromConfig(updated))
+}
+
+func (s *Server) saveReloadConfigLocked(raw *config.Config) (*config.Config, error) {
+	if err := config.Save(s.configPath, raw); err != nil {
+		return nil, err
+	}
 	updated, err := config.Load(s.configPath)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "reload config")
-		return
+		return nil, fmt.Errorf("reload config: %w", err)
+	}
+	if s.manager != nil {
+		if err := s.manager.Reload(updated, s.broadcastLedgerChange); err != nil {
+			return nil, err
+		}
 	}
 	s.cfg = config.Clone(updated)
 	s.harnesses = harnessResponsesFromConfig(s.cfg)
-	writeJSON(w, http.StatusOK, configResponseFromConfig(updated))
+	return updated, nil
 }
 
 type taskResponse struct {
@@ -989,6 +1101,14 @@ type projectConfigPatch struct {
 	WorktreeBase      *string `json:"worktree_base"`
 	LedgerPath        *string `json:"ledger_path"`
 	ValidationCommand *string `json:"validation_command"`
+}
+
+type projectCreateRequest struct {
+	Slug              string `json:"slug"`
+	RepoPath          string `json:"repo_path"`
+	WorktreeBase      string `json:"worktree_base"`
+	LedgerPath        string `json:"ledger_path"`
+	ValidationCommand string `json:"validation_command"`
 }
 
 type runtimeConfigResponse struct {

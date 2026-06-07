@@ -143,6 +143,10 @@ function App() {
     () => tasks.find((task) => task.id === selectedWorker?.task_id),
     [selectedWorker?.task_id, tasks]
   );
+  const selectedProject = useMemo(
+    () => projects.find((project) => project.slug === selectedProjectSlug),
+    [projects, selectedProjectSlug]
+  );
   const harnessNames = useMemo(
     () => Object.keys(configDraft.harnesses).sort((a, b) => a.localeCompare(b)),
     [configDraft.harnesses]
@@ -304,7 +308,12 @@ function App() {
       ]);
       setConfig(configData);
       setProjects(projectData);
-      setSelectedProjectSlug((current) => current || projectData[0]?.slug || configData.project.slug || "");
+      setSelectedProjectSlug((current) => {
+        if (projectData.some((project) => project.slug === current)) {
+          return current;
+        }
+        return projectData[0]?.slug || "";
+      });
       if (replaceDraft || !settingsDirtyRef.current) {
         setConfigDraft(configToDraft(configData));
         settingsDirtyRef.current = false;
@@ -446,17 +455,14 @@ function App() {
     setError("");
     setMessage("");
     try {
-      await api<ConfigResponse>(
-        "/api/config",
+      await api<ProjectInfo>(
+        "/api/projects",
         {
-          method: "PATCH",
+          method: "POST",
           body: JSON.stringify({
-            projects: {
-              [slug]: {
-                repo_path: repoPath,
-                worktree_base: config?.runtime?.worktree_base || config?.project.worktree_base || ""
-              }
-            }
+            slug,
+            repo_path: repoPath,
+            worktree_base: config?.runtime?.worktree_base || config?.project.worktree_base || ""
           })
         },
         token
@@ -471,6 +477,35 @@ function App() {
     } finally {
       setSaving(false);
     }
+  }
+
+  async function deleteProject(slug: string) {
+    if (!slug || !window.confirm(`Delete project "${slug}" from this server?`)) {
+      return;
+    }
+    setSaving(true);
+    setError("");
+    setMessage("");
+    try {
+      await api<{ status: string }>(`/api/projects/${encodeURIComponent(slug)}`, { method: "DELETE" }, token);
+      setTasks([]);
+      setWorkers([]);
+      setSelectedID("");
+      setSelectedWorkerID("");
+      setSelectedProjectSlug((current) => (current === slug ? "" : current));
+      await refreshSettings(token, true);
+      setMessage("Project deleted.");
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  function selectProject(slug: string) {
+    setSelectedProjectSlug(slug);
+    setSelectedID("");
+    setSelectedWorkerID("");
   }
 
   function updateConfigDraft(patch: Partial<ConfigDraft>) {
@@ -502,24 +537,6 @@ function App() {
           <p>Task ledger and worker orchestration</p>
         </div>
         <div className="topbar-actions">
-          <label className="project-switcher">
-            Project
-            <select
-              value={selectedProjectSlug}
-              onChange={(event) => {
-                setSelectedProjectSlug(event.target.value);
-                setSelectedID("");
-                setSelectedWorkerID("");
-              }}
-            >
-              {projects.map((project) => (
-                <option key={project.slug} value={project.slug}>
-                  {project.slug}
-                </option>
-              ))}
-              {projects.length === 0 && <option value={selectedProjectSlug}>{selectedProjectSlug || "default"}</option>}
-            </select>
-          </label>
           <button className="secondary" type="button" onClick={() => void refreshAll()} disabled={loading}>
             Refresh
           </button>
@@ -532,6 +549,66 @@ function App() {
       </section>
 
       <section className="workspace">
+        <aside className="project-sidebar" aria-label="Projects">
+          <div className="section-heading">
+            <h2>Projects</h2>
+            <span>{projects.length} total</span>
+          </div>
+          <div className="project-overview">
+            <div>
+              <span>Current</span>
+              <strong>{selectedProject?.slug || "None"}</strong>
+            </div>
+            <div>
+              <span>Tasks</span>
+              <strong>{selectedProject ? tasks.length : 0}</strong>
+            </div>
+            <div>
+              <span>Workers</span>
+              <strong>{selectedProject ? workers.length : 0}</strong>
+            </div>
+          </div>
+          <div className="project-list">
+            {projects.map((project) => (
+              <button
+                className={`project-row ${project.slug === selectedProjectSlug ? "selected" : ""}`}
+                key={project.slug}
+                type="button"
+                onClick={() => selectProject(project.slug)}
+              >
+                <span>{project.slug}</span>
+                <small>{project.repo_path}</small>
+              </button>
+            ))}
+            {projects.length === 0 && <div className="empty">No projects configured.</div>}
+          </div>
+          <div className="sidebar-project-actions">
+            <label>
+              Slug
+              <input value={newProjectSlug} onChange={(event) => setNewProjectSlug(event.target.value)} />
+            </label>
+            <label>
+              Repository path
+              <input value={newProjectRepoPath} onChange={(event) => setNewProjectRepoPath(event.target.value)} />
+            </label>
+            <button
+              type="button"
+              onClick={() => void addProject()}
+              disabled={saving || !newProjectSlug.trim() || !newProjectRepoPath.trim()}
+            >
+              Add Project
+            </button>
+            <button
+              className="danger"
+              type="button"
+              onClick={() => void deleteProject(selectedProjectSlug)}
+              disabled={saving || !selectedProjectSlug}
+            >
+              Delete Selected
+            </button>
+          </div>
+        </aside>
+
         <aside className="task-list" aria-label="Task ledger">
           <div className="section-heading">
             <h2>Tasks</h2>
@@ -782,39 +859,6 @@ function App() {
                 </div>
               ))}
               {!settingsLoading && harnesses.length === 0 && <div className="empty">No worker harnesses configured.</div>}
-            </div>
-
-            <div className="wide project-editor">
-              <div className="subheading">
-                <h3>Projects</h3>
-                <span>{projects.length} configured</span>
-              </div>
-              <div className="project-list">
-                {projects.map((project) => (
-                  <div className="availability-row" key={project.slug}>
-                    <span>{project.slug}</span>
-                    <span>{project.repo_path}</span>
-                  </div>
-                ))}
-                {projects.length === 0 && <div className="empty">No projects configured.</div>}
-              </div>
-              <div className="project-add">
-                <label>
-                  Slug
-                  <input value={newProjectSlug} onChange={(event) => setNewProjectSlug(event.target.value)} />
-                </label>
-                <label>
-                  Repository path
-                  <input value={newProjectRepoPath} onChange={(event) => setNewProjectRepoPath(event.target.value)} />
-                </label>
-                <button
-                  type="button"
-                  onClick={() => void addProject()}
-                  disabled={saving || !newProjectSlug.trim() || !newProjectRepoPath.trim()}
-                >
-                  Add Project
-                </button>
-              </div>
             </div>
 
             <div className="actions wide">

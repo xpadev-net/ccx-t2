@@ -963,6 +963,92 @@ func TestPatchConfigRequiresConfigPath(t *testing.T) {
 	}
 }
 
+func TestCreateProjectPersistsAndReloadsManager(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	cfg := testConfig()
+	cfg.Runtime.WorktreeBase = filepath.Join(dir, "worktrees")
+	cfg.Project = config.ProjectConfig{}
+	cfg.Projects = map[string]config.ProjectConfig{}
+	if err := config.Save(configPath, cfg); err != nil {
+		t.Fatalf("Save config: %v", err)
+	}
+	loaded, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("Load config: %v", err)
+	}
+	manager, err := runtimepkg.NewManager(loaded, "http://127.0.0.1:8080")
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	server := New(Deps{Config: loaded, ConfigPath: configPath, Manager: manager, AuthDisabled: true})
+
+	resp := performJSONRequest(server, http.MethodPost, "/api/projects", `{
+		"slug": "alpha",
+		"repo_path": "`+filepath.Join(dir, "alpha")+`"
+	}`)
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusCreated, resp.Body.String())
+	}
+	reloaded, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("Load reloaded config: %v", err)
+	}
+	if _, ok := reloaded.Projects["alpha"]; !ok {
+		t.Fatalf("project alpha missing from saved config: %#v", reloaded.Projects)
+	}
+	tasks := performRequest(server, http.MethodGet, "/api/projects/alpha/tasks")
+	if tasks.Code != http.StatusOK {
+		t.Fatalf("project tasks status = %d, want %d; body=%s", tasks.Code, http.StatusOK, tasks.Body.String())
+	}
+}
+
+func TestDeleteProjectPersistsAndReloadsManager(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	cfg := testConfig()
+	cfg.Runtime.WorktreeBase = filepath.Join(dir, "worktrees")
+	cfg.Project = config.ProjectConfig{}
+	cfg.Projects = map[string]config.ProjectConfig{
+		"alpha": {
+			Slug:         "alpha",
+			RepoPath:     filepath.Join(dir, "alpha"),
+			WorktreeBase: cfg.Runtime.WorktreeBase,
+			LedgerPath:   filepath.Join(dir, "alpha", "tasks", "ledger.md"),
+			Orchestrator: cfg.Orchestrator,
+			GitHub:       cfg.GitHub,
+		},
+	}
+	if err := config.Save(configPath, cfg); err != nil {
+		t.Fatalf("Save config: %v", err)
+	}
+	loaded, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("Load config: %v", err)
+	}
+	manager, err := runtimepkg.NewManager(loaded, "http://127.0.0.1:8080")
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	server := New(Deps{Config: loaded, ConfigPath: configPath, Manager: manager, AuthDisabled: true})
+
+	resp := performRequest(server, http.MethodDelete, "/api/projects/alpha")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	reloaded, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("Load reloaded config: %v", err)
+	}
+	if _, ok := reloaded.Projects["alpha"]; ok {
+		t.Fatalf("project alpha still present in saved config: %#v", reloaded.Projects)
+	}
+	tasks := performRequest(server, http.MethodGet, "/api/projects/alpha/tasks")
+	if tasks.Code != http.StatusNotFound {
+		t.Fatalf("project tasks status = %d, want %d; body=%s", tasks.Code, http.StatusNotFound, tasks.Body.String())
+	}
+}
+
 func TestPatchConfigConcurrentRequestsPreserveUpdates(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.yaml")

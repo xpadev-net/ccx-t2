@@ -67,25 +67,6 @@ button:disabled {
   gap: 12px;
 }
 
-.project-switcher {
-  display: grid;
-  gap: 4px;
-  color: #627284;
-  font-size: 12px;
-}
-
-.project-switcher select {
-  min-width: 180px;
-}
-
-.project-add {
-  display: grid;
-  grid-template-columns: minmax(120px, 180px) minmax(240px, 1fr) auto;
-  gap: 12px;
-  align-items: end;
-  margin-top: 12px;
-}
-
 .project-list {
   display: grid;
   gap: 8px;
@@ -132,11 +113,12 @@ button:disabled {
 
 .workspace {
   display: grid;
-  grid-template-columns: minmax(280px, 360px) minmax(420px, 1fr);
+  grid-template-columns: minmax(230px, 290px) minmax(280px, 360px) minmax(420px, 1fr);
   gap: 18px;
   padding: 18px 28px 28px;
 }
 
+.project-sidebar,
 .task-list,
 .task-editor,
 .task-create,
@@ -146,6 +128,10 @@ button:disabled {
   border: 1px solid #d9e0e7;
   border-radius: 8px;
   background: #ffffff;
+}
+
+.project-sidebar {
+  min-height: 600px;
 }
 
 .task-list {
@@ -164,7 +150,7 @@ button:disabled {
 .worker-dashboard,
 .settings-panel,
 .auth-panel {
-  grid-column: 2;
+  grid-column: 3;
 }
 
 .section-heading {
@@ -206,6 +192,76 @@ button:disabled {
 
 .task-row.selected {
   background: #edf7f6;
+}
+
+.project-overview {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  border-bottom: 1px solid #eef2f5;
+  padding: 12px;
+}
+
+.project-overview div {
+  min-width: 0;
+  border: 1px solid #e5ebf0;
+  border-radius: 6px;
+  padding: 8px;
+}
+
+.project-overview span,
+.project-row small {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  color: #627284;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.project-overview strong {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  color: #1f2933;
+  font-size: 14px;
+  font-weight: 680;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.project-row {
+  display: grid;
+  gap: 3px;
+  width: 100%;
+  min-height: 54px;
+  border: 0;
+  border-bottom: 1px solid #eef2f5;
+  border-radius: 0;
+  background: #ffffff;
+  color: #1f2933;
+  padding: 10px 12px;
+  text-align: left;
+}
+
+.project-row.selected {
+  background: #edf7f6;
+}
+
+.project-row span {
+  min-width: 0;
+  overflow: hidden;
+  font-weight: 680;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sidebar-project-actions {
+  display: grid;
+  gap: 10px;
+  border-top: 1px solid #e5ebf0;
+  padding: 12px;
 }
 
 .worker-layout {
