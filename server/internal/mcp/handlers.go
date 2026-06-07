@@ -7,6 +7,7 @@ import (
 	"log"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -20,6 +21,8 @@ import (
 	"github.com/xpadev/ccx-t2/internal/worker"
 	"github.com/xpadev/ccx-t2/internal/worktree"
 )
+
+var mergeCommitRE = regexp.MustCompile(`^[0-9a-fA-F]{7,64}$`)
 
 // Deps holds the dependencies used by MCP tool handlers.
 type Deps struct {
@@ -884,8 +887,25 @@ func handleNotify(deps *Deps) ToolHandler {
 
 		switch notifyType {
 		case "completed":
-			prURL, _ := payload["pr_url"].(string)
-			mergeCommit, _ := payload["merge_commit"].(string)
+			rawPRURL := optionalStringArg(payload, "pr_url")
+			if strings.ContainsAny(rawPRURL, "\r\n") {
+				return nil, fmt.Errorf("pr_url must be a single line")
+			}
+			prURL := strings.TrimSpace(rawPRURL)
+			if prURL == "" {
+				return nil, fmt.Errorf("pr_url is required for completed notifications")
+			}
+			rawMergeCommit := optionalStringArg(payload, "merge_commit")
+			if strings.ContainsAny(rawMergeCommit, "\r\n") {
+				return nil, fmt.Errorf("merge_commit must be a single-line value")
+			}
+			mergeCommit := strings.TrimSpace(rawMergeCommit)
+			if mergeCommit == "" {
+				return nil, fmt.Errorf("merge_commit is required for completed notifications")
+			}
+			if !mergeCommitRE.MatchString(mergeCommit) {
+				return nil, fmt.Errorf("merge_commit must be a valid commit hash")
+			}
 
 			prevTask, err := toolDeps.Ledger.UpdateIfStatusesReturnPrevWith(taskID, []string{"in_progress", "blocked"},
 				func(current ledger.Task) (map[string]any, error) {
@@ -899,15 +919,14 @@ func handleNotify(deps *Deps) ToolHandler {
 						"worker_id": "",
 						"harness":   "",
 					}
-					if mergeCommit != "" {
-						// Append merge_commit comment to body so archive_task can read it.
-						// Avoid a leading newline when body is empty.
-						comment := "<!-- merge_commit: " + mergeCommit + " -->"
-						if current.Body == "" {
-							fields["body"] = comment
-						} else {
-							fields["body"] = current.Body + "\n" + comment
-						}
+					// Append a fresh merge_commit comment so archive_task reads the
+					// verified completion value, not a stale marker from the task body.
+					comment := "<!-- merge_commit: " + mergeCommit + " -->"
+					body := ledger.RemoveMergeCommitComment(current.Body)
+					if strings.TrimSpace(body) == "" {
+						fields["body"] = comment
+					} else {
+						fields["body"] = body + "\n" + comment
 					}
 					return fields, nil
 				},
@@ -1326,6 +1345,7 @@ Instructions:
 - Do not rewrite history on a default branch or any branch that has an open pull request.
 - Never force push. If an open-PR branch is behind its base, merge the base branch normally.
 - Implement the task, validate, self-review, create a PR, and merge it.
+- Do not call notify(type="completed") until the PR is merged, gh-review-hook has exited 0, and the merge commit is verified.
 - Always include your worker_id in notify payloads for ownership verification.
 - Always include project_slug in notify payloads when it is present above.
 - When complete: call notify(type="completed", payload={project_slug, task_id, worker_id, pr_url, merge_commit}).

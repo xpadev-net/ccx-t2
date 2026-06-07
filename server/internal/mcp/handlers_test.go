@@ -107,6 +107,7 @@ func TestBuildWorkerPromptFromTaskUsesTaskRestrictions(t *testing.T) {
 		"Work only inside the Worktree path above",
 		"Do not rewrite history on a default branch or any branch that has an open pull request",
 		"Never force push",
+		`Do not call notify(type="completed") until the PR is merged, gh-review-hook has exited 0, and the merge commit is verified.`,
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("prompt does not contain %q:\n%s", want, prompt)
@@ -267,6 +268,110 @@ func TestHandleNotifyCompletedRejectsStaleWorkerIDUnderLedgerLock(t *testing.T) 
 	})
 }
 
+func TestHandleNotifyCompletedRejectsMissingCompletionEvidence(t *testing.T) {
+	cases := []struct {
+		name    string
+		payload map[string]any
+		wantErr string
+	}{
+		{
+			name: "missing pr_url",
+			payload: map[string]any{
+				"merge_commit": "abc123",
+			},
+			wantErr: "pr_url is required",
+		},
+		{
+			name: "missing merge_commit",
+			payload: map[string]any{
+				"pr_url": "https://example.test/pr/1",
+			},
+			wantErr: "merge_commit is required",
+		},
+		{
+			name: "multiline pr_url",
+			payload: map[string]any{
+				"pr_url":       "https://example.test/pr/1\nextra",
+				"merge_commit": "abc123def456",
+			},
+			wantErr: "pr_url must be a single line",
+		},
+		{
+			name: "trailing newline pr_url",
+			payload: map[string]any{
+				"pr_url":       "https://example.test/pr/1\n",
+				"merge_commit": "abc123def456",
+			},
+			wantErr: "pr_url must be a single line",
+		},
+		{
+			name: "multiline merge_commit",
+			payload: map[string]any{
+				"pr_url":       "https://example.test/pr/1",
+				"merge_commit": "abc123\nextra",
+			},
+			wantErr: "merge_commit must be a single-line value",
+		},
+		{
+			name: "comment-closing merge_commit",
+			payload: map[string]any{
+				"pr_url":       "https://example.test/pr/1",
+				"merge_commit": "abc123 --> injected",
+			},
+			wantErr: "merge_commit must be a valid commit hash",
+		},
+		{
+			name: "short merge_commit",
+			payload: map[string]any{
+				"pr_url":       "https://example.test/pr/1",
+				"merge_commit": "abc123",
+			},
+			wantErr: "merge_commit must be a valid commit hash",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			l := ledger.NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
+			if err := l.Add(ledger.Task{
+				ID:       "task-001",
+				Title:    "Task",
+				Status:   "in_progress",
+				WorkerID: "worker-task-001",
+				Body:     "current body",
+			}); err != nil {
+				t.Fatalf("Add: %v", err)
+			}
+			deps := testMCPDeps(dir, l)
+			payload := map[string]any{
+				"task_id":   "task-001",
+				"worker_id": "worker-task-001",
+			}
+			for k, v := range tc.payload {
+				payload[k] = v
+			}
+
+			_, err := handleNotify(deps)(context.Background(), map[string]any{
+				"type":    "completed",
+				"payload": payload,
+			})
+			if err == nil {
+				t.Fatal("handleNotify completed error = nil, want missing completion evidence error")
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("handleNotify completed error = %v, want %q", err, tc.wantErr)
+			}
+			tasks, err := l.Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if len(tasks) != 1 || tasks[0].Status != "in_progress" || tasks[0].PrURL != "" || strings.Contains(tasks[0].Body, "merge_commit") {
+				t.Fatalf("task changed after rejected completion: %#v", tasks)
+			}
+		})
+	}
+}
+
 func TestHandleNotifyBlockedRejectsStaleWorkerIDUnderLedgerLock(t *testing.T) {
 	testHandleNotifyRejectsStaleWorkerID(t, "blocked", map[string]any{
 		"reason": "blocked",
@@ -314,6 +419,93 @@ func TestHandleArchiveTaskAlreadyArchivedIsIdempotent(t *testing.T) {
 	archived, ok := got.(map[string]any)["archived"].(string)
 	if !ok || archived != "task-001" {
 		t.Fatalf("handleArchiveTask result = %#v, want archived task-001", got)
+	}
+}
+
+func TestHandleNotifyCompletedThenArchivePreservesMergeMetadata(t *testing.T) {
+	dir := t.TempDir()
+	l := ledger.NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
+	if err := l.Add(ledger.Task{
+		ID:       "task-001",
+		Title:    "Done",
+		Status:   "in_progress",
+		Branch:   "feature/task-001-done",
+		WorkerID: "worker-task-001",
+		Harness:  "codex",
+		Body:     "current body\n<!-- merge_commit: stale -->",
+	}); err != nil {
+		t.Fatalf("Add completed candidate: %v", err)
+	}
+	if err := l.Add(ledger.Task{ID: "task-002", Title: "Still active", Status: "unstarted"}); err != nil {
+		t.Fatalf("Add active task: %v", err)
+	}
+	deps := testMCPDeps(dir, l)
+
+	_, err := handleNotify(deps)(context.Background(), map[string]any{
+		"type": "completed",
+		"payload": map[string]any{
+			"task_id":      "task-001",
+			"worker_id":    "worker-task-001",
+			"pr_url":       "https://example.test/pull/123",
+			"merge_commit": "abc123def456",
+		},
+	})
+	if err != nil {
+		t.Fatalf("handleNotify completed: %v", err)
+	}
+	tasks, err := l.Load()
+	if err != nil {
+		t.Fatalf("Load after notify: %v", err)
+	}
+	var completed *ledger.Task
+	for i := range tasks {
+		if tasks[i].ID == "task-001" {
+			completed = &tasks[i]
+			break
+		}
+	}
+	if completed == nil {
+		t.Fatalf("completed task missing after notify: %#v", tasks)
+	}
+	if completed.Status != "completed" || completed.PrURL != "https://example.test/pull/123" {
+		t.Fatalf("completed task metadata = %#v, want completed with PR URL", completed)
+	}
+	if completed.WorkerID != "" || completed.Harness != "" {
+		t.Fatalf("completed task retained runtime fields: %#v", completed)
+	}
+	if !strings.Contains(completed.Body, "<!-- merge_commit: abc123def456 -->") {
+		t.Fatalf("completed task missing merge commit comment: %q", completed.Body)
+	}
+	if strings.Contains(completed.Body, "stale") {
+		t.Fatalf("completed task retained stale merge commit marker: %q", completed.Body)
+	}
+
+	got, err := handleArchiveTask(deps)(context.Background(), map[string]any{"id": "task-001"})
+	if err != nil {
+		t.Fatalf("handleArchiveTask: %v", err)
+	}
+	if got.(map[string]any)["archived"] != "task-001" {
+		t.Fatalf("handleArchiveTask result = %#v, want archived task-001", got)
+	}
+	tasks, err = l.Load()
+	if err != nil {
+		t.Fatalf("Load after archive: %v", err)
+	}
+	if len(tasks) != 1 || tasks[0].ID != "task-002" {
+		t.Fatalf("active ledger tasks after archive = %#v, want only task-002", tasks)
+	}
+	archived, ok, err := l.ArchivedTask("task-001")
+	if err != nil {
+		t.Fatalf("ArchivedTask: %v", err)
+	}
+	if !ok {
+		t.Fatal("ArchivedTask ok = false, want archived task")
+	}
+	if archived.PrURL != "https://example.test/pull/123" || archived.MergeCommit != "abc123def456" {
+		t.Fatalf("archived metadata = %#v, want PR URL and merge commit", archived)
+	}
+	if strings.Contains(archived.Body, "merge_commit") {
+		t.Fatalf("archive body retained merge commit comment: %q", archived.Body)
 	}
 }
 
@@ -371,6 +563,21 @@ func testHandleNotifyRejectsStaleWorkerID(t *testing.T, notifyType string, extra
 	}
 	if len(tasks) != 1 {
 		t.Fatalf("stale notify left child tasks behind: %#v", tasks)
+	}
+}
+
+func testMCPDeps(dir string, l *ledger.Ledger) *Deps {
+	return &Deps{
+		Ledger:   l,
+		Registry: worker.NewRegistry(),
+		Config: &config.Config{
+			Project: config.ProjectConfig{
+				Slug:         "proj",
+				RepoPath:     dir,
+				WorktreeBase: dir,
+			},
+		},
+		Session: "missing-session",
 	}
 }
 
