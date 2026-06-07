@@ -217,10 +217,12 @@ function App() {
       if (closed) {
         return;
       }
+      let connectionOpened = false;
       socket = new WebSocket(
         `${protocol}//${window.location.host}${workerLogPath(selectedProjectSlug, selectedWorker.worker_id)}${tokenQuery}`
       );
       socket.addEventListener("open", () => {
+        connectionOpened = true;
         attempts = 0;
         if (retryTimer !== undefined) {
           window.clearTimeout(retryTimer);
@@ -242,10 +244,12 @@ function App() {
         }
       });
       socket.addEventListener("error", () => {
-        setWorkerLog((current) => [...current, "[stream error]"]);
+        if (connectionOpened) {
+          setWorkerLog((current) => [...current, "[stream error]"]);
+        }
       });
       socket.addEventListener("close", () => {
-        if (!closed && attempts < 3) {
+        if (connectionOpened && !closed && attempts < 3) {
           attempts += 1;
           retryTimer = window.setTimeout(connect, 250 * attempts);
         }
@@ -277,10 +281,12 @@ function App() {
       if (closed) {
         return;
       }
+      let connectionOpened = false;
       socket = new WebSocket(
         `${protocol}//${window.location.host}${orchestratorLogPath(selectedProjectSlug)}${tokenQuery}`
       );
       socket.addEventListener("open", () => {
+        connectionOpened = true;
         attempts = 0;
         if (retryTimer !== undefined) {
           window.clearTimeout(retryTimer);
@@ -302,10 +308,12 @@ function App() {
         }
       });
       socket.addEventListener("error", () => {
-        setOrchestratorLog((current) => [...current, "[stream error]"]);
+        if (connectionOpened) {
+          setOrchestratorLog((current) => [...current, "[stream error]"]);
+        }
       });
       socket.addEventListener("close", () => {
-        if (!closed && attempts < 3) {
+        if (connectionOpened && !closed && attempts < 3) {
           attempts += 1;
           retryTimer = window.setTimeout(connect, 250 * attempts);
         }
