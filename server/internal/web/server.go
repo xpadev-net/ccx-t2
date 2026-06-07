@@ -37,6 +37,8 @@ type Server struct {
 	mux            *http.ServeMux
 }
 
+const deleteCleanupLease = 5 * time.Minute
+
 // Deps contains dependencies needed by the web API.
 type Deps struct {
 	Config         *config.Config
@@ -103,10 +105,10 @@ func (c defaultWorkerCleaner) CleanupWorker(ctx context.Context, task ledger.Tas
 		workerID = "worker-" + task.ID
 	}
 	var errs []error
-	if workerID != "" && c.session == "" {
-		errs = append(errs, fmt.Errorf("tmux session is not configured"))
+	if c.session == "" {
+		log.Printf("warn: web cleanup skipping tmux window for %s: session is not configured", workerID)
 	}
-	if workerID != "" && c.session != "" {
+	if c.session != "" {
 		if err := tmux.KillWindowContext(ctx, c.session, workerID); err != nil {
 			if !isMissingTmuxWindowError(err) {
 				errs = append(errs, fmt.Errorf("kill worker window: %w", err))
@@ -133,7 +135,7 @@ func (c defaultWorkerCleaner) CleanupWorker(ctx context.Context, task ledger.Tas
 }
 
 func isMissingTmuxWindowError(err error) bool {
-	msg := err.Error()
+	msg := strings.ToLower(strings.TrimSpace(err.Error()))
 	return strings.Contains(msg, "can't find window") ||
 		strings.Contains(msg, "can't find pane") ||
 		strings.Contains(msg, "can't find session") ||
@@ -141,15 +143,13 @@ func isMissingTmuxWindowError(err error) bool {
 }
 
 func isMissingWorktreeError(err error) bool {
-	msg := err.Error()
+	msg := strings.ToLower(strings.TrimSpace(err.Error()))
 	return strings.Contains(msg, "is not a working tree") ||
-		strings.Contains(msg, "not a working tree") ||
-		strings.Contains(msg, "No such file or directory") ||
-		strings.Contains(msg, "no such file or directory")
+		strings.Contains(msg, "not a working tree")
 }
 
 func isMissingBranchError(err error) bool {
-	msg := err.Error()
+	msg := strings.ToLower(strings.TrimSpace(err.Error()))
 	return strings.Contains(msg, "branch") && strings.Contains(msg, "not found")
 }
 
@@ -377,6 +377,10 @@ func (s *Server) updateTask(w http.ResponseWriter, r *http.Request, id string) {
 			writeError(w, http.StatusBadRequest, invalidTaskMutationMessage(err))
 			return
 		}
+		if errors.Is(err, errTaskDeletingConflict) {
+			writeError(w, http.StatusConflict, "task delete is in progress")
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "update task")
 		return
 	}
@@ -390,41 +394,90 @@ func (s *Server) deleteTask(w http.ResponseWriter, r *http.Request, id string) {
 		writeError(w, http.StatusInternalServerError, "ledger is not configured")
 		return
 	}
-	task, ok, err := s.loadTaskIfExists(id)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "load task")
-		return
-	}
-	if !ok {
-		writeError(w, http.StatusNotFound, "task not found")
-		return
-	}
-	resp := taskDeleteResponse{Deleted: taskResponseFromLedger(task)}
-	needsCleanup := task.Status == "in_progress" || task.Status == "blocked"
-	if needsCleanup {
-		if s.cleaner == nil {
-			writeError(w, http.StatusInternalServerError, "worker cleaner is not configured")
-			return
-		}
-		if err := s.cleaner.CleanupWorker(context.WithoutCancel(r.Context()), task); err != nil {
-			log.Printf("web: cleanup after task delete failed: %v", err)
-			resp.CleanupError = "worker cleanup failed"
-			writeJSON(w, http.StatusAccepted, resp)
-			return
-		}
-		resp.WorkerCleaned = true
-	}
-	deleted, err := s.ledger.DeleteTaskReturnPrev(id)
+	task, marker, needsCleanup, err := s.prepareTaskForDelete(id)
 	if err != nil {
 		if errors.Is(err, ledger.ErrTaskNotFound) {
 			writeError(w, http.StatusNotFound, "task not found")
 			return
 		}
+		if errors.Is(err, ledger.ErrTaskDeleteInProgress) {
+			writeJSON(w, http.StatusAccepted, taskDeleteResponse{
+				Deleted:       taskResponseFromLedger(task),
+				DeletePending: true,
+			})
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "delete task")
 		return
 	}
-	resp.Deleted = taskResponseFromLedger(deleted)
+	resp := taskDeleteResponse{Deleted: taskResponseFromLedger(task)}
+	if needsCleanup {
+		if s.cleaner == nil {
+			if _, err := s.ledger.RestoreTaskSnapshotIfCurrent(task, marker); err != nil {
+				log.Printf("web: restore after missing cleaner failed: %v", err)
+			}
+			writeError(w, http.StatusInternalServerError, "worker cleaner is not configured")
+			return
+		}
+		if err := s.cleaner.CleanupWorker(context.WithoutCancel(r.Context()), task); err != nil {
+			log.Printf("web: cleanup after task delete failed: %v", err)
+			restored, restoreErr := s.ledger.RestoreTaskSnapshotIfCurrent(task, marker)
+			if restoreErr != nil {
+				log.Printf("web: restore after cleanup failure failed: %v", restoreErr)
+				writeError(w, http.StatusInternalServerError, "restore task after cleanup failure")
+				return
+			}
+			resp.CleanupError = "worker cleanup failed"
+			if !restored {
+				resp.DeletePending = true
+			}
+			writeJSON(w, http.StatusAccepted, resp)
+			return
+		}
+		resp.WorkerCleaned = true
+	} else {
+		writeJSON(w, http.StatusOK, resp)
+		return
+	}
+	deleted, err := s.ledger.DeleteTaskIfCurrent(marker)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "delete task")
+		return
+	}
+	if !deleted {
+		resp.DeletePending = true
+		writeJSON(w, http.StatusAccepted, resp)
+		return
+	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) prepareTaskForDelete(id string) (ledger.Task, ledger.Task, bool, error) {
+	now := time.Now()
+	return s.ledger.PrepareDeleteReturnPrev(id, func(task ledger.Task) bool {
+		return taskNeedsDeleteCleanup(task, now)
+	})
+}
+
+func taskNeedsDeleteCleanup(task ledger.Task, now time.Time) bool {
+	if task.Status == "deleting" {
+		return deletingMarkerExpired(task.UpdatedAt, now)
+	}
+	return task.Status == "in_progress" ||
+		task.Status == "blocked" ||
+		task.WorkerID != "" ||
+		task.Branch != ""
+}
+
+func deletingMarkerExpired(updatedAt string, now time.Time) bool {
+	if updatedAt == "" {
+		return true
+	}
+	ts, err := time.Parse(time.RFC3339, updatedAt)
+	if err != nil {
+		return true
+	}
+	return !ts.After(now.Add(-deleteCleanupLease))
 }
 
 func (s *Server) loadTaskIfExists(id string) (ledger.Task, bool, error) {
@@ -498,6 +551,7 @@ type taskDeleteResponse struct {
 	Deleted       taskResponse `json:"deleted"`
 	WorkerCleaned bool         `json:"worker_cleaned,omitempty"`
 	CleanupError  string       `json:"cleanup_error,omitempty"`
+	DeletePending bool         `json:"delete_pending,omitempty"`
 }
 
 type taskMutationRequest struct {
@@ -531,6 +585,9 @@ func taskFromCreateRequest(req taskMutationRequest) (ledger.Task, error) {
 	task.UpdatedAt = ""
 	if strings.TrimSpace(task.Status) == "" {
 		task.Status = "unstarted"
+	}
+	if strings.TrimSpace(task.Status) == "deleting" {
+		return ledger.Task{}, fmt.Errorf("status deleting is reserved for task deletion")
 	}
 	if strings.TrimSpace(task.Title) == "" && strings.TrimSpace(task.Body) == "" {
 		return ledger.Task{}, fmt.Errorf("title or body is required")
@@ -578,10 +635,17 @@ func taskSnapshotWithFields(task ledger.Task, fields map[string]any) ledger.Task
 var reWebTaskID = regexp.MustCompile(`^task-\d{8}-\d{4}$`)
 
 var errInvalidTaskMutation = errors.New("invalid task mutation")
+var errTaskDeletingConflict = errors.New("task delete is in progress")
 
 func validateTaskUpdate(current ledger.Task, fields map[string]any) error {
+	if current.Status == "deleting" {
+		return errTaskDeletingConflict
+	}
 	if status, ok := fields["status"].(string); ok && strings.TrimSpace(status) == "" {
 		return fmt.Errorf("%w: status cannot be empty", errInvalidTaskMutation)
+	}
+	if status, ok := fields["status"].(string); ok && strings.TrimSpace(status) == "deleting" {
+		return fmt.Errorf("%w: status deleting is reserved for task deletion", errInvalidTaskMutation)
 	}
 	next := taskSnapshotWithFields(current, fields)
 	if strings.TrimSpace(next.Title) == "" && strings.TrimSpace(next.Body) == "" {
