@@ -1157,7 +1157,7 @@ function workerLogPath(projectSlug: string, workerID: string) {
 }
 
 function orchestratorLogPath(projectSlug: string) {
-  return `/ws/projects/${encodeURIComponent(projectSlug)}/orchestrator`;
+  return projectSlug ? `/ws/projects/${encodeURIComponent(projectSlug)}/orchestrator` : "/ws/orchestrator";
 }
 
 function workerFollowupPath(projectSlug: string, workerID: string) {
