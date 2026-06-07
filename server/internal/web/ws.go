@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -15,6 +16,10 @@ import (
 // function that stops the stream.
 type PipeOutputFunc func(session, window string) (<-chan string, func(), error)
 
+type SendKeysFunc func(ctx context.Context, session, window, keys string) error
+
+type WindowAliveFunc func(ctx context.Context, session, window string) (bool, error)
+
 type wsMessage struct {
 	Type string `json:"type"`
 	Data string `json:"data,omitempty"`
@@ -23,6 +28,11 @@ type wsMessage struct {
 type ledgerWSClient struct {
 	conn *websocket.Conn
 	send chan wsMessage
+}
+
+type tmuxStreamRegistry struct {
+	mu      sync.Mutex
+	streams map[string]struct{}
 }
 
 const wsWriteTimeout = 5 * time.Second
@@ -38,27 +48,42 @@ func (s *Server) handleWorkerLogWS(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "worker window is required")
 		return
 	}
+	s.handleTmuxLogWS(w, r, window, "worker")
+}
+
+func (s *Server) handleOrchestratorLogWS(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w, http.MethodGet)
+		return
+	}
+	if r.URL.Path != "/ws/orchestrator" {
+		writeError(w, http.StatusNotFound, "orchestrator websocket route not found")
+		return
+	}
 	cfg, ok := s.configSnapshot()
 	if !ok {
 		writeError(w, http.StatusInternalServerError, "config is not configured")
 		return
 	}
-	if cfg.Project.Slug == "" {
-		writeError(w, http.StatusInternalServerError, "tmux session is not configured")
+	window := "orchestrator"
+	if s.projectScoped && cfg.Project.Slug != "" {
+		window = cfg.Project.Slug + "-orchestrator"
+	}
+	s.handleTmuxLogWS(w, r, window, "orchestrator")
+}
+
+func (s *Server) handleTmuxLogWS(w http.ResponseWriter, r *http.Request, window, label string) {
+	session, err := s.tmuxSessionName()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	session := s.tmuxSession
-	if session == "" {
-		session = cfg.Runtime.TmuxSession
-	}
-	if session == "" {
-		session = cfg.Project.Slug
-	}
-	if !s.reserveWorkerStream(window) {
-		writeError(w, http.StatusConflict, "worker log stream already open")
+	streamKey := session + "\x00" + window
+	if !s.reserveTmuxStream(streamKey) {
+		writeError(w, http.StatusConflict, label+" log stream already open")
 		return
 	}
-	defer s.releaseWorkerStream(window)
+	defer s.releaseTmuxStream(streamKey)
 	conn, err := s.upgradeWebSocket(w, r)
 	if err != nil {
 		return
@@ -66,7 +91,7 @@ func (s *Server) handleWorkerLogWS(w http.ResponseWriter, r *http.Request) {
 	defer conn.Close()
 	lines, cleanup, err := s.pipeOutput(session, window)
 	if err != nil {
-		_ = writeWSJSON(conn, wsMessage{Type: "error", Data: "open worker log stream"})
+		_ = writeWSJSON(conn, wsMessage{Type: "error", Data: "open " + label + " log stream"})
 		return
 	}
 	defer cleanup()
@@ -117,6 +142,18 @@ func (s *Server) handleProjectWS(w http.ResponseWriter, r *http.Request) {
 			r2 := r.Clone(r.Context())
 			r2.URL.Path = "/ws/worker/" + parts[2]
 			projectServer.handleWorkerLogWS(w, r2)
+			return
+		}
+	case "orchestrator":
+		if len(parts) == 2 {
+			projectServer, err := s.projectServer(parts[0])
+			if err != nil {
+				writeError(w, http.StatusNotFound, "project not found")
+				return
+			}
+			r2 := r.Clone(r.Context())
+			r2.URL.Path = "/ws/orchestrator"
+			projectServer.handleOrchestratorLogWS(w, r2)
 			return
 		}
 	}
@@ -183,23 +220,29 @@ func writeWSJSON(conn *websocket.Conn, msg wsMessage) error {
 	return conn.WriteJSON(msg)
 }
 
-func (s *Server) reserveWorkerStream(window string) bool {
-	s.workerStreamsMu.Lock()
-	defer s.workerStreamsMu.Unlock()
-	if s.workerStreams == nil {
-		s.workerStreams = make(map[string]struct{})
+func (s *Server) reserveTmuxStream(key string) bool {
+	if s.tmuxStreams == nil {
+		s.tmuxStreams = &tmuxStreamRegistry{}
 	}
-	if _, ok := s.workerStreams[window]; ok {
+	s.tmuxStreams.mu.Lock()
+	defer s.tmuxStreams.mu.Unlock()
+	if s.tmuxStreams.streams == nil {
+		s.tmuxStreams.streams = make(map[string]struct{})
+	}
+	if _, ok := s.tmuxStreams.streams[key]; ok {
 		return false
 	}
-	s.workerStreams[window] = struct{}{}
+	s.tmuxStreams.streams[key] = struct{}{}
 	return true
 }
 
-func (s *Server) releaseWorkerStream(window string) {
-	s.workerStreamsMu.Lock()
-	defer s.workerStreamsMu.Unlock()
-	delete(s.workerStreams, window)
+func (s *Server) releaseTmuxStream(key string) {
+	if s.tmuxStreams == nil {
+		return
+	}
+	s.tmuxStreams.mu.Lock()
+	defer s.tmuxStreams.mu.Unlock()
+	delete(s.tmuxStreams.streams, key)
 }
 
 func discardWSReads(ctx context.Context, conn *websocket.Conn, cancel context.CancelFunc) {

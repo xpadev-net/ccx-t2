@@ -1194,6 +1194,98 @@ func TestWorkerLogWebSocketAcceptsTokenQueryAuth(t *testing.T) {
 	}
 }
 
+func TestProjectOrchestratorLogWebSocketStreamsProjectWindow(t *testing.T) {
+	dir := t.TempDir()
+	cfg := testConfig()
+	cfg.Runtime = config.RuntimeConfig{TmuxSession: "ccx-test", WorktreeBase: filepath.Join(dir, "worktrees")}
+	cfg.Projects = map[string]config.ProjectConfig{
+		"alpha": {
+			Slug:         "alpha",
+			RepoPath:     filepath.Join(dir, "alpha"),
+			LedgerPath:   filepath.Join(dir, "alpha", "tasks", "ledger.md"),
+			WorktreeBase: cfg.Runtime.WorktreeBase,
+			Orchestrator: cfg.Orchestrator,
+			GitHub:       cfg.GitHub,
+		},
+	}
+	manager, err := runtimepkg.NewManager(cfg, "http://127.0.0.1:8080")
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	lines := make(chan string, 1)
+	lines <- "orchestrator ready"
+	close(lines)
+	server := httptest.NewServer(New(Deps{
+		Config:  cfg,
+		Manager: manager,
+		PipeOutput: func(session, window string) (<-chan string, func(), error) {
+			if session != "ccx-test" || window != "alpha-orchestrator" {
+				t.Fatalf("pipe args = %q %q, want ccx-test alpha-orchestrator", session, window)
+			}
+			return lines, func() {}, nil
+		},
+		AuthDisabled: true,
+	}))
+	defer server.Close()
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(server.URL, "/ws/projects/alpha/orchestrator"), nil)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer conn.Close()
+
+	var msg wsMessage
+	if err := conn.ReadJSON(&msg); err != nil {
+		t.Fatalf("ReadJSON: %v", err)
+	}
+	if msg.Type != "line" || msg.Data != "orchestrator ready" {
+		t.Fatalf("message = %#v, want orchestrator line", msg)
+	}
+}
+
+func TestProjectOrchestratorLogWebSocketRejectsSecondSubscriber(t *testing.T) {
+	dir := t.TempDir()
+	cfg := testConfig()
+	cfg.Runtime = config.RuntimeConfig{TmuxSession: "ccx-test", WorktreeBase: filepath.Join(dir, "worktrees")}
+	cfg.Projects = map[string]config.ProjectConfig{
+		"alpha": {
+			Slug:         "alpha",
+			RepoPath:     filepath.Join(dir, "alpha"),
+			LedgerPath:   filepath.Join(dir, "alpha", "tasks", "ledger.md"),
+			WorktreeBase: cfg.Runtime.WorktreeBase,
+			Orchestrator: cfg.Orchestrator,
+			GitHub:       cfg.GitHub,
+		},
+	}
+	manager, err := runtimepkg.NewManager(cfg, "http://127.0.0.1:8080")
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	lines := make(chan string)
+	server := httptest.NewServer(New(Deps{
+		Config:  cfg,
+		Manager: manager,
+		PipeOutput: func(session, window string) (<-chan string, func(), error) {
+			return lines, func() {}, nil
+		},
+		AuthDisabled: true,
+	}))
+	defer server.Close()
+	first, _, err := websocket.DefaultDialer.Dial(wsURL(server.URL, "/ws/projects/alpha/orchestrator"), nil)
+	if err != nil {
+		t.Fatalf("first Dial: %v", err)
+	}
+	defer first.Close()
+
+	_, resp, err := websocket.DefaultDialer.Dial(wsURL(server.URL, "/ws/projects/alpha/orchestrator"), nil)
+	if err == nil {
+		t.Fatal("second Dial error = nil, want conflict")
+	}
+	if resp == nil || resp.StatusCode != http.StatusConflict {
+		t.Fatalf("response = %#v, want 409", resp)
+	}
+	close(lines)
+}
+
 func TestWebSocketRejectsDisallowedOrigin(t *testing.T) {
 	server := httptest.NewServer(New(Deps{
 		Config:         testConfig(),
@@ -1236,6 +1328,106 @@ func TestWorkerLogWebSocketRejectsSecondSubscriber(t *testing.T) {
 		t.Fatalf("response = %#v, want 409", resp)
 	}
 	close(lines)
+}
+
+func TestProjectWorkerFollowupSendsToActiveWorkerWindow(t *testing.T) {
+	dir := t.TempDir()
+	cfg := testConfig()
+	cfg.Runtime = config.RuntimeConfig{TmuxSession: "ccx-test", WorktreeBase: filepath.Join(dir, "worktrees")}
+	cfg.Projects = map[string]config.ProjectConfig{
+		"alpha": {
+			Slug:         "alpha",
+			RepoPath:     filepath.Join(dir, "alpha"),
+			LedgerPath:   filepath.Join(dir, "alpha", "tasks", "ledger.md"),
+			WorktreeBase: cfg.Runtime.WorktreeBase,
+			Orchestrator: cfg.Orchestrator,
+			GitHub:       cfg.GitHub,
+		},
+	}
+	manager, err := runtimepkg.NewManager(cfg, "http://127.0.0.1:8080")
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	alpha, err := manager.Project("alpha")
+	if err != nil {
+		t.Fatalf("Project alpha: %v", err)
+	}
+	if err := alpha.Ledger.Add(ledger.Task{
+		ID:       "task-20260101-0001",
+		Title:    "Active worker",
+		Status:   "in_progress",
+		WorkerID: "alpha-worker-task-20260101-0001",
+	}); err != nil {
+		t.Fatalf("Add alpha task: %v", err)
+	}
+	var sentSession, sentWindow, sentKeys string
+	handler := New(Deps{
+		Config:  cfg,
+		Manager: manager,
+		IsWindowAlive: func(ctx context.Context, session, window string) (bool, error) {
+			if session != "ccx-test" || window != "alpha-worker-task-20260101-0001" {
+				t.Fatalf("alive args = %q %q, want ccx-test alpha-worker-task-20260101-0001", session, window)
+			}
+			return true, nil
+		},
+		SendKeys: func(ctx context.Context, session, window, keys string) error {
+			sentSession, sentWindow, sentKeys = session, window, keys
+			return nil
+		},
+		AuthDisabled: true,
+	})
+
+	resp := performJSONRequest(handler, http.MethodPost, "/api/projects/alpha/workers/alpha-worker-task-20260101-0001/followup", `{
+		"message": "please continue"
+	}`)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	if sentSession != "ccx-test" || sentWindow != "alpha-worker-task-20260101-0001" || sentKeys != "please continue" {
+		t.Fatalf("sent = %q %q %q, want project worker followup", sentSession, sentWindow, sentKeys)
+	}
+	var followup workerFollowupResponse
+	if err := json.Unmarshal(resp.Body.Bytes(), &followup); err != nil {
+		t.Fatalf("decode followup response: %v", err)
+	}
+	if !followup.Sent || followup.Window != "alpha-worker-task-20260101-0001" || followup.TaskID != "task-20260101-0001" {
+		t.Fatalf("followup = %#v, want sent project worker response", followup)
+	}
+}
+
+func TestWorkerFollowupRejectsControlCharacters(t *testing.T) {
+	l := newTestLedger(t)
+	if err := l.Add(ledger.Task{
+		ID:       "task-20260101-0001",
+		Title:    "Active worker",
+		Status:   "in_progress",
+		WorkerID: "worker-task-20260101-0001",
+	}); err != nil {
+		t.Fatalf("Add task: %v", err)
+	}
+	sendCalled := false
+	handler := New(Deps{
+		Config: testConfig(),
+		Ledger: l,
+		IsWindowAlive: func(ctx context.Context, session, window string) (bool, error) {
+			return true, nil
+		},
+		SendKeys: func(ctx context.Context, session, window, keys string) error {
+			sendCalled = true
+			return nil
+		},
+		AuthDisabled: true,
+	})
+
+	resp := performJSONRequest(handler, http.MethodPost, "/api/workers/worker-task-20260101-0001/followup", `{
+		"message": "please stop\u0003"
+	}`)
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusBadRequest, resp.Body.String())
+	}
+	if sendCalled {
+		t.Fatal("SendKeys was called for unsafe followup input")
+	}
 }
 
 func TestLedgerWebSocketReceivesChangeNotification(t *testing.T) {

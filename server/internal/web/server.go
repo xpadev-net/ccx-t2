@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/xpadev/ccx-t2/internal/config"
 	"github.com/xpadev/ccx-t2/internal/ledger"
@@ -36,7 +37,10 @@ type Server struct {
 	trigger         Triggerer
 	cleaner         WorkerCleaner
 	pipeOutput      PipeOutputFunc
+	sendKeys        SendKeysFunc
+	isWindowAlive   WindowAliveFunc
 	tmuxSession     string
+	projectScoped   bool
 	secret          string
 	authDisabled    bool
 	allowedOrigins  map[string]bool
@@ -44,11 +48,12 @@ type Server struct {
 	mux             *http.ServeMux
 	ledgerClientsMu sync.Mutex
 	ledgerClients   map[*ledgerWSClient]struct{}
-	workerStreamsMu sync.Mutex
-	workerStreams   map[string]struct{}
+	tmuxStreams     *tmuxStreamRegistry
 }
 
 const deleteCleanupLease = 5 * time.Minute
+const maxFollowupMessageBytes = 20000
+const followupTmuxTimeout = 10 * time.Second
 
 // Deps contains dependencies needed by the web API.
 type Deps struct {
@@ -60,6 +65,8 @@ type Deps struct {
 	Trigger        Triggerer
 	Cleaner        WorkerCleaner
 	PipeOutput     PipeOutputFunc
+	SendKeys       SendKeysFunc
+	IsWindowAlive  WindowAliveFunc
 	Session        string
 	Secret         string
 	AuthDisabled   bool
@@ -77,16 +84,25 @@ func New(deps Deps) *Server {
 		registry:       deps.Registry,
 		trigger:        deps.Trigger,
 		pipeOutput:     deps.PipeOutput,
+		sendKeys:       deps.SendKeys,
+		isWindowAlive:  deps.IsWindowAlive,
 		tmuxSession:    deps.Session,
 		secret:         deps.Secret,
 		authDisabled:   deps.AuthDisabled,
 		allowedOrigins: allowedOriginSet(deps.AllowedOrigins),
 		harnesses:      harnessResponsesFromConfig(cfg),
 		mux:            http.NewServeMux(),
+		tmuxStreams:    &tmuxStreamRegistry{},
 	}
 	s.cleaner = workerCleanerFromDeps(s, deps)
 	if s.pipeOutput == nil {
 		s.pipeOutput = tmux.PipeOutput
+	}
+	if s.sendKeys == nil {
+		s.sendKeys = tmux.SendKeysContext
+	}
+	if s.isWindowAlive == nil {
+		s.isWindowAlive = tmux.IsWindowAliveContext
 	}
 	if s.ledger != nil {
 		s.ledger.SetOnChange(s.broadcastLedgerChange)
@@ -263,9 +279,11 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/tasks", s.handleTasks)
 	s.mux.HandleFunc("/api/tasks/", s.handleTaskByID)
 	s.mux.HandleFunc("/api/workers", s.handleWorkers)
+	s.mux.HandleFunc("/api/workers/", s.handleWorkerRoute)
 	s.mux.HandleFunc("/api/harnesses", s.handleHarnesses)
 	s.mux.HandleFunc("/api/config", s.handleConfig)
 	s.mux.HandleFunc("/ws/worker/", s.handleWorkerLogWS)
+	s.mux.HandleFunc("/ws/orchestrator", s.handleOrchestratorLogWS)
 	s.mux.HandleFunc("/ws/ledger", s.handleLedgerWS)
 	s.mux.HandleFunc("/ws/projects/", s.handleProjectWS)
 }
@@ -384,6 +402,10 @@ func (s *Server) handleProjectRoute(w http.ResponseWriter, r *http.Request) {
 			projectServer.handleWorkers(w, r)
 			return
 		}
+		if len(parts) == 4 && parts[3] == "followup" {
+			projectServer.sendWorkerFollowup(w, r, parts[2])
+			return
+		}
 	}
 	writeError(w, http.StatusNotFound, "project route not found")
 }
@@ -450,11 +472,15 @@ func (s *Server) projectServer(slug string) (*Server, error) {
 		registry:       project.Registry,
 		trigger:        project.Orchestrator,
 		pipeOutput:     s.pipeOutput,
+		sendKeys:       s.sendKeys,
+		isWindowAlive:  s.isWindowAlive,
 		tmuxSession:    project.Session,
+		projectScoped:  true,
 		secret:         s.secret,
 		authDisabled:   s.authDisabled,
 		allowedOrigins: s.allowedOrigins,
 		harnesses:      s.harnesses,
+		tmuxStreams:    s.tmuxStreams,
 	}
 	out.cleaner = defaultWorkerCleaner{
 		deps: func() cleanupDependencies {
@@ -747,6 +773,136 @@ func (s *Server) handleWorkers(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
+func (s *Server) handleWorkerRoute(w http.ResponseWriter, r *http.Request) {
+	rest := strings.TrimPrefix(r.URL.Path, "/api/workers/")
+	parts := strings.Split(rest, "/")
+	if len(parts) == 2 && parts[0] != "" && parts[1] == "followup" {
+		s.sendWorkerFollowup(w, r, parts[0])
+		return
+	}
+	writeError(w, http.StatusNotFound, "worker route not found")
+}
+
+func (s *Server) sendWorkerFollowup(w http.ResponseWriter, r *http.Request, workerID string) {
+	if !requireMethod(w, r, http.MethodPost) {
+		return
+	}
+	workerID = strings.TrimSpace(workerID)
+	if workerID == "" || strings.Contains(workerID, "/") {
+		writeError(w, http.StatusBadRequest, "worker_id is required")
+		return
+	}
+	if s.ledger == nil {
+		writeError(w, http.StatusInternalServerError, "ledger is not configured")
+		return
+	}
+	var req workerFollowupRequest
+	if err := decodeJSON(w, r, &req); err != nil {
+		writeDecodeError(w, err)
+		return
+	}
+	message, err := normalizeFollowupMessage(req.Message)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	task, err := s.activeTaskForWorker(workerID)
+	if err != nil {
+		if errors.Is(err, errWorkerNotActive) {
+			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "load worker task")
+		return
+	}
+	session, err := s.tmuxSessionName()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), followupTmuxTimeout)
+	defer cancel()
+	alive, err := s.isWindowAlive(ctx, session, workerID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "check worker tmux window")
+		return
+	}
+	if !alive {
+		writeError(w, http.StatusNotFound, "worker tmux window not found")
+		return
+	}
+	if _, err := s.activeTaskForWorker(workerID); err != nil {
+		if errors.Is(err, errWorkerNotActive) {
+			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "load worker task")
+		return
+	}
+	if err := s.sendKeys(ctx, session, workerID, message); err != nil {
+		writeError(w, http.StatusInternalServerError, "send worker followup")
+		return
+	}
+	writeJSON(w, http.StatusOK, workerFollowupResponse{
+		Sent:     true,
+		TaskID:   task.ID,
+		WorkerID: workerID,
+		Session:  session,
+		Window:   workerID,
+	})
+}
+
+func (s *Server) activeTaskForWorker(workerID string) (ledger.Task, error) {
+	tasks, err := s.ledger.Load()
+	if err != nil {
+		return ledger.Task{}, err
+	}
+	for _, task := range tasks {
+		if task.WorkerID != workerID {
+			continue
+		}
+		if task.Status != "in_progress" && task.Status != "blocked" {
+			return ledger.Task{}, fmt.Errorf("%w: task %s status is %q", errWorkerNotActive, task.ID, task.Status)
+		}
+		return task, nil
+	}
+	return ledger.Task{}, fmt.Errorf("%w: no active task found with worker_id %q", errWorkerNotActive, workerID)
+}
+
+func normalizeFollowupMessage(input string) (string, error) {
+	message := strings.Trim(input, "\n")
+	if strings.TrimSpace(message) == "" {
+		return "", fmt.Errorf("message is required")
+	}
+	if len(message) > maxFollowupMessageBytes {
+		return "", fmt.Errorf("message is too large")
+	}
+	for _, r := range message {
+		if unicode.IsControl(r) && r != '\n' && r != '\t' {
+			return "", fmt.Errorf("message contains unsupported control characters")
+		}
+	}
+	return message, nil
+}
+
+func (s *Server) tmuxSessionName() (string, error) {
+	cfg, ok := s.configSnapshot()
+	if !ok {
+		return "", fmt.Errorf("config is not configured")
+	}
+	session := s.tmuxSession
+	if session == "" {
+		session = cfg.Runtime.TmuxSession
+	}
+	if session == "" {
+		session = cfg.Project.Slug
+	}
+	if session == "" {
+		return "", fmt.Errorf("tmux session is not configured")
+	}
+	return session, nil
+}
+
 func (s *Server) handleHarnesses(w http.ResponseWriter, r *http.Request) {
 	if !requireMethod(w, r, http.MethodGet) {
 		return
@@ -877,6 +1033,18 @@ type taskDeleteResponse struct {
 	DeletePending bool         `json:"delete_pending,omitempty"`
 }
 
+type workerFollowupRequest struct {
+	Message string `json:"message"`
+}
+
+type workerFollowupResponse struct {
+	Sent     bool   `json:"sent"`
+	TaskID   string `json:"task_id"`
+	WorkerID string `json:"worker_id"`
+	Session  string `json:"session"`
+	Window   string `json:"window"`
+}
+
 type taskMutationRequest struct {
 	IdempotencyKey *string   `json:"idempotency_key"`
 	Title          *string   `json:"title"`
@@ -959,6 +1127,7 @@ var reWebTaskID = regexp.MustCompile(`^task-\d{8}-\d{4}$`)
 
 var errInvalidTaskMutation = errors.New("invalid task mutation")
 var errTaskDeletingConflict = errors.New("task delete is in progress")
+var errWorkerNotActive = errors.New("worker is not active")
 
 func validateTaskUpdate(current ledger.Task, fields map[string]any) error {
 	if current.Status == "deleting" {

@@ -239,12 +239,14 @@ Worker からのイベントを直列に処理し、Orchestrator を適切なタ
   - `PATCH /api/projects/:slug/tasks/:id` — タスク更新
   - `DELETE /api/projects/:slug/tasks/:id` — タスク削除（in_progress の場合は stop_worker・worktree 削除を連動）
   - `GET /api/projects/:slug/workers` — 対象プロジェクトの Worker 一覧（内部 Worker レジストリから返す。tmux ウィンドウ一覧と同期）
+  - `POST /api/projects/:slug/workers/:worker_id/followup` — 対象プロジェクトの active Worker tmux window に followup 入力を送信
   - `GET /api/harnesses` — ハーネス一覧
   - `GET /api/config` — グローバル設定取得（GitHub トークン等のシークレットは返さない）
   - `PATCH /api/config` — グローバル設定更新。プロジェクト追加・更新・削除を含む
 - 本番ビルド時は `web/dist/` をビルド済み静的ファイルとして配信
 
 **`server/internal/web/ws.go`**
+- `GET /ws/projects/:slug/orchestrator` — tmux pipe-pane をブリッジして Orchestrator ログをストリーミング
 - `GET /ws/projects/:slug/worker/:window` — tmux pipe-pane をブリッジして Worker ログをストリーミング
 - `GET /ws/projects/:slug/ledger` — 対象プロジェクトの台帳変更（MCP ツール実行・REST 書き込みの後）を push 通知
 
@@ -255,7 +257,8 @@ Worker からのイベントを直列に処理し、Orchestrator を適切なタ
   - プロジェクト切り替え
   - タスク台帳ビュー（一覧・編集・削除）
   - タスク追加フォーム（自然言語入力 → Orchestrator 経由）
-  - Worker ダッシュボード（ログストリーミング）
+  - Orchestrator console（ログストリーミング）
+  - Worker ダッシュボード（ログストリーミング・followup 送信）
   - グローバル設定画面（harness と project 登録）
 
 ---

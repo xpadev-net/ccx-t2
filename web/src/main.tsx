@@ -27,6 +27,14 @@ type TaskDeleteResponse = {
   delete_pending?: boolean;
 };
 
+type WorkerFollowupResponse = {
+  sent: boolean;
+  task_id: string;
+  worker_id: string;
+  session: string;
+  window: string;
+};
+
 type WorkerInfo = {
   worker_id: string;
   task_id: string;
@@ -115,7 +123,10 @@ function App() {
   const [tokenDraft, setTokenDraft] = useState(() => initialToken());
   const [workers, setWorkers] = useState<WorkerInfo[]>([]);
   const [selectedWorkerID, setSelectedWorkerID] = useState("");
+  const [orchestratorLog, setOrchestratorLog] = useState<string[]>([]);
   const [workerLog, setWorkerLog] = useState<string[]>([]);
+  const [followupMessage, setFollowupMessage] = useState("");
+  const [followupSending, setFollowupSending] = useState(false);
   const [projects, setProjects] = useState<ProjectInfo[]>([]);
   const [selectedProjectSlug, setSelectedProjectSlug] = useState("");
   const [newProjectSlug, setNewProjectSlug] = useState("");
@@ -151,6 +162,8 @@ function App() {
     () => Object.keys(configDraft.harnesses).sort((a, b) => a.localeCompare(b)),
     [configDraft.harnesses]
   );
+  const tmuxSession = config?.runtime?.tmux_session || selectedProjectSlug || "tmux";
+  const orchestratorWindow = selectedProjectSlug ? `${selectedProjectSlug}-orchestrator` : "orchestrator";
 
   useEffect(() => {
     void refreshAll(true, token, true);
@@ -187,6 +200,7 @@ function App() {
     if (!selectedWorker) {
       setSelectedWorkerID("");
       setWorkerLog([]);
+      setFollowupMessage("");
       return;
     }
     setSelectedWorkerID(selectedWorker.worker_id);
@@ -239,6 +253,59 @@ function App() {
   }, [selectedProjectSlug, selectedWorker?.worker_id, token]);
 
   useEffect(() => {
+    if (!selectedProjectSlug) {
+      setOrchestratorLog([]);
+      return;
+    }
+    setOrchestratorLog([]);
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const tokenQuery = token ? `?token=${encodeURIComponent(token)}` : "";
+    let attempts = 0;
+    let closed = false;
+    let retryTimer: number | undefined;
+    let socket: WebSocket | undefined;
+    const connect = () => {
+      if (closed) {
+        return;
+      }
+      socket = new WebSocket(
+        `${protocol}//${window.location.host}${orchestratorLogPath(selectedProjectSlug)}${tokenQuery}`
+      );
+      socket.addEventListener("message", (event) => {
+        try {
+          const msg = JSON.parse(String(event.data)) as { type?: string; data?: string };
+          if (msg.type === "line" && typeof msg.data === "string") {
+            setOrchestratorLog((current) => [...current.slice(-299), msg.data as string]);
+          } else if (msg.type === "closed") {
+            setOrchestratorLog((current) => [...current, "[stream closed]"]);
+          } else if (msg.type === "error" && msg.data) {
+            setOrchestratorLog((current) => [...current, `[error] ${msg.data}`]);
+          }
+        } catch {
+          setOrchestratorLog((current) => [...current, String(event.data)]);
+        }
+      });
+      socket.addEventListener("error", () => {
+        setOrchestratorLog((current) => [...current, "[stream error]"]);
+      });
+      socket.addEventListener("close", () => {
+        if (!closed && attempts < 3) {
+          attempts += 1;
+          retryTimer = window.setTimeout(connect, 250 * attempts);
+        }
+      });
+    };
+    connect();
+    return () => {
+      closed = true;
+      if (retryTimer !== undefined) {
+        window.clearTimeout(retryTimer);
+      }
+      socket?.close();
+    };
+  }, [selectedProjectSlug, token]);
+
+  useEffect(() => {
     if (!selectedTask) {
       setSelectedID("");
       setTitle("");
@@ -266,7 +333,7 @@ function App() {
     try {
       const data = await api<Task[]>(tasksPath(selectedProjectSlug), {}, authToken);
       setTasks(data);
-      setSelectedID((current) => current || data[0]?.id || "");
+      setSelectedID((current) => (data.some((task) => task.id === current) ? current : data[0]?.id || ""));
     } catch (err) {
       setError(errorMessage(err));
     } finally {
@@ -283,7 +350,9 @@ function App() {
     try {
       const data = await api<WorkerInfo[]>(workersPath(selectedProjectSlug), {}, authToken);
       setWorkers(data);
-      setSelectedWorkerID((current) => current || data[0]?.worker_id || "");
+      setSelectedWorkerID((current) =>
+        data.some((worker) => worker.worker_id === current) ? current : data[0]?.worker_id || ""
+      );
     } catch (err) {
       setError(errorMessage(err));
     }
@@ -416,6 +485,32 @@ function App() {
     }
   }
 
+  async function sendWorkerFollowup(event: FormEvent) {
+    event.preventDefault();
+    if (!selectedWorker || !followupMessage.trim()) {
+      return;
+    }
+    setFollowupSending(true);
+    setError("");
+    setMessage("");
+    try {
+      const response = await api<WorkerFollowupResponse>(
+        workerFollowupPath(selectedProjectSlug, selectedWorker.worker_id),
+        {
+          method: "POST",
+          body: JSON.stringify({ message: followupMessage })
+        },
+        token
+      );
+      setFollowupMessage("");
+      setMessage(`Followup sent to ${response.window}.`);
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setFollowupSending(false);
+    }
+  }
+
   async function saveConfig(event: FormEvent) {
     event.preventDefault();
     setSaving(true);
@@ -504,8 +599,13 @@ function App() {
 
   function selectProject(slug: string) {
     setSelectedProjectSlug(slug);
+    setTasks([]);
+    setWorkers([]);
     setSelectedID("");
     setSelectedWorkerID("");
+    setWorkerLog([]);
+    setOrchestratorLog([]);
+    setFollowupMessage("");
   }
 
   function updateConfigDraft(patch: Partial<ConfigDraft>) {
@@ -689,6 +789,25 @@ function App() {
           </form>
         </section>
 
+        <section className="orchestrator-dashboard" aria-label="Orchestrator console">
+          <div className="section-heading">
+            <h2>Orchestrator</h2>
+            <span>{selectedProjectSlug || "No project"}</span>
+          </div>
+          <div className="console-metadata">
+            <span>Project: {selectedProjectSlug || "None"}</span>
+            <span>Session: {tmuxSession}</span>
+            <span>Window: {orchestratorWindow}</span>
+          </div>
+          <div className="log-panel">
+            <div className="log-heading">
+              <span>{orchestratorWindow}</span>
+              <span>{selectedProject?.repo_path || "No repository"}</span>
+            </div>
+            <pre>{orchestratorLog.length ? orchestratorLog.join("\n") : "Waiting for orchestrator output..."}</pre>
+          </div>
+        </section>
+
         <section className="worker-dashboard" aria-label="Worker dashboard">
           <div className="section-heading">
             <h2>Workers</h2>
@@ -711,12 +830,33 @@ function App() {
             </div>
             <div className="log-panel">
               <div className="log-heading">
-                <span>{selectedWorker?.task_id || "No worker selected"}</span>
-                {selectedWorkerTask?.branch && <span>{selectedWorkerTask.branch}</span>}
+                <span>{selectedWorker?.worker_id || "No worker selected"}</span>
+                <span>{selectedWorkerTask?.branch || selectedWorker?.task_id || "No task"}</span>
               </div>
               <pre>{workerLog.length ? workerLog.join("\n") : "Waiting for worker output..."}</pre>
             </div>
           </div>
+          <form className="followup-form" onSubmit={sendWorkerFollowup}>
+            <div className="console-metadata">
+              <span>Project: {selectedProjectSlug || "None"}</span>
+              <span>Session: {tmuxSession}</span>
+              <span>Window: {selectedWorker?.worker_id || "None"}</span>
+              <span>Task: {selectedWorker?.task_id || "None"}</span>
+            </div>
+            <label>
+              Worker followup
+              <textarea
+                value={followupMessage}
+                onChange={(event) => setFollowupMessage(event.target.value)}
+                disabled={!selectedWorker || followupSending}
+              />
+            </label>
+            <div className="actions">
+              <button type="submit" disabled={!selectedWorker || followupSending || !followupMessage.trim()}>
+                Send Followup
+              </button>
+            </div>
+          </form>
         </section>
 
         <section className="settings-panel" aria-label="Settings">
@@ -990,6 +1130,16 @@ function workerLogPath(projectSlug: string, workerID: string) {
   return projectSlug
     ? `/ws/projects/${encodeURIComponent(projectSlug)}/worker/${encodeURIComponent(workerID)}`
     : `/ws/worker/${encodeURIComponent(workerID)}`;
+}
+
+function orchestratorLogPath(projectSlug: string) {
+  return projectSlug ? `/ws/projects/${encodeURIComponent(projectSlug)}/orchestrator` : "/ws/orchestrator";
+}
+
+function workerFollowupPath(projectSlug: string, workerID: string) {
+  return projectSlug
+    ? `/api/projects/${encodeURIComponent(projectSlug)}/workers/${encodeURIComponent(workerID)}/followup`
+    : `/api/workers/${encodeURIComponent(workerID)}/followup`;
 }
 
 async function api<T>(path: string, init: RequestInit = {}, token = ""): Promise<T> {
