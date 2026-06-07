@@ -177,14 +177,16 @@ func TestWorkerSplitRequestThroughMCPIntegration(t *testing.T) {
 	t.Cleanup(httpServer.Close)
 	deps.BaseURL = httpServer.URL
 
-	if _, err := handleSpawnWorker(deps)(context.Background(), map[string]any{
+	got, err := handleSpawnWorker(deps)(context.Background(), map[string]any{
 		"task_id":       taskID,
 		"branch":        branch,
 		"allowed_files": []any{"server/internal/mcp"},
 		"harness":       harnessName,
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("spawn_worker: %v", err)
 	}
+	assertPromptSent(t, got, "spawn_worker")
 
 	childID, childAllowed, childForbidden := waitForSplitTask(t, l, taskID, session, "worker-"+taskID)
 	waitForWorkerCleanup(t, registry, session, "worker-"+taskID, worktreePath)
@@ -199,15 +201,17 @@ func TestWorkerSplitRequestThroughMCPIntegration(t *testing.T) {
 		_ = exec.Command("git", "-C", repoPath, "worktree", "remove", "--force", childWorktreePath).Run()
 		_ = exec.Command("git", "-C", repoPath, "branch", "-D", childBranch).Run()
 	})
-	if _, err := handleSpawnWorker(deps)(context.Background(), map[string]any{
+	got, err = handleSpawnWorker(deps)(context.Background(), map[string]any{
 		"task_id":         childID,
 		"branch":          childBranch,
 		"allowed_files":   stringsToAny(childAllowed),
 		"forbidden_files": stringsToAny(childForbidden),
 		"harness":         harnessName,
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("spawn child worker: %v", err)
 	}
+	assertPromptSent(t, got, "spawn child worker")
 	waitForCompletedTask(t, l, childID, harnessName, session, "worker-"+childID)
 	waitForWorkerCleanup(t, registry, session, "worker-"+childID, childWorktreePath)
 }
@@ -461,7 +465,7 @@ func waitForSplitTask(t *testing.T, l *ledger.Ledger, taskID, session, workerID 
 				t.Fatalf("split reason = %q, want needs smaller slices", parent.Reason)
 			}
 			childID, childAllowed, childForbidden := assertChildTask(t, tasks, "Child API", "Implement API slice", []string{"server/internal/mcp"}, []string{"server/internal/mcp/legacy.go"})
-			assertChildTask(t, tasks, "Child UI", "Implement UI slice", []string{"web/src"}, nil)
+			assertChildTask(t, tasks, "Child UI", "Implement UI slice", []string{"web/src"}, []string{})
 			return childID, childAllowed, childForbidden
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -497,6 +501,17 @@ func stringsToAny(values []string) []any {
 		out[i] = value
 	}
 	return out
+}
+
+func assertPromptSent(t *testing.T, got any, label string) {
+	t.Helper()
+	result, ok := got.(map[string]any)
+	if !ok {
+		t.Fatalf("%s result type = %T, want map[string]any", label, got)
+	}
+	if result["prompt_sent"] != true {
+		t.Fatalf("%s result = %#v, want prompt_sent true", label, got)
+	}
 }
 
 func waitForWorkerCleanup(t *testing.T, registry *worker.Registry, session, workerID, worktreePath string) {
