@@ -48,7 +48,6 @@ type Server struct {
 	mux             *http.ServeMux
 	ledgerClientsMu sync.Mutex
 	ledgerClients   map[*ledgerWSClient]struct{}
-	tmuxStreamsMu   sync.Mutex
 	tmuxStreams     *tmuxStreamRegistry
 }
 
