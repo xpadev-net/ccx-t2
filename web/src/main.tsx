@@ -46,6 +46,7 @@ type WorkerInfo = {
 type ProjectInfo = {
   slug: string;
   repo_path: string;
+  session?: string;
 };
 
 type ConfigResponse = {
@@ -162,7 +163,7 @@ function App() {
     () => Object.keys(configDraft.harnesses).sort((a, b) => a.localeCompare(b)),
     [configDraft.harnesses]
   );
-  const tmuxSession = config?.runtime?.tmux_session || selectedProjectSlug || "tmux";
+  const tmuxSession = selectedProject?.session || config?.runtime?.tmux_session || selectedProjectSlug || "tmux";
   const orchestratorWindow = selectedProjectSlug ? `${selectedProjectSlug}-orchestrator` : "orchestrator";
 
   useEffect(() => {
