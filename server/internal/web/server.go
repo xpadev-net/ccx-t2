@@ -17,31 +17,40 @@ import (
 
 // Server serves the browser-facing REST API.
 type Server struct {
-	cfg       *config.Config
-	ledger    *ledger.Ledger
-	registry  *worker.Registry
-	secret    string
-	harnesses []harnessResponse
-	mux       *http.ServeMux
+	cfg            *config.Config
+	ledger         *ledger.Ledger
+	registry       *worker.Registry
+	secret         string
+	authDisabled   bool
+	allowedOrigins map[string]bool
+	harnesses      []harnessResponse
+	mux            *http.ServeMux
 }
 
 // Deps contains dependencies needed by the web API.
 type Deps struct {
-	Config   *config.Config
-	Ledger   *ledger.Ledger
-	Registry *worker.Registry
-	Secret   string
+	Config         *config.Config
+	Ledger         *ledger.Ledger
+	Registry       *worker.Registry
+	Secret         string
+	AuthDisabled   bool
+	AllowedOrigins []string
 }
 
 // New constructs a web API handler.
 func New(deps Deps) *Server {
 	s := &Server{
-		cfg:       deps.Config,
-		ledger:    deps.Ledger,
-		registry:  deps.Registry,
-		secret:    deps.Secret,
-		harnesses: harnessResponsesFromConfig(deps.Config),
-		mux:       http.NewServeMux(),
+		cfg:            deps.Config,
+		ledger:         deps.Ledger,
+		registry:       deps.Registry,
+		secret:         deps.Secret,
+		authDisabled:   deps.AuthDisabled,
+		allowedOrigins: allowedOriginSet(deps.AllowedOrigins),
+		harnesses:      harnessResponsesFromConfig(deps.Config),
+		mux:            http.NewServeMux(),
+	}
+	if s.secret == "" && !s.authDisabled {
+		log.Printf("web: bearer auth is not configured; set Secret or AuthDisabled=true explicitly")
 	}
 	s.routes()
 	return s
@@ -49,7 +58,7 @@ func New(deps Deps) *Server {
 
 // ServeHTTP implements http.Handler.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	setCORSHeaders(w)
+	s.setCORSHeaders(w, r)
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -61,8 +70,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) authorize(w http.ResponseWriter, r *http.Request) bool {
-	if s.secret == "" {
+	if s.authDisabled {
 		return true
+	}
+	if s.secret == "" {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return false
 	}
 	hdr := r.Header.Get("Authorization")
 	if !strings.HasPrefix(hdr, "Bearer ") {
@@ -77,10 +90,23 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request) bool {
 	return true
 }
 
-func setCORSHeaders(w http.ResponseWriter) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
+func (s *Server) setCORSHeaders(w http.ResponseWriter, r *http.Request) {
+	if s.allowedOrigins[r.Header.Get("Origin")] {
+		w.Header().Set("Access-Control-Allow-Origin", r.Header.Get("Origin"))
+		w.Header().Set("Vary", "Origin")
+	}
+	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+}
+
+func allowedOriginSet(origins []string) map[string]bool {
+	out := make(map[string]bool, len(origins))
+	for _, origin := range origins {
+		if origin != "" {
+			out[origin] = true
+		}
+	}
+	return out
 }
 
 func (s *Server) routes() {

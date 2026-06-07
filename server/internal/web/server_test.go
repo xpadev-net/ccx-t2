@@ -27,7 +27,7 @@ func TestGetTasksIncludesBody(t *testing.T) {
 		t.Fatalf("Add: %v", err)
 	}
 
-	resp := performRequest(New(Deps{Ledger: l}), http.MethodGet, "/api/tasks")
+	resp := performRequest(New(Deps{Ledger: l, AuthDisabled: true}), http.MethodGet, "/api/tasks")
 	if resp.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusOK, resp.Body.String())
 	}
@@ -52,7 +52,7 @@ func TestGetWorkersReturnsSortedSnapshot(t *testing.T) {
 	registry.Register(worker.Info{WorkerID: "worker-b", TaskID: "task-002", Harness: "codex", StartedAt: time.Unix(2, 0).UTC()})
 	registry.Register(worker.Info{WorkerID: "worker-a", TaskID: "task-001", Harness: "codex", StartedAt: time.Unix(1, 0).UTC()})
 
-	resp := performRequest(New(Deps{Registry: registry}), http.MethodGet, "/api/workers")
+	resp := performRequest(New(Deps{Registry: registry, AuthDisabled: true}), http.MethodGet, "/api/workers")
 	if resp.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusOK, resp.Body.String())
 	}
@@ -71,12 +71,16 @@ func TestGetWorkersReturnsSortedSnapshot(t *testing.T) {
 
 func TestGetHarnessesUsesConfiguredWorkerHarnesses(t *testing.T) {
 	cfg := testConfig()
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
 	cfg.Harnesses["worker"] = config.HarnessConfig{
-		Command: "sh",
+		Command: exe,
 		McpArgs: "--mcp-url {url} --token nested-secret-value",
 	}
 
-	resp := performRequest(New(Deps{Config: cfg}), http.MethodGet, "/api/harnesses")
+	resp := performRequest(New(Deps{Config: cfg, AuthDisabled: true}), http.MethodGet, "/api/harnesses")
 	if resp.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusOK, resp.Body.String())
 	}
@@ -101,8 +105,8 @@ func TestGetHarnessesUsesConfiguredWorkerHarnesses(t *testing.T) {
 	if harnesses[0].Name != "worker" || !harnesses[0].Available {
 		t.Fatalf("harness = %#v, want available worker", harnesses[0])
 	}
-	if harnesses[0].Usage["command"] != "sh" {
-		t.Fatalf("usage command = %#v, want sh", harnesses[0].Usage["command"])
+	if harnesses[0].Usage["command"] != exe {
+		t.Fatalf("usage command = %#v, want %s", harnesses[0].Usage["command"], exe)
 	}
 }
 
@@ -116,7 +120,7 @@ func TestGetConfigRedactsSecrets(t *testing.T) {
 		McpArgs: "--mcp-url {url} --token nested-secret-value --secret {secret}",
 	}
 
-	resp := performRequest(New(Deps{Config: cfg}), http.MethodGet, "/api/config")
+	resp := performRequest(New(Deps{Config: cfg, AuthDisabled: true}), http.MethodGet, "/api/config")
 	if resp.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusOK, resp.Body.String())
 	}
@@ -148,7 +152,7 @@ func TestGetConfigRedactsSecrets(t *testing.T) {
 }
 
 func TestMethodNotAllowed(t *testing.T) {
-	resp := performRequest(New(Deps{}), http.MethodPost, "/api/tasks")
+	resp := performRequest(New(Deps{AuthDisabled: true}), http.MethodPost, "/api/tasks")
 	if resp.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("status = %d, want %d", resp.Code, http.StatusMethodNotAllowed)
 	}
@@ -159,37 +163,57 @@ func TestMethodNotAllowed(t *testing.T) {
 
 func TestBearerAuth(t *testing.T) {
 	l := newTestLedger(t)
-	server := New(Deps{Ledger: l, Secret: "web-secret"})
+	server := New(Deps{
+		Ledger:         l,
+		Secret:         "web-secret",
+		AllowedOrigins: []string{"http://localhost:5173"},
+	})
 
-	resp := performRequest(server, http.MethodGet, "/api/tasks")
+	resp := performRequestWithHeaders(server, http.MethodGet, "/api/tasks", map[string]string{
+		"Origin": "http://localhost:5173",
+	})
 	if resp.Code != http.StatusUnauthorized {
 		t.Fatalf("unauthorized status = %d, want %d", resp.Code, http.StatusUnauthorized)
 	}
-	if got := resp.Header().Get("Access-Control-Allow-Origin"); got != "*" {
-		t.Fatalf("unauthorized Access-Control-Allow-Origin = %q, want *", got)
+	if got := resp.Header().Get("Access-Control-Allow-Origin"); got != "http://localhost:5173" {
+		t.Fatalf("unauthorized Access-Control-Allow-Origin = %q, want http://localhost:5173", got)
 	}
 
 	req := httptest.NewRequest(http.MethodGet, "/api/tasks", nil)
+	req.Header.Set("Origin", "http://localhost:5173")
 	req.Header.Set("Authorization", "Bearer web-secret")
 	authorized := httptest.NewRecorder()
 	server.ServeHTTP(authorized, req)
 	if authorized.Code != http.StatusOK {
 		t.Fatalf("authorized status = %d, want %d; body=%s", authorized.Code, http.StatusOK, authorized.Body.String())
 	}
-	if got := authorized.Header().Get("Access-Control-Allow-Origin"); got != "*" {
-		t.Fatalf("authorized Access-Control-Allow-Origin = %q, want *", got)
+	if got := authorized.Header().Get("Access-Control-Allow-Origin"); got != "http://localhost:5173" {
+		t.Fatalf("authorized Access-Control-Allow-Origin = %q, want http://localhost:5173", got)
+	}
+}
+
+func TestAuthRequiresSecretOrExplicitOptOut(t *testing.T) {
+	l := newTestLedger(t)
+	resp := performRequest(New(Deps{Ledger: l}), http.MethodGet, "/api/tasks")
+	if resp.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d", resp.Code, http.StatusUnauthorized)
 	}
 }
 
 func TestCORSPreflight(t *testing.T) {
-	server := New(Deps{Secret: "web-secret"})
+	server := New(Deps{Secret: "web-secret", AllowedOrigins: []string{"http://localhost:5173"}})
 
-	resp := performRequest(server, http.MethodOptions, "/api/tasks")
+	resp := performRequestWithHeaders(server, http.MethodOptions, "/api/tasks", map[string]string{
+		"Origin": "http://localhost:5173",
+	})
 	if resp.Code != http.StatusNoContent {
 		t.Fatalf("status = %d, want %d", resp.Code, http.StatusNoContent)
 	}
-	if got := resp.Header().Get("Access-Control-Allow-Origin"); got != "*" {
-		t.Fatalf("Access-Control-Allow-Origin = %q, want *", got)
+	if got := resp.Header().Get("Access-Control-Allow-Origin"); got != "http://localhost:5173" {
+		t.Fatalf("Access-Control-Allow-Origin = %q, want http://localhost:5173", got)
+	}
+	if got := resp.Header().Get("Access-Control-Allow-Methods"); got != "GET, OPTIONS" {
+		t.Fatalf("Access-Control-Allow-Methods = %q, want GET, OPTIONS", got)
 	}
 	if got := resp.Header().Get("Access-Control-Allow-Headers"); !strings.Contains(got, "Authorization") {
 		t.Fatalf("Access-Control-Allow-Headers = %q, want Authorization", got)
@@ -242,7 +266,14 @@ func testConfig() *config.Config {
 }
 
 func performRequest(handler http.Handler, method, target string) *httptest.ResponseRecorder {
+	return performRequestWithHeaders(handler, method, target, nil)
+}
+
+func performRequestWithHeaders(handler http.Handler, method, target string, headers map[string]string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(method, target, nil)
+	for key, value := range headers {
+		req.Header.Set(key, value)
+	}
 	resp := httptest.NewRecorder()
 	handler.ServeHTTP(resp, req)
 	return resp
