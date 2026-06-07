@@ -1124,6 +1124,9 @@ func waitForHarnessProcess(session, window string, timeout time.Duration) error 
 	deadline := time.Now().Add(timeout)
 	seen := false
 	for {
+		if time.Now().After(deadline) {
+			return fmt.Errorf("harness process did not start within %v", timeout)
+		}
 		idle, err := tmux.IsPaneIdle(session, window)
 		if err != nil {
 			return err
@@ -1135,9 +1138,6 @@ func waitForHarnessProcess(session, window string, timeout time.Duration) error 
 			seen = true
 		} else if seen {
 			seen = false
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("harness process did not start within %v", timeout)
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
