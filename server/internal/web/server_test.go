@@ -17,6 +17,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/xpadev/ccx-t2/internal/config"
 	"github.com/xpadev/ccx-t2/internal/ledger"
+	runtimepkg "github.com/xpadev/ccx-t2/internal/runtime"
 	"github.com/xpadev/ccx-t2/internal/worker"
 )
 
@@ -49,6 +50,66 @@ func TestGetTasksIncludesBody(t *testing.T) {
 	}
 	if len(tasks[0].AllowedFiles) != 1 || tasks[0].AllowedFiles[0] != "server/internal/web/**" {
 		t.Fatalf("AllowedFiles = %#v, want server/internal/web/**", tasks[0].AllowedFiles)
+	}
+}
+
+func TestProjectScopedTasksUseSelectedProjectLedger(t *testing.T) {
+	dir := t.TempDir()
+	cfg := testConfig()
+	cfg.Runtime = config.RuntimeConfig{TmuxSession: "ccx-test", WorktreeBase: filepath.Join(dir, "worktrees")}
+	cfg.Projects = map[string]config.ProjectConfig{
+		"alpha": {
+			Slug:         "alpha",
+			RepoPath:     filepath.Join(dir, "alpha"),
+			LedgerPath:   filepath.Join(dir, "alpha", "tasks", "ledger.md"),
+			WorktreeBase: cfg.Runtime.WorktreeBase,
+			Orchestrator: cfg.Orchestrator,
+			GitHub:       cfg.GitHub,
+		},
+		"beta": {
+			Slug:         "beta",
+			RepoPath:     filepath.Join(dir, "beta"),
+			LedgerPath:   filepath.Join(dir, "beta", "tasks", "ledger.md"),
+			WorktreeBase: cfg.Runtime.WorktreeBase,
+			Orchestrator: cfg.Orchestrator,
+			GitHub:       cfg.GitHub,
+		},
+	}
+	manager, err := runtimepkg.NewManager(cfg, "http://127.0.0.1:8080")
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	alpha, err := manager.Project("alpha")
+	if err != nil {
+		t.Fatalf("Project alpha: %v", err)
+	}
+	beta, err := manager.Project("beta")
+	if err != nil {
+		t.Fatalf("Project beta: %v", err)
+	}
+	if err := alpha.Ledger.Add(ledger.Task{ID: "task-20260101-0001", Title: "Alpha", Status: "unstarted"}); err != nil {
+		t.Fatalf("Add alpha: %v", err)
+	}
+	if err := beta.Ledger.Add(ledger.Task{ID: "task-20260101-0002", Title: "Beta", Status: "unstarted"}); err != nil {
+		t.Fatalf("Add beta: %v", err)
+	}
+
+	handler := New(Deps{Config: cfg, Manager: manager, AuthDisabled: true})
+	resp := performRequest(handler, http.MethodGet, "/api/projects/alpha/tasks")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	var tasks []taskResponse
+	if err := json.Unmarshal(resp.Body.Bytes(), &tasks); err != nil {
+		t.Fatalf("decode tasks: %v", err)
+	}
+	if len(tasks) != 1 || tasks[0].Title != "Alpha" {
+		t.Fatalf("tasks = %#v, want only Alpha task", tasks)
+	}
+
+	missing := performRequest(handler, http.MethodGet, "/api/projects/missing/tasks")
+	if missing.Code != http.StatusNotFound {
+		t.Fatalf("missing status = %d, want %d", missing.Code, http.StatusNotFound)
 	}
 }
 

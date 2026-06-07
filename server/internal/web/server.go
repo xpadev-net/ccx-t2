@@ -19,6 +19,7 @@ import (
 
 	"github.com/xpadev/ccx-t2/internal/config"
 	"github.com/xpadev/ccx-t2/internal/ledger"
+	runtimepkg "github.com/xpadev/ccx-t2/internal/runtime"
 	"github.com/xpadev/ccx-t2/internal/tmux"
 	"github.com/xpadev/ccx-t2/internal/worker"
 	"github.com/xpadev/ccx-t2/internal/worktree"
@@ -30,10 +31,12 @@ type Server struct {
 	cfg             *config.Config
 	configPath      string
 	ledger          *ledger.Ledger
+	manager         *runtimepkg.Manager
 	registry        *worker.Registry
 	trigger         Triggerer
 	cleaner         WorkerCleaner
 	pipeOutput      PipeOutputFunc
+	tmuxSession     string
 	secret          string
 	authDisabled    bool
 	allowedOrigins  map[string]bool
@@ -52,6 +55,7 @@ type Deps struct {
 	Config         *config.Config
 	ConfigPath     string
 	Ledger         *ledger.Ledger
+	Manager        *runtimepkg.Manager
 	Registry       *worker.Registry
 	Trigger        Triggerer
 	Cleaner        WorkerCleaner
@@ -69,9 +73,11 @@ func New(deps Deps) *Server {
 		cfg:            cfg,
 		configPath:     deps.ConfigPath,
 		ledger:         deps.Ledger,
+		manager:        deps.Manager,
 		registry:       deps.Registry,
 		trigger:        deps.Trigger,
 		pipeOutput:     deps.PipeOutput,
+		tmuxSession:    deps.Session,
 		secret:         deps.Secret,
 		authDisabled:   deps.AuthDisabled,
 		allowedOrigins: allowedOriginSet(deps.AllowedOrigins),
@@ -84,6 +90,14 @@ func New(deps Deps) *Server {
 	}
 	if s.ledger != nil {
 		s.ledger.SetOnChange(s.broadcastLedgerChange)
+	}
+	if s.manager != nil {
+		for _, info := range s.manager.Projects() {
+			project, err := s.manager.Project(info.Slug)
+			if err == nil && project.Ledger != nil {
+				project.Ledger.SetOnChange(s.broadcastLedgerChange)
+			}
+		}
 	}
 	if s.secret == "" && !s.authDisabled {
 		log.Printf("web: bearer auth is not configured; set Secret or AuthDisabled=true explicitly")
@@ -244,6 +258,8 @@ func allowedOriginSet(origins []string) map[string]bool {
 }
 
 func (s *Server) routes() {
+	s.mux.HandleFunc("/api/projects", s.handleProjects)
+	s.mux.HandleFunc("/api/projects/", s.handleProjectRoute)
 	s.mux.HandleFunc("/api/tasks", s.handleTasks)
 	s.mux.HandleFunc("/api/tasks/", s.handleTaskByID)
 	s.mux.HandleFunc("/api/workers", s.handleWorkers)
@@ -251,6 +267,102 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/config", s.handleConfig)
 	s.mux.HandleFunc("/ws/worker/", s.handleWorkerLogWS)
 	s.mux.HandleFunc("/ws/ledger", s.handleLedgerWS)
+	s.mux.HandleFunc("/ws/projects/", s.handleProjectWS)
+}
+
+func (s *Server) handleProjects(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodGet) {
+		return
+	}
+	if s.manager != nil {
+		writeJSON(w, http.StatusOK, s.manager.Projects())
+		return
+	}
+	cfg, ok := s.configSnapshot()
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "config is not configured")
+		return
+	}
+	writeJSON(w, http.StatusOK, []runtimepkg.ProjectInfo{{
+		Slug:     cfg.Project.Slug,
+		RepoPath: cfg.Project.RepoPath,
+	}})
+}
+
+func (s *Server) handleProjectRoute(w http.ResponseWriter, r *http.Request) {
+	rest := strings.TrimPrefix(r.URL.Path, "/api/projects/")
+	parts := strings.Split(rest, "/")
+	if len(parts) < 2 || parts[0] == "" {
+		writeError(w, http.StatusNotFound, "project route not found")
+		return
+	}
+	projectServer, err := s.projectServer(parts[0])
+	if err != nil {
+		if errors.Is(err, runtimepkg.ErrProjectNotFound) {
+			writeError(w, http.StatusNotFound, "project not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "project is not configured")
+		return
+	}
+	switch parts[1] {
+	case "tasks":
+		if len(parts) == 2 {
+			projectServer.handleTasks(w, r)
+			return
+		}
+		if len(parts) == 3 {
+			switch r.Method {
+			case http.MethodPatch:
+				projectServer.updateTask(w, r, parts[2])
+			case http.MethodDelete:
+				projectServer.deleteTask(w, r, parts[2])
+			default:
+				methodNotAllowed(w, http.MethodPatch, http.MethodDelete)
+			}
+			return
+		}
+	case "workers":
+		if len(parts) == 2 {
+			projectServer.handleWorkers(w, r)
+			return
+		}
+	}
+	writeError(w, http.StatusNotFound, "project route not found")
+}
+
+func (s *Server) projectServer(slug string) (*Server, error) {
+	if s.manager == nil {
+		cfg, ok := s.configSnapshot()
+		if !ok || cfg.Project.Slug != slug {
+			return nil, fmt.Errorf("%w: %s", runtimepkg.ErrProjectNotFound, slug)
+		}
+		return s, nil
+	}
+	project, err := s.manager.Project(slug)
+	if err != nil {
+		return nil, err
+	}
+	out := &Server{
+		cfg:            project.Config,
+		ledger:         project.Ledger,
+		manager:        s.manager,
+		registry:       project.Registry,
+		trigger:        project.Orchestrator,
+		pipeOutput:     s.pipeOutput,
+		tmuxSession:    project.Session,
+		secret:         s.secret,
+		authDisabled:   s.authDisabled,
+		allowedOrigins: s.allowedOrigins,
+		harnesses:      s.harnesses,
+	}
+	out.cleaner = defaultWorkerCleaner{
+		deps: func() cleanupDependencies {
+			return cleanupDependencies{cfg: project.Config, session: project.Session}
+		},
+		registry: project.Registry,
+	}
+	return out, nil
 }
 
 func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request) {
@@ -842,30 +954,50 @@ func taskResponseFromLedger(task ledger.Task) taskResponse {
 type configResponse struct {
 	Project         projectConfigResponse            `json:"project"`
 	Server          serverConfigResponse             `json:"server"`
+	Runtime         runtimeConfigResponse            `json:"runtime"`
 	Orchestrator    orchestratorConfigResponse       `json:"orchestrator"`
 	WorkerHarnesses []string                         `json:"worker_harnesses"`
 	Harnesses       map[string]harnessConfigResponse `json:"harnesses"`
 	GitHub          githubConfigResponse             `json:"github"`
+	Projects        map[string]projectConfigResponse `json:"projects"`
 }
 
 type configPatchRequest struct {
 	Project         *projectConfigPatch           `json:"project"`
 	Server          *serverConfigPatch            `json:"server"`
+	Runtime         *runtimeConfigPatch           `json:"runtime"`
 	Orchestrator    *orchestratorConfigPatch      `json:"orchestrator"`
 	WorkerHarnesses *[]string                     `json:"worker_harnesses"`
 	Harnesses       map[string]harnessConfigPatch `json:"harnesses"`
 	GitHub          *githubConfigPatch            `json:"github"`
+	Projects        map[string]projectConfigPatch `json:"projects"`
 }
 
 type projectConfigResponse struct {
-	Slug         string `json:"slug"`
-	RepoPath     string `json:"repo_path"`
-	WorktreeBase string `json:"worktree_base"`
+	Slug              string                     `json:"slug"`
+	RepoPath          string                     `json:"repo_path"`
+	WorktreeBase      string                     `json:"worktree_base"`
+	LedgerPath        string                     `json:"ledger_path,omitempty"`
+	ValidationCommand string                     `json:"validation_command,omitempty"`
+	Orchestrator      orchestratorConfigResponse `json:"orchestrator,omitempty"`
+	GitHub            githubConfigResponse       `json:"github,omitempty"`
 }
 
 type projectConfigPatch struct {
-	Slug         *string `json:"slug"`
-	RepoPath     *string `json:"repo_path"`
+	Slug              *string `json:"slug"`
+	RepoPath          *string `json:"repo_path"`
+	WorktreeBase      *string `json:"worktree_base"`
+	LedgerPath        *string `json:"ledger_path"`
+	ValidationCommand *string `json:"validation_command"`
+}
+
+type runtimeConfigResponse struct {
+	TmuxSession  string `json:"tmux_session"`
+	WorktreeBase string `json:"worktree_base"`
+}
+
+type runtimeConfigPatch struct {
+	TmuxSession  *string `json:"tmux_session"`
 	WorktreeBase *string `json:"worktree_base"`
 }
 
@@ -953,14 +1085,18 @@ func configResponseFromConfig(cfg *config.Config) configResponse {
 	for name, h := range cfg.Harnesses {
 		harnesses[name] = harnessConfigResponse{Command: h.Command}
 	}
+	projects := make(map[string]projectConfigResponse, len(cfg.Projects))
+	for slug, project := range cfg.Projects {
+		projects[slug] = projectConfigResponseFromConfig(project)
+	}
 	return configResponse{
-		Project: projectConfigResponse{
-			Slug:         cfg.Project.Slug,
-			RepoPath:     cfg.Project.RepoPath,
-			WorktreeBase: cfg.Project.WorktreeBase,
-		},
+		Project: projectConfigResponseFromConfig(cfg.Project),
 		Server: serverConfigResponse{
 			Port: cfg.Server.Port,
+		},
+		Runtime: runtimeConfigResponse{
+			TmuxSession:  cfg.Runtime.TmuxSession,
+			WorktreeBase: cfg.Runtime.WorktreeBase,
 		},
 		Orchestrator: orchestratorConfigResponse{
 			Harness:           cfg.Orchestrator.Harness,
@@ -972,6 +1108,25 @@ func configResponseFromConfig(cfg *config.Config) configResponse {
 		GitHub: githubConfigResponse{
 			Owner: cfg.GitHub.Owner,
 			Repo:  cfg.GitHub.Repo,
+		},
+		Projects: projects,
+	}
+}
+
+func projectConfigResponseFromConfig(project config.ProjectConfig) projectConfigResponse {
+	return projectConfigResponse{
+		Slug:         project.Slug,
+		RepoPath:     project.RepoPath,
+		WorktreeBase: project.WorktreeBase,
+		LedgerPath:   project.LedgerPath,
+		Orchestrator: orchestratorConfigResponse{
+			Harness:           project.Orchestrator.Harness,
+			HeartbeatInterval: project.Orchestrator.HeartbeatInterval.String(),
+			Timeout:           project.Orchestrator.Timeout.String(),
+		},
+		GitHub: githubConfigResponse{
+			Owner: project.GitHub.Owner,
+			Repo:  project.GitHub.Repo,
 		},
 	}
 }
@@ -991,10 +1146,28 @@ func applyConfigPatch(cfg *config.Config, req configPatchRequest) error {
 			cfg.Project.WorktreeBase = strings.TrimSpace(*req.Project.WorktreeBase)
 			changed = true
 		}
+		if req.Project.LedgerPath != nil {
+			cfg.Project.LedgerPath = strings.TrimSpace(*req.Project.LedgerPath)
+			changed = true
+		}
+		if req.Project.ValidationCommand != nil {
+			cfg.Project.ValidationCommand = strings.TrimSpace(*req.Project.ValidationCommand)
+			changed = true
+		}
 	}
 	if req.Server != nil && req.Server.Port != nil {
 		cfg.Server.Port = *req.Server.Port
 		changed = true
+	}
+	if req.Runtime != nil {
+		if req.Runtime.TmuxSession != nil {
+			cfg.Runtime.TmuxSession = strings.TrimSpace(*req.Runtime.TmuxSession)
+			changed = true
+		}
+		if req.Runtime.WorktreeBase != nil {
+			cfg.Runtime.WorktreeBase = strings.TrimSpace(*req.Runtime.WorktreeBase)
+			changed = true
+		}
 	}
 	if req.Orchestrator != nil {
 		if req.Orchestrator.Harness != nil {
@@ -1052,6 +1225,44 @@ func applyConfigPatch(cfg *config.Config, req configPatchRequest) error {
 		}
 		if req.GitHub.Repo != nil {
 			cfg.GitHub.Repo = strings.TrimSpace(*req.GitHub.Repo)
+			changed = true
+		}
+	}
+	if req.Projects != nil {
+		if cfg.Projects == nil {
+			cfg.Projects = make(map[string]config.ProjectConfig)
+		}
+		for slug, patch := range req.Projects {
+			slug = strings.TrimSpace(slug)
+			if slug == "" {
+				return fmt.Errorf("project slug cannot be empty")
+			}
+			current := cfg.Projects[slug]
+			current.Slug = slug
+			if patch.Slug != nil {
+				nextSlug := strings.TrimSpace(*patch.Slug)
+				if nextSlug == "" {
+					return fmt.Errorf("project slug cannot be empty")
+				}
+				if nextSlug != slug {
+					delete(cfg.Projects, slug)
+					slug = nextSlug
+					current.Slug = nextSlug
+				}
+			}
+			if patch.RepoPath != nil {
+				current.RepoPath = strings.TrimSpace(*patch.RepoPath)
+			}
+			if patch.WorktreeBase != nil {
+				current.WorktreeBase = strings.TrimSpace(*patch.WorktreeBase)
+			}
+			if patch.LedgerPath != nil {
+				current.LedgerPath = strings.TrimSpace(*patch.LedgerPath)
+			}
+			if patch.ValidationCommand != nil {
+				current.ValidationCommand = strings.TrimSpace(*patch.ValidationCommand)
+			}
+			cfg.Projects[slug] = current
 			changed = true
 		}
 	}
