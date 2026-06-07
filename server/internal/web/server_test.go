@@ -1,7 +1,10 @@
 package web
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -44,6 +47,165 @@ func TestGetTasksIncludesBody(t *testing.T) {
 	}
 	if len(tasks[0].AllowedFiles) != 1 || tasks[0].AllowedFiles[0] != "server/internal/web/**" {
 		t.Fatalf("AllowedFiles = %#v, want server/internal/web/**", tasks[0].AllowedFiles)
+	}
+}
+
+func TestPostTasksCreatesTaskAndTriggersOrchestrator(t *testing.T) {
+	l := newTestLedger(t)
+	trigger := &fakeTrigger{}
+	server := New(Deps{Ledger: l, Trigger: trigger, AuthDisabled: true})
+
+	resp := performJSONRequest(server, http.MethodPost, "/api/tasks", `{
+		"title": "New task",
+		"body": "Build mutation endpoint.",
+		"allowed_files": ["server/internal/web/**"]
+	}`)
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusCreated, resp.Body.String())
+	}
+
+	var created taskCreateResponse
+	if err := json.Unmarshal(resp.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode created task: %v", err)
+	}
+	if created.Task.ID == "" {
+		t.Fatal("created task ID is empty")
+	}
+	if got := resp.Header().Get("Idempotency-Key"); got != created.Task.ID {
+		t.Fatalf("Idempotency-Key = %q, want created task ID %q", got, created.Task.ID)
+	}
+	if created.Task.Status != "unstarted" {
+		t.Fatalf("status = %q, want unstarted", created.Task.Status)
+	}
+	if !created.OrchestratorTriggered {
+		t.Fatal("OrchestratorTriggered = false, want true")
+	}
+	if len(trigger.reasons) != 1 || !strings.Contains(trigger.reasons[0], created.Task.ID) {
+		t.Fatalf("trigger reasons = %#v, want created task ID", trigger.reasons)
+	}
+}
+
+func TestPostTasksSupportsIdempotencyKey(t *testing.T) {
+	l := newTestLedger(t)
+	server := New(Deps{Ledger: l, AuthDisabled: true})
+	body := `{"idempotency_key":"client-task-1","title":"New task"}`
+
+	first := performJSONRequest(server, http.MethodPost, "/api/tasks", body)
+	if first.Code != http.StatusCreated {
+		t.Fatalf("first status = %d, want %d; body=%s", first.Code, http.StatusCreated, first.Body.String())
+	}
+	second := performJSONRequest(server, http.MethodPost, "/api/tasks", body)
+	if second.Code != http.StatusOK {
+		t.Fatalf("second status = %d, want %d; body=%s", second.Code, http.StatusOK, second.Body.String())
+	}
+	tasks, err := l.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("len(tasks) = %d, want 1", len(tasks))
+	}
+	if tasks[0].ID != "client-task-1" {
+		t.Fatalf("task ID = %q, want client-task-1", tasks[0].ID)
+	}
+}
+
+func TestPostTasksIdempotentRetryRetriesTrigger(t *testing.T) {
+	l := newTestLedger(t)
+	trigger := &fakeTrigger{err: errors.New("tmux unavailable")}
+	server := New(Deps{Ledger: l, Trigger: trigger, AuthDisabled: true})
+	body := `{"idempotency_key":"client-task-1","title":"New task"}`
+
+	first := performJSONRequest(server, http.MethodPost, "/api/tasks", body)
+	if first.Code != http.StatusAccepted {
+		t.Fatalf("first status = %d, want %d; body=%s", first.Code, http.StatusAccepted, first.Body.String())
+	}
+	trigger.err = nil
+	second := performJSONRequest(server, http.MethodPost, "/api/tasks", body)
+	if second.Code != http.StatusOK {
+		t.Fatalf("second status = %d, want %d; body=%s", second.Code, http.StatusOK, second.Body.String())
+	}
+	if len(trigger.reasons) != 2 {
+		t.Fatalf("trigger count = %d, want 2", len(trigger.reasons))
+	}
+
+	var retry taskCreateResponse
+	if err := json.Unmarshal(second.Body.Bytes(), &retry); err != nil {
+		t.Fatalf("decode retry response: %v", err)
+	}
+	if !retry.OrchestratorTriggered {
+		t.Fatal("retry OrchestratorTriggered = false, want true")
+	}
+}
+
+func TestPostTasksReturnsAcceptedWhenTriggerFails(t *testing.T) {
+	l := newTestLedger(t)
+	server := New(Deps{
+		Ledger:       l,
+		Trigger:      &fakeTrigger{err: errors.New("tmux unavailable")},
+		AuthDisabled: true,
+	})
+
+	resp := performJSONRequest(server, http.MethodPost, "/api/tasks", `{"title":"New task"}`)
+	if resp.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusAccepted, resp.Body.String())
+	}
+
+	var created taskCreateResponse
+	if err := json.Unmarshal(resp.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode created task: %v", err)
+	}
+	if created.Task.ID == "" {
+		t.Fatal("created task ID is empty")
+	}
+	if created.TriggerError == "" {
+		t.Fatal("TriggerError is empty, want trigger failure marker")
+	}
+	tasks, err := l.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("len(tasks) = %d, want 1", len(tasks))
+	}
+}
+
+func TestPatchTaskUpdatesFields(t *testing.T) {
+	l := newTestLedger(t)
+	if err := l.Add(ledger.Task{ID: "task-001", Title: "Old", Status: "unstarted", Body: "old body"}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	resp := performJSONRequest(New(Deps{Ledger: l, AuthDisabled: true}), http.MethodPatch, "/api/tasks/task-001", `{
+		"title": "Updated",
+		"status": "blocked",
+		"reason": "Needs detail",
+		"body": "new body"
+	}`)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusOK, resp.Body.String())
+	}
+
+	var updated taskResponse
+	if err := json.Unmarshal(resp.Body.Bytes(), &updated); err != nil {
+		t.Fatalf("decode updated task: %v", err)
+	}
+	if updated.Title != "Updated" || updated.Status != "blocked" || updated.Reason != "Needs detail" || updated.Body != "new body" {
+		t.Fatalf("updated task = %#v, want patched fields", updated)
+	}
+}
+
+func TestPatchTaskNotFound(t *testing.T) {
+	resp := performJSONRequest(New(Deps{Ledger: newTestLedger(t), AuthDisabled: true}), http.MethodPatch, "/api/tasks/missing", `{"title":"Updated"}`)
+	if resp.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", resp.Code, http.StatusNotFound)
+	}
+}
+
+func TestPostTasksRejectsEmptyTask(t *testing.T) {
+	resp := performJSONRequest(New(Deps{Ledger: newTestLedger(t), AuthDisabled: true}), http.MethodPost, "/api/tasks", `{}`)
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", resp.Code, http.StatusBadRequest)
 	}
 }
 
@@ -152,12 +314,12 @@ func TestGetConfigRedactsSecrets(t *testing.T) {
 }
 
 func TestMethodNotAllowed(t *testing.T) {
-	resp := performRequest(New(Deps{AuthDisabled: true}), http.MethodPost, "/api/tasks")
+	resp := performRequest(New(Deps{AuthDisabled: true}), http.MethodPut, "/api/tasks")
 	if resp.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("status = %d, want %d", resp.Code, http.StatusMethodNotAllowed)
 	}
-	if allow := resp.Header().Get("Allow"); allow != http.MethodGet {
-		t.Fatalf("Allow = %q, want GET", allow)
+	if allow := resp.Header().Get("Allow"); allow != "GET, POST" {
+		t.Fatalf("Allow = %q, want GET, POST", allow)
 	}
 }
 
@@ -215,8 +377,8 @@ func TestCORSPreflight(t *testing.T) {
 	if got := resp.Header().Get("Vary"); got != "Origin" {
 		t.Fatalf("Vary = %q, want Origin", got)
 	}
-	if got := resp.Header().Get("Access-Control-Allow-Methods"); got != "GET, OPTIONS" {
-		t.Fatalf("Access-Control-Allow-Methods = %q, want GET, OPTIONS", got)
+	if got := resp.Header().Get("Access-Control-Allow-Methods"); got != "GET, POST, PATCH, OPTIONS" {
+		t.Fatalf("Access-Control-Allow-Methods = %q, want GET, POST, PATCH, OPTIONS", got)
 	}
 	if got := resp.Header().Get("Access-Control-Allow-Headers"); !strings.Contains(got, "Authorization") {
 		t.Fatalf("Access-Control-Allow-Headers = %q, want Authorization", got)
@@ -272,6 +434,14 @@ func performRequest(handler http.Handler, method, target string) *httptest.Respo
 	return performRequestWithHeaders(handler, method, target, nil)
 }
 
+func performJSONRequest(handler http.Handler, method, target, body string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, target, bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+	return resp
+}
+
 func performRequestWithHeaders(handler http.Handler, method, target string, headers map[string]string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(method, target, nil)
 	for key, value := range headers {
@@ -280,4 +450,14 @@ func performRequestWithHeaders(handler http.Handler, method, target string, head
 	resp := httptest.NewRecorder()
 	handler.ServeHTTP(resp, req)
 	return resp
+}
+
+type fakeTrigger struct {
+	reasons []string
+	err     error
+}
+
+func (f *fakeTrigger) Trigger(ctx context.Context, reason string) error {
+	f.reasons = append(f.reasons, reason)
+	return f.err
 }
