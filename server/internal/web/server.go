@@ -276,10 +276,19 @@ func (s *Server) updateTask(w http.ResponseWriter, r *http.Request, id string) {
 		writeError(w, http.StatusBadRequest, "status cannot be empty")
 		return
 	}
-	prev, err := s.ledger.UpdateReturnPrev(id, fields)
+	prev, err := s.ledger.UpdateReturnPrevWith(id, func(current ledger.Task) (map[string]any, error) {
+		if err := validateTaskUpdate(current, fields); err != nil {
+			return nil, err
+		}
+		return fields, nil
+	})
 	if err != nil {
 		if errors.Is(err, ledger.ErrTaskNotFound) {
 			writeError(w, http.StatusNotFound, "task not found")
+			return
+		}
+		if errors.Is(err, errInvalidTaskMutation) {
+			writeError(w, http.StatusBadRequest, invalidTaskMutationMessage(err))
 			return
 		}
 		writeError(w, http.StatusInternalServerError, "update task")
@@ -288,17 +297,6 @@ func (s *Server) updateTask(w http.ResponseWriter, r *http.Request, id string) {
 	updated := taskSnapshotWithFields(prev, fields)
 	updated.UpdatedAt = ""
 	writeJSON(w, http.StatusOK, taskResponseFromLedger(updated))
-}
-
-func (s *Server) loadTask(id string) (ledger.Task, error) {
-	task, ok, err := s.loadTaskIfExists(id)
-	if err != nil {
-		return ledger.Task{}, err
-	}
-	if !ok {
-		return ledger.Task{}, fmt.Errorf("task not found: %s", id)
-	}
-	return task, nil
 }
 
 func (s *Server) loadTaskIfExists(id string) (ledger.Task, bool, error) {
@@ -444,6 +442,25 @@ func taskSnapshotWithFields(task ledger.Task, fields map[string]any) ledger.Task
 }
 
 var reWebTaskID = regexp.MustCompile(`^task-\d{8}-\d{4}$`)
+
+var errInvalidTaskMutation = errors.New("invalid task mutation")
+
+func validateTaskUpdate(current ledger.Task, fields map[string]any) error {
+	if status, ok := fields["status"].(string); ok && strings.TrimSpace(status) == "" {
+		return fmt.Errorf("%w: status cannot be empty", errInvalidTaskMutation)
+	}
+	next := taskSnapshotWithFields(current, fields)
+	if strings.TrimSpace(next.Title) == "" && strings.TrimSpace(next.Body) == "" {
+		return fmt.Errorf("%w: title and body cannot both be empty", errInvalidTaskMutation)
+	}
+	return nil
+}
+
+func invalidTaskMutationMessage(err error) string {
+	msg := err.Error()
+	prefix := errInvalidTaskMutation.Error() + ": "
+	return strings.TrimPrefix(msg, prefix)
+}
 
 func fieldsFromUpdateRequest(req taskMutationRequest) map[string]any {
 	fields := make(map[string]any)

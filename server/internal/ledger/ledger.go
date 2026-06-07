@@ -418,6 +418,14 @@ func (l *Ledger) UpdateIfStatusesReturnPrevWith(id string, allowedStatuses []str
 // the returned prev task with its earlier read to detect concurrent transitions
 // (e.g., a spawned worker that changed status between the caller's Load and this Update).
 func (l *Ledger) UpdateReturnPrev(id string, fields map[string]any) (prev Task, err error) {
+	return l.UpdateReturnPrevWith(id, func(Task) (map[string]any, error) {
+		return fields, nil
+	})
+}
+
+// UpdateReturnPrevWith computes and applies task fields while holding the
+// ledger lock, and returns the pre-update snapshot.
+func (l *Ledger) UpdateReturnPrevWith(id string, updater func(Task) (map[string]any, error)) (prev Task, err error) {
 	l.mu.Lock()
 	tasks, err := l.load()
 	if err != nil {
@@ -431,6 +439,11 @@ func (l *Ledger) UpdateReturnPrev(id string, fields map[string]any) (prev Task, 
 		}
 		prev = tasks[i] // snapshot before mutation
 		found = true
+		fields, err := updater(prev)
+		if err != nil {
+			l.mu.Unlock()
+			return Task{}, err
+		}
 		t := &tasks[i]
 		if err := applyFields(t, fields); err != nil {
 			l.mu.Unlock()
