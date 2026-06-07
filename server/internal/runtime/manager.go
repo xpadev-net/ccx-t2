@@ -34,6 +34,7 @@ type ProjectRuntime struct {
 	Scheduler    *scheduler.Scheduler
 	Session      string
 	BaseURL      string
+	cancel       context.CancelFunc
 }
 
 type Manager struct {
@@ -42,6 +43,8 @@ type Manager struct {
 	baseURL  string
 	mu       sync.RWMutex
 	projects map[string]*ProjectRuntime
+	ctx      context.Context
+	started  bool
 }
 
 func NewManager(cfg *config.Config, baseURL string) (*Manager, error) {
@@ -54,42 +57,60 @@ func NewManager(cfg *config.Config, baseURL string) (*Manager, error) {
 		baseURL:  baseURL,
 		projects: make(map[string]*ProjectRuntime, len(cfg.Projects)),
 	}
-	for slug := range cfg.Projects {
-		projectCfg, ok := config.Project(cfg, slug)
-		if !ok {
-			return nil, fmt.Errorf("runtime: %w: %s", ErrProjectNotFound, slug)
-		}
-		archiveDir := filepath.Join(filepath.Dir(projectCfg.Project.LedgerPath), "archive")
-		if err := os.MkdirAll(filepath.Dir(projectCfg.Project.LedgerPath), 0o755); err != nil {
-			return nil, fmt.Errorf("runtime: project %s ledger dir: %w", slug, err)
-		}
-		if err := os.MkdirAll(archiveDir, 0o755); err != nil {
-			return nil, fmt.Errorf("runtime: project %s archive dir: %w", slug, err)
-		}
-		l := ledger.NewLedger(projectCfg.Project.LedgerPath, archiveDir)
-		registry := worker.NewRegistry()
-		var gh *githubpkg.Client
-		if projectCfg.GitHub.Token != "" || projectCfg.GitHub.Owner != "" || projectCfg.GitHub.Repo != "" {
-			client, err := githubpkg.NewClient(projectCfg.GitHub.Token, projectCfg.GitHub.Owner, projectCfg.GitHub.Repo)
-			if err != nil {
-				return nil, fmt.Errorf("runtime: project %s github: %w", slug, err)
-			}
-			gh = client
-		}
-		o := orchestrator.NewProject(l, projectCfg, m.session, m.baseURL, slug+"-orchestrator")
-		m.projects[slug] = &ProjectRuntime{
-			Slug:         slug,
-			Config:       projectCfg,
-			Ledger:       l,
-			Registry:     registry,
-			GitHub:       gh,
-			Orchestrator: o,
-			Scheduler:    scheduler.New(l, o, projectCfg.Orchestrator.HeartbeatInterval),
-			Session:      m.session,
-			BaseURL:      m.baseURL,
-		}
+	projects, err := buildProjects(cfg, m.session, m.baseURL)
+	if err != nil {
+		return nil, err
 	}
+	m.projects = projects
 	return m, nil
+}
+
+func buildProjects(cfg *config.Config, session, baseURL string) (map[string]*ProjectRuntime, error) {
+	projects := make(map[string]*ProjectRuntime, len(cfg.Projects))
+	for slug := range cfg.Projects {
+		project, err := buildProjectRuntime(cfg, slug, session, baseURL)
+		if err != nil {
+			return nil, err
+		}
+		projects[slug] = project
+	}
+	return projects, nil
+}
+
+func buildProjectRuntime(cfg *config.Config, slug, session, baseURL string) (*ProjectRuntime, error) {
+	projectCfg, ok := config.Project(cfg, slug)
+	if !ok {
+		return nil, fmt.Errorf("runtime: %w: %s", ErrProjectNotFound, slug)
+	}
+	archiveDir := filepath.Join(filepath.Dir(projectCfg.Project.LedgerPath), "archive")
+	if err := os.MkdirAll(filepath.Dir(projectCfg.Project.LedgerPath), 0o755); err != nil {
+		return nil, fmt.Errorf("runtime: project %s ledger dir: %w", slug, err)
+	}
+	if err := os.MkdirAll(archiveDir, 0o755); err != nil {
+		return nil, fmt.Errorf("runtime: project %s archive dir: %w", slug, err)
+	}
+	l := ledger.NewLedger(projectCfg.Project.LedgerPath, archiveDir)
+	registry := worker.NewRegistry()
+	var gh *githubpkg.Client
+	if projectCfg.GitHub.Token != "" || projectCfg.GitHub.Owner != "" || projectCfg.GitHub.Repo != "" {
+		client, err := githubpkg.NewClient(projectCfg.GitHub.Token, projectCfg.GitHub.Owner, projectCfg.GitHub.Repo)
+		if err != nil {
+			return nil, fmt.Errorf("runtime: project %s github: %w", slug, err)
+		}
+		gh = client
+	}
+	o := orchestrator.NewProject(l, projectCfg, session, baseURL, slug+"-orchestrator")
+	return &ProjectRuntime{
+		Slug:         slug,
+		Config:       projectCfg,
+		Ledger:       l,
+		Registry:     registry,
+		GitHub:       gh,
+		Orchestrator: o,
+		Scheduler:    scheduler.New(l, o, projectCfg.Orchestrator.HeartbeatInterval),
+		Session:      session,
+		BaseURL:      baseURL,
+	}, nil
 }
 
 func (m *Manager) Project(slug string) (*ProjectRuntime, error) {
@@ -114,25 +135,74 @@ func (m *Manager) Projects() []ProjectInfo {
 }
 
 func (m *Manager) Start(ctx context.Context) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ctx = ctx
+	m.started = true
 	for _, project := range m.projects {
-		go func(project *ProjectRuntime) {
-			_ = project.Scheduler.Run(ctx)
-		}(project)
+		project.start(ctx)
 	}
 }
 
 func (p *ProjectRuntime) Close() {
-	if p != nil && p.Orchestrator != nil {
+	if p == nil {
+		return
+	}
+	if p.cancel != nil {
+		p.cancel()
+		p.cancel = nil
+	}
+	if p.Orchestrator != nil {
 		p.Orchestrator.Close()
 	}
 }
 
-func (m *Manager) Close() {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+func (p *ProjectRuntime) start(ctx context.Context) {
+	if p == nil || p.Scheduler == nil || p.cancel != nil {
+		return
+	}
+	projectCtx, cancel := context.WithCancel(ctx)
+	p.cancel = cancel
+	go func() {
+		_ = p.Scheduler.Run(projectCtx)
+	}()
+}
+
+func (m *Manager) Reload(cfg *config.Config, onLedgerChange func()) error {
+	if cfg == nil {
+		return fmt.Errorf("runtime: config is nil")
+	}
+	nextCfg := config.Clone(cfg)
+	projects, err := buildProjects(nextCfg, nextCfg.Runtime.TmuxSession, m.baseURL)
+	if err != nil {
+		return err
+	}
+	for _, project := range projects {
+		if project.Ledger != nil && onLedgerChange != nil {
+			project.Ledger.SetOnChange(onLedgerChange)
+		}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	for _, project := range m.projects {
 		project.Close()
 	}
+	m.cfg = nextCfg
+	m.session = nextCfg.Runtime.TmuxSession
+	m.projects = projects
+	if m.started && m.ctx != nil {
+		for _, project := range m.projects {
+			project.start(m.ctx)
+		}
+	}
+	return nil
+}
+
+func (m *Manager) Close() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, project := range m.projects {
+		project.Close()
+	}
+	m.started = false
 }
