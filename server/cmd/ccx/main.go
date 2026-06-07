@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -56,7 +57,8 @@ func serve(args []string) error {
 		return fmt.Errorf("ensure tmux session: %w", err)
 	}
 
-	baseURL := fmt.Sprintf("http://127.0.0.1:%d", cfg.Server.Port)
+	listenAddr := net.JoinHostPort(cfg.Server.Host, fmt.Sprint(cfg.Server.Port))
+	baseURL := fmt.Sprintf("http://%s", net.JoinHostPort(baseURLHost(cfg.Server.Host), fmt.Sprint(cfg.Server.Port)))
 	manager, err := runtimepkg.NewManager(cfg, baseURL)
 	if err != nil {
 		return err
@@ -103,13 +105,13 @@ func serve(args []string) error {
 	defer manager.Close()
 
 	server := &http.Server{
-		Addr:              fmt.Sprintf(":%d", cfg.Server.Port),
+		Addr:              listenAddr,
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	errCh := make(chan error, 1)
 	go func() {
-		log.Printf("ccx serving on %s", baseURL)
+		log.Printf("ccx serving on %s (listen %s)", baseURL, listenAddr)
 		errCh <- server.ListenAndServe()
 	}()
 
@@ -134,6 +136,15 @@ func defaultConfigPath() string {
 		return filepath.Join(home, ".config", "ccx-t2", "config.yaml")
 	}
 	return "config.yaml"
+}
+
+func baseURLHost(host string) string {
+	switch strings.TrimSpace(host) {
+	case "", "0.0.0.0", "::", "[::]":
+		return "127.0.0.1"
+	default:
+		return strings.Trim(host, "[]")
+	}
 }
 
 func ensureConfig(path string) error {
@@ -173,7 +184,7 @@ func defaultConfig() (*config.Config, error) {
 		orchestratorHarness = workerHarnesses[0]
 	}
 	return &config.Config{
-		Server: config.ServerConfig{Port: 8080},
+		Server: config.ServerConfig{Host: "127.0.0.1", Port: 8080},
 		Runtime: config.RuntimeConfig{
 			TmuxSession:  "ccx-t2",
 			WorktreeBase: worktreeBase,

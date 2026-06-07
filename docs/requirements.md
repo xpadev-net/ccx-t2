@@ -295,6 +295,7 @@ Orchestrator 起動時は対象プロジェクトの設定、台帳スナップ�
 
 ```yaml
 server:
+  host: 127.0.0.1
   port: 8080
   mcp_secret: ${CCX_MCP_SECRET}
 

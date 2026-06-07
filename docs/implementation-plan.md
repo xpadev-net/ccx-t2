@@ -142,7 +142,7 @@ worktree path は `runtime.worktree_base/{project_slug}-{task_id}` を既定と�
 - 設定ファイルが存在しない場合は、projects 空・利用可能 harness 自動検出済みの既定設定を生成して保存する
 - 設定をロードし、tmux session を ensure する
 - `runtime.Manager` を生成し、各プロジェクトの ledger / registry / orchestrator / scheduler を初期化する
-- HTTP server を `server.port` で起動する
+- HTTP server を `server.host` / `server.port` で起動する
 - embed された Web UI asset を静的配信する。`--web-dir` が存在する場合だけ外部 directory を優先する
 - SIGINT / SIGTERM で HTTP server と scheduler を graceful shutdown する
 

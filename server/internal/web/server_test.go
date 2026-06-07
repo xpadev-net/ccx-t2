@@ -865,6 +865,9 @@ func TestGetConfigRedactsSecrets(t *testing.T) {
 	if cfgResp.Server.Port != 9090 {
 		t.Fatalf("server.port = %d, want 9090", cfgResp.Server.Port)
 	}
+	if cfgResp.Server.Host != "127.0.0.1" {
+		t.Fatalf("server.host = %q, want 127.0.0.1", cfgResp.Server.Host)
+	}
 	if cfgResp.GitHub.Owner != "xpadev-net" || cfgResp.GitHub.Repo != "ccx-t2" {
 		t.Fatalf("github = %#v, want owner/repo", cfgResp.GitHub)
 	}
@@ -899,7 +902,7 @@ func TestPatchConfigUpdatesAndPersistsEditableFields(t *testing.T) {
 
 	resp := performJSONRequest(server, http.MethodPatch, "/api/config", `{
 		"project": {"slug": "next", "repo_path": "/repo2"},
-		"server": {"port": 9091},
+		"server": {"host": "0.0.0.0", "port": 9091},
 		"orchestrator": {"harness": "orchestrator", "heartbeat_interval": "2m", "timeout": "45m"},
 		"worker_harnesses": ["worker"],
 		"harnesses": {"worker": {"command": "sh"}},
@@ -918,7 +921,7 @@ func TestPatchConfigUpdatesAndPersistsEditableFields(t *testing.T) {
 	if err := json.Unmarshal(resp.Body.Bytes(), &patched); err != nil {
 		t.Fatalf("decode config: %v", err)
 	}
-	if patched.Project.Slug != "next" || patched.Project.RepoPath != "/repo2" || patched.Server.Port != 9091 {
+	if patched.Project.Slug != "next" || patched.Project.RepoPath != "/repo2" || patched.Server.Host != "0.0.0.0" || patched.Server.Port != 9091 {
 		t.Fatalf("patched config = %#v, want updated project/server", patched)
 	}
 	if patched.Orchestrator.HeartbeatInterval != "2m0s" || patched.Orchestrator.Timeout != "45m0s" {
@@ -1272,6 +1275,7 @@ func testConfig() *config.Config {
 			ValidationCommand: "go test ./...",
 		},
 		Server: config.ServerConfig{
+			Host: "127.0.0.1",
 			Port: 9090,
 		},
 		Orchestrator: config.OrchestratorConfig{

@@ -91,6 +91,7 @@ Web UI はバイナリに埋め込まれたビルド済み asset を配信しま
 
 ```yaml
 server:
+  host: 127.0.0.1
   port: 8080
   mcp_secret: ${CCX_MCP_SECRET}
 
