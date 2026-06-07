@@ -262,7 +262,8 @@ func (s *Server) updateTask(w http.ResponseWriter, r *http.Request, id string) {
 		writeError(w, http.StatusBadRequest, "no task fields provided")
 		return
 	}
-	if err := s.ledger.Update(id, fields); err != nil {
+	prev, err := s.ledger.UpdateReturnPrev(id, fields)
+	if err != nil {
 		if strings.Contains(err.Error(), "task not found:") {
 			writeError(w, http.StatusNotFound, "task not found")
 			return
@@ -270,11 +271,7 @@ func (s *Server) updateTask(w http.ResponseWriter, r *http.Request, id string) {
 		writeError(w, http.StatusInternalServerError, "update task")
 		return
 	}
-	updated, err := s.loadTask(id)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "load updated task")
-		return
-	}
+	updated := taskSnapshotWithFields(prev, fields)
 	writeJSON(w, http.StatusOK, taskResponseFromLedger(updated))
 }
 
@@ -392,16 +389,20 @@ func taskFromCreateRequest(req taskMutationRequest) (ledger.Task, error) {
 	if status, ok := fields["status"].(string); ok && status != "" {
 		task.Status = status
 	}
-	applyCreateFields(&task, fields)
+	task = taskSnapshotWithFields(task, fields)
+	task.UpdatedAt = ""
 	if strings.TrimSpace(task.Title) == "" && strings.TrimSpace(task.Body) == "" {
 		return ledger.Task{}, fmt.Errorf("title or body is required")
 	}
 	return task, nil
 }
 
-func applyCreateFields(task *ledger.Task, fields map[string]any) {
+func taskSnapshotWithFields(task ledger.Task, fields map[string]any) ledger.Task {
 	if title, ok := fields["title"].(string); ok {
 		task.Title = title
+	}
+	if status, ok := fields["status"].(string); ok {
+		task.Status = status
 	}
 	if branch, ok := fields["branch"].(string); ok {
 		task.Branch = branch
@@ -430,6 +431,8 @@ func applyCreateFields(task *ledger.Task, fields map[string]any) {
 	if body, ok := fields["body"].(string); ok {
 		task.Body = body
 	}
+	task.UpdatedAt = time.Now().Format(time.RFC3339)
+	return task
 }
 
 func fieldsFromUpdateRequest(req taskMutationRequest) map[string]any {
