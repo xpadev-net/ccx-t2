@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/xpadev/ccx-t2/internal/config"
@@ -25,7 +26,9 @@ import (
 
 // Server serves the browser-facing REST API.
 type Server struct {
+	configMu       sync.RWMutex
 	cfg            *config.Config
+	configPath     string
 	ledger         *ledger.Ledger
 	registry       *worker.Registry
 	trigger        Triggerer
@@ -42,6 +45,7 @@ const deleteCleanupLease = 5 * time.Minute
 // Deps contains dependencies needed by the web API.
 type Deps struct {
 	Config         *config.Config
+	ConfigPath     string
 	Ledger         *ledger.Ledger
 	Registry       *worker.Registry
 	Trigger        Triggerer
@@ -54,18 +58,20 @@ type Deps struct {
 
 // New constructs a web API handler.
 func New(deps Deps) *Server {
+	cfg := config.Clone(deps.Config)
 	s := &Server{
-		cfg:            deps.Config,
+		cfg:            cfg,
+		configPath:     deps.ConfigPath,
 		ledger:         deps.Ledger,
 		registry:       deps.Registry,
 		trigger:        deps.Trigger,
-		cleaner:        workerCleanerFromDeps(deps),
 		secret:         deps.Secret,
 		authDisabled:   deps.AuthDisabled,
 		allowedOrigins: allowedOriginSet(deps.AllowedOrigins),
-		harnesses:      harnessResponsesFromConfig(deps.Config),
+		harnesses:      harnessResponsesFromConfig(cfg),
 		mux:            http.NewServeMux(),
 	}
+	s.cleaner = workerCleanerFromDeps(s, deps)
 	if s.secret == "" && !s.authDisabled {
 		log.Printf("web: bearer auth is not configured; set Secret or AuthDisabled=true explicitly")
 	}
@@ -83,21 +89,32 @@ type WorkerCleaner interface {
 	CleanupWorker(ctx context.Context, task ledger.Task) error
 }
 
-type defaultWorkerCleaner struct {
-	cfg      *config.Config
-	registry *worker.Registry
-	session  string
+type cleanupDependencies struct {
+	cfg     *config.Config
+	session string
 }
 
-func workerCleanerFromDeps(deps Deps) WorkerCleaner {
+type defaultWorkerCleaner struct {
+	deps     func() cleanupDependencies
+	registry *worker.Registry
+}
+
+func workerCleanerFromDeps(server *Server, deps Deps) WorkerCleaner {
 	if deps.Cleaner != nil {
 		return deps.Cleaner
 	}
-	return defaultWorkerCleaner{cfg: deps.Config, registry: deps.Registry, session: deps.Session}
+	return defaultWorkerCleaner{
+		deps: func() cleanupDependencies {
+			cfg, _ := server.configSnapshot()
+			return cleanupDependencies{cfg: cfg, session: deps.Session}
+		},
+		registry: deps.Registry,
+	}
 }
 
 func (c defaultWorkerCleaner) CleanupWorker(ctx context.Context, task ledger.Task) error {
-	if c.cfg == nil {
+	deps := c.deps()
+	if deps.cfg == nil {
 		return fmt.Errorf("config is not configured")
 	}
 	workerID := task.WorkerID
@@ -105,24 +122,24 @@ func (c defaultWorkerCleaner) CleanupWorker(ctx context.Context, task ledger.Tas
 		workerID = "worker-" + task.ID
 	}
 	var errs []error
-	if c.session == "" {
+	if deps.session == "" {
 		log.Printf("warn: web cleanup skipping tmux window for %s: session is not configured", workerID)
 	}
-	if c.session != "" {
-		if err := tmux.KillWindowContext(ctx, c.session, workerID); err != nil {
+	if deps.session != "" {
+		if err := tmux.KillWindowContext(ctx, deps.session, workerID); err != nil {
 			if !isMissingTmuxWindowError(err) {
 				errs = append(errs, fmt.Errorf("kill worker window: %w", err))
 			}
 		}
 	}
-	worktreePath := filepath.Join(c.cfg.Project.WorktreeBase, c.cfg.Project.Slug+"-"+task.ID)
-	if err := worktree.RemoveContext(ctx, c.cfg.Project.RepoPath, worktreePath); err != nil {
+	worktreePath := filepath.Join(deps.cfg.Project.WorktreeBase, deps.cfg.Project.Slug+"-"+task.ID)
+	if err := worktree.RemoveContext(ctx, deps.cfg.Project.RepoPath, worktreePath); err != nil {
 		if !isMissingWorktreeError(err) {
 			errs = append(errs, fmt.Errorf("remove worktree: %w", err))
 		}
 	}
 	if task.Branch != "" {
-		out, err := exec.CommandContext(ctx, "git", "-C", c.cfg.Project.RepoPath, "branch", "-D", task.Branch).CombinedOutput()
+		out, err := exec.CommandContext(ctx, "git", "-C", deps.cfg.Project.RepoPath, "branch", "-D", task.Branch).CombinedOutput()
 		if err != nil {
 			combinedErr := fmt.Errorf("git branch -D %s: %w: %s", task.Branch, err, strings.TrimSpace(string(out)))
 			if !isMissingBranchError(combinedErr) {
@@ -502,22 +519,89 @@ func (s *Server) handleHarnesses(w http.ResponseWriter, r *http.Request) {
 	if !requireMethod(w, r, http.MethodGet) {
 		return
 	}
-	if s.cfg == nil {
+	harnesses, ok := s.harnessSnapshot()
+	if !ok {
 		writeError(w, http.StatusInternalServerError, "config is not configured")
 		return
 	}
-	writeJSON(w, http.StatusOK, s.harnesses)
+	writeJSON(w, http.StatusOK, harnesses)
 }
 
 func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
-	if !requireMethod(w, r, http.MethodGet) {
-		return
+	switch r.Method {
+	case http.MethodGet:
+		s.getConfig(w, r)
+	case http.MethodPatch:
+		s.patchConfig(w, r)
+	default:
+		methodNotAllowed(w, http.MethodGet, http.MethodPatch)
 	}
+}
+
+func (s *Server) configSnapshot() (*config.Config, bool) {
+	s.configMu.RLock()
+	defer s.configMu.RUnlock()
 	if s.cfg == nil {
+		return nil, false
+	}
+	return config.Clone(s.cfg), true
+}
+
+func (s *Server) harnessSnapshot() ([]harnessResponse, bool) {
+	s.configMu.RLock()
+	defer s.configMu.RUnlock()
+	if s.cfg == nil {
+		return nil, false
+	}
+	return append([]harnessResponse(nil), s.harnesses...), true
+}
+
+func (s *Server) getConfig(w http.ResponseWriter, r *http.Request) {
+	cfg, ok := s.configSnapshot()
+	if !ok {
 		writeError(w, http.StatusInternalServerError, "config is not configured")
 		return
 	}
-	writeJSON(w, http.StatusOK, configResponseFromConfig(s.cfg))
+	writeJSON(w, http.StatusOK, configResponseFromConfig(cfg))
+}
+
+func (s *Server) patchConfig(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.configSnapshot(); !ok {
+		writeError(w, http.StatusInternalServerError, "config is not configured")
+		return
+	}
+	if s.configPath == "" {
+		writeError(w, http.StatusInternalServerError, "config path is not configured")
+		return
+	}
+	var req configPatchRequest
+	if err := decodeJSON(w, r, &req); err != nil {
+		writeDecodeError(w, err)
+		return
+	}
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
+	raw, err := config.LoadRaw(s.configPath)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "load config")
+		return
+	}
+	if err := applyConfigPatch(raw, req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := config.Save(s.configPath, raw); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	updated, err := config.Load(s.configPath)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "reload config")
+		return
+	}
+	s.cfg = config.Clone(updated)
+	s.harnesses = harnessResponsesFromConfig(s.cfg)
+	writeJSON(w, http.StatusOK, configResponseFromConfig(updated))
 }
 
 type taskResponse struct {
@@ -744,14 +828,33 @@ type configResponse struct {
 	GitHub          githubConfigResponse             `json:"github"`
 }
 
+type configPatchRequest struct {
+	Project         *projectConfigPatch           `json:"project"`
+	Server          *serverConfigPatch            `json:"server"`
+	Orchestrator    *orchestratorConfigPatch      `json:"orchestrator"`
+	WorkerHarnesses *[]string                     `json:"worker_harnesses"`
+	Harnesses       map[string]harnessConfigPatch `json:"harnesses"`
+	GitHub          *githubConfigPatch            `json:"github"`
+}
+
 type projectConfigResponse struct {
 	Slug         string `json:"slug"`
 	RepoPath     string `json:"repo_path"`
 	WorktreeBase string `json:"worktree_base"`
 }
 
+type projectConfigPatch struct {
+	Slug         *string `json:"slug"`
+	RepoPath     *string `json:"repo_path"`
+	WorktreeBase *string `json:"worktree_base"`
+}
+
 type serverConfigResponse struct {
 	Port int `json:"port"`
+}
+
+type serverConfigPatch struct {
+	Port *int `json:"port"`
 }
 
 type orchestratorConfigResponse struct {
@@ -760,13 +863,28 @@ type orchestratorConfigResponse struct {
 	Timeout           string `json:"timeout"`
 }
 
+type orchestratorConfigPatch struct {
+	Harness           *string `json:"harness"`
+	HeartbeatInterval *string `json:"heartbeat_interval"`
+	Timeout           *string `json:"timeout"`
+}
+
 type githubConfigResponse struct {
 	Owner string `json:"owner,omitempty"`
 	Repo  string `json:"repo,omitempty"`
 }
 
+type githubConfigPatch struct {
+	Owner *string `json:"owner"`
+	Repo  *string `json:"repo"`
+}
+
 type harnessConfigResponse struct {
 	Command string `json:"command"`
+}
+
+type harnessConfigPatch struct {
+	Command *string `json:"command"`
 }
 
 type harnessResponse struct {
@@ -836,6 +954,91 @@ func configResponseFromConfig(cfg *config.Config) configResponse {
 			Repo:  cfg.GitHub.Repo,
 		},
 	}
+}
+
+func applyConfigPatch(cfg *config.Config, req configPatchRequest) error {
+	changed := false
+	if req.Project != nil {
+		if req.Project.Slug != nil {
+			cfg.Project.Slug = strings.TrimSpace(*req.Project.Slug)
+			changed = true
+		}
+		if req.Project.RepoPath != nil {
+			cfg.Project.RepoPath = strings.TrimSpace(*req.Project.RepoPath)
+			changed = true
+		}
+		if req.Project.WorktreeBase != nil {
+			cfg.Project.WorktreeBase = strings.TrimSpace(*req.Project.WorktreeBase)
+			changed = true
+		}
+	}
+	if req.Server != nil && req.Server.Port != nil {
+		cfg.Server.Port = *req.Server.Port
+		changed = true
+	}
+	if req.Orchestrator != nil {
+		if req.Orchestrator.Harness != nil {
+			cfg.Orchestrator.Harness = strings.TrimSpace(*req.Orchestrator.Harness)
+			changed = true
+		}
+		if req.Orchestrator.HeartbeatInterval != nil {
+			d, err := time.ParseDuration(strings.TrimSpace(*req.Orchestrator.HeartbeatInterval))
+			if err != nil {
+				return fmt.Errorf("orchestrator.heartbeat_interval must be a duration")
+			}
+			cfg.Orchestrator.HeartbeatInterval = d
+			changed = true
+		}
+		if req.Orchestrator.Timeout != nil {
+			d, err := time.ParseDuration(strings.TrimSpace(*req.Orchestrator.Timeout))
+			if err != nil {
+				return fmt.Errorf("orchestrator.timeout must be a duration")
+			}
+			cfg.Orchestrator.Timeout = d
+			changed = true
+		}
+	}
+	if req.WorkerHarnesses != nil {
+		cfg.WorkerHarnesses = append([]string(nil), *req.WorkerHarnesses...)
+		for i := range cfg.WorkerHarnesses {
+			cfg.WorkerHarnesses[i] = strings.TrimSpace(cfg.WorkerHarnesses[i])
+		}
+		changed = true
+	}
+	if req.Harnesses != nil {
+		if cfg.Harnesses == nil {
+			cfg.Harnesses = make(map[string]config.HarnessConfig)
+		}
+		for name, patch := range req.Harnesses {
+			name = strings.TrimSpace(name)
+			if name == "" {
+				return fmt.Errorf("harness name cannot be empty")
+			}
+			current, ok := cfg.Harnesses[name]
+			if !ok {
+				return fmt.Errorf("harness %q does not exist", name)
+			}
+			if patch.Command != nil {
+				current.Command = strings.TrimSpace(*patch.Command)
+				cfg.Harnesses[name] = current
+				changed = true
+			}
+		}
+	}
+	if req.GitHub != nil {
+		if req.GitHub.Owner != nil {
+			cfg.GitHub.Owner = strings.TrimSpace(*req.GitHub.Owner)
+			changed = true
+		}
+		if req.GitHub.Repo != nil {
+			cfg.GitHub.Repo = strings.TrimSpace(*req.GitHub.Repo)
+			changed = true
+		}
+	}
+	if !changed {
+		return fmt.Errorf("no config fields provided")
+	}
+	return nil
 }
 
 func requireMethod(w http.ResponseWriter, r *http.Request, method string) bool {
