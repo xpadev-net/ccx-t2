@@ -788,7 +788,7 @@ func (s *Server) sendWorkerFollowup(w http.ResponseWriter, r *http.Request, work
 		return
 	}
 	workerID = strings.TrimSpace(workerID)
-	if workerID == "" || strings.Contains(workerID, "/") {
+	if workerID == "" {
 		writeError(w, http.StatusBadRequest, "worker_id is required")
 		return
 	}
