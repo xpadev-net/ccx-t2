@@ -7,8 +7,10 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -17,14 +19,20 @@ import (
 	runtimepkg "github.com/xpadev/ccx-t2/internal/runtime"
 	"github.com/xpadev/ccx-t2/internal/tmux"
 	"github.com/xpadev/ccx-t2/internal/web"
+	"github.com/xpadev/ccx-t2/internal/webui"
+	"gopkg.in/yaml.v3"
 )
 
 func main() {
-	if len(os.Args) < 2 || os.Args[1] != "serve" {
-		fmt.Fprintln(os.Stderr, "usage: ccx serve [--config path] [--web-dir path]")
+	args := os.Args[1:]
+	if len(args) > 0 && args[0] == "serve" {
+		args = args[1:]
+	}
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		fmt.Fprintln(os.Stderr, "usage: ccx [serve] [--config path] [--web-dir path]")
 		os.Exit(2)
 	}
-	if err := serve(os.Args[2:]); err != nil {
+	if err := serve(args); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -37,6 +45,9 @@ func serve(args []string) error {
 		return err
 	}
 
+	if err := ensureConfig(*configPath); err != nil {
+		return err
+	}
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		return err
@@ -78,6 +89,12 @@ func serve(args []string) error {
 	mux.Handle("/mcp/worker", workerMCP)
 	if info, err := os.Stat(*webDir); err == nil && info.IsDir() {
 		mux.Handle("/", http.FileServer(http.Dir(*webDir)))
+	} else {
+		handler, err := webui.Handler()
+		if err != nil {
+			return fmt.Errorf("embedded web ui: %w", err)
+		}
+		mux.Handle("/", handler)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -117,4 +134,113 @@ func defaultConfigPath() string {
 		return filepath.Join(home, ".config", "ccx-t2", "config.yaml")
 	}
 	return "config.yaml"
+}
+
+func ensureConfig(path string) error {
+	if _, err := os.Stat(path); err == nil {
+		return nil
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("stat config: %w", err)
+	}
+
+	cfg, err := defaultConfig()
+	if err != nil {
+		return err
+	}
+	data, err := yaml.Marshal(cfg)
+	if err != nil {
+		return fmt.Errorf("marshal default config: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("create config dir: %w", err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		return fmt.Errorf("write default config: %w", err)
+	}
+	log.Printf("created default config at %s", path)
+	return nil
+}
+
+func defaultConfig() (*config.Config, error) {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		home = "."
+	}
+	worktreeBase := filepath.Join(home, ".local", "share", "ccx-t2", "worktrees")
+	workerHarnesses, harnesses := detectHarnesses()
+	orchestratorHarness := ""
+	if len(workerHarnesses) > 0 {
+		orchestratorHarness = workerHarnesses[0]
+	}
+	return &config.Config{
+		Server: config.ServerConfig{Port: 8080},
+		Runtime: config.RuntimeConfig{
+			TmuxSession:  "ccx-t2",
+			WorktreeBase: worktreeBase,
+		},
+		Orchestrator: config.OrchestratorConfig{
+			Harness:           orchestratorHarness,
+			HeartbeatInterval: time.Minute,
+			Timeout:           30 * time.Minute,
+		},
+		WorkerHarnesses: workerHarnesses,
+		Harnesses:       harnesses,
+		Projects:        map[string]config.ProjectConfig{},
+	}, nil
+}
+
+type harnessCandidate struct {
+	name         string
+	fallbackArgs []string
+}
+
+var harnessCandidates = []harnessCandidate{
+	{name: "claude", fallbackArgs: []string{"--dangerously-skip-permissions"}},
+	{name: "codex", fallbackArgs: []string{"--yolo"}},
+	{name: "opencode", fallbackArgs: []string{"--permission-mode", "yolo"}},
+	{name: "cursor-agent", fallbackArgs: []string{"--yolo"}},
+}
+
+func detectHarnesses() ([]string, map[string]config.HarnessConfig) {
+	names := make([]string, 0, len(harnessCandidates))
+	harnesses := make(map[string]config.HarnessConfig)
+	for _, candidate := range harnessCandidates {
+		if _, err := exec.LookPath(candidate.name); err != nil {
+			continue
+		}
+		args := append(dangerousPermissionArgs(candidate), "--mcp-url", "{url}")
+		names = append(names, candidate.name)
+		harnesses[candidate.name] = config.HarnessConfig{
+			Command: candidate.name,
+			McpArgs: strings.Join(args, " "),
+		}
+	}
+	return names, harnesses
+}
+
+func dangerousPermissionArgs(candidate harnessCandidate) []string {
+	help := commandHelp(candidate.name)
+	switch {
+	case strings.Contains(help, "--dangerously-skip-permissions"):
+		return []string{"--dangerously-skip-permissions"}
+	case strings.Contains(help, "--dangerously-bypass-approvals-and-sandbox"):
+		return []string{"--dangerously-bypass-approvals-and-sandbox"}
+	case strings.Contains(help, "--allow-dangerous-permissions"):
+		return []string{"--allow-dangerous-permissions"}
+	case strings.Contains(help, "--yolo"):
+		return []string{"--yolo"}
+	case strings.Contains(help, "--permission-mode") && strings.Contains(strings.ToLower(help), "yolo"):
+		return []string{"--permission-mode", "yolo"}
+	}
+	return candidate.fallbackArgs
+}
+
+func commandHelp(command string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 750*time.Millisecond)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, command, "--help").CombinedOutput()
+	if err != nil && len(out) == 0 {
+		return ""
+	}
+	return string(out)
 }

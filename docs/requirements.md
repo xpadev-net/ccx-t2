@@ -135,7 +135,7 @@ Orchestrator ウィンドウはプロジェクトごとに1つのみ維持する
 単一コマンドでプロセス全体を起動する。
 
 ```sh
-ccx serve --config ~/.config/ccx-t2/config.yaml
+ccx
 ```
 
 `serve` は以下をまとめて起動する。
@@ -146,7 +146,15 @@ ccx serve --config ~/.config/ccx-t2/config.yaml
 - 各プロジェクトの heartbeat scheduler
 - 共通 tmux session
 
-`--config` が省略された場合は `~/.config/ccx-t2/config.yaml` を使用する。
+`ccx serve` も互換のため同じ動作をする。`--config` が省略された場合は
+`~/.config/ccx-t2/config.yaml` を使用する。設定ファイルが存在しない場合は、
+project を空のままにした設定ファイルを自動生成する。PATH 上に存在する harness CLI は
+自動検出し、検出できたものだけを `harnesses` / `worker_harnesses` に追加する。
+対応 CLI では `--yolo` や dangerous permissions 系の flag を best-effort で付与し、
+権限確認で worker が止まらないようにする。
+
+Web UI はビルド済み asset を Go バイナリに埋め込み、既定ではその asset を配信する。
+開発時に外部 `dist` を確認したい場合のみ `--web-dir` で配信ディレクトリを上書きできる。
 
 ---
 
@@ -317,15 +325,5 @@ harnesses:
     command: cursor-agent
     mcp_args: "--mcp-url {url} --mcp-secret {secret}"
 
-projects:
-  ccx-t2:
-    repo_path: /path/to/ccx-t2
-    ledger_path: /path/to/ccx-t2/tasks/ledger.md
-    validation_command: cd server && go test ./...
-    github:
-      token: ${GITHUB_TOKEN}
-      owner: xpadev-net
-      repo: ccx-t2
-    orchestrator:
-      harness: codex
+projects: {}
 ```
