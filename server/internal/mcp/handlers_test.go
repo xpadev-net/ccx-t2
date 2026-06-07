@@ -103,6 +103,9 @@ func TestBuildWorkerPromptFromTaskUsesTaskRestrictions(t *testing.T) {
 		"Reloaded body",
 		"  - server/internal/mcp\n",
 		"  - server/internal/mcp/old.go\n",
+		"Work only inside the Worktree path above",
+		"Do not rewrite history on a default branch or any branch that has an open pull request",
+		"Never force push",
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("prompt does not contain %q:\n%s", want, prompt)

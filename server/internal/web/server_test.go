@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -763,6 +764,31 @@ func TestCleanupMissingResourceErrorsAreRetrySafe(t *testing.T) {
 	}
 	if isMissingWorktreeError(errors.New("stat /bad/repo: no such file or directory")) {
 		t.Fatal("repo path error was classified as missing worktree")
+	}
+}
+
+func TestDefaultWorkerCleanerSkipsUnsafeDefaultBranchDelete(t *testing.T) {
+	repoPath := initWebTestRepo(t)
+	cfg := testConfig()
+	cfg.Project.RepoPath = repoPath
+	cfg.Project.WorktreeBase = filepath.Join(t.TempDir(), "worktrees")
+	cleaner := defaultWorkerCleaner{
+		deps: func() cleanupDependencies {
+			return cleanupDependencies{cfg: cfg}
+		},
+		registry: worker.NewRegistry(),
+	}
+
+	err := cleaner.CleanupWorker(context.Background(), ledger.Task{
+		ID:     "task-001",
+		Status: "in_progress",
+		Branch: "main",
+	})
+	if err != nil {
+		t.Fatalf("CleanupWorker: %v", err)
+	}
+	if !webTestBranchExists(t, repoPath, "main") {
+		t.Fatal("main was deleted, want preserved")
 	}
 }
 
@@ -1564,6 +1590,39 @@ func newTestLedger(t *testing.T) *ledger.Ledger {
 		t.Fatalf("write ledger: %v", err)
 	}
 	return ledger.NewLedger(ledgerPath, filepath.Join(dir, "archive"))
+}
+
+func initWebTestRepo(t *testing.T) string {
+	t.Helper()
+	repoPath := t.TempDir()
+	runWebGit(t, repoPath, "init", "-b", "main")
+	runWebGit(t, repoPath, "config", "user.email", "test@example.com")
+	runWebGit(t, repoPath, "config", "user.name", "Test User")
+	runWebGit(t, repoPath, "commit", "--allow-empty", "-m", "init")
+	return repoPath
+}
+
+func runWebGit(t *testing.T, repoPath string, args ...string) {
+	t.Helper()
+	cmdArgs := append([]string{"-C", repoPath}, args...)
+	out, err := exec.Command("git", cmdArgs...).CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v failed: %v\n%s", args, err, string(out))
+	}
+}
+
+func webTestBranchExists(t *testing.T, repoPath, branch string) bool {
+	t.Helper()
+	err := exec.Command("git", "-C", repoPath, "show-ref", "--verify", "--quiet", "refs/heads/"+branch).Run()
+	if err == nil {
+		return true
+	}
+	exitErr, ok := err.(*exec.ExitError)
+	if ok && exitErr.ExitCode() == 1 {
+		return false
+	}
+	t.Fatalf("check branch %s: %v", branch, err)
+	return false
 }
 
 func testConfig() *config.Config {

@@ -501,7 +501,7 @@ func cleanupArchivedTaskResources(deps *Deps, taskID, branch string) {
 		deps.Config.Project.Slug+"-"+taskID)
 	_ = worktree.Remove(deps.Config.Project.RepoPath, wPath)
 	if branch != "" {
-		_ = exec.Command("git", "-C", deps.Config.Project.RepoPath, "branch", "-D", branch).Run()
+		_ = worktree.DeleteTaskBranchIfSafe(deps.Config.Project.RepoPath, branch, taskID)
 	}
 }
 
@@ -624,7 +624,7 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 		// Step 2: Create tmux window.
 		if err := tmux.CreateWindow(toolDeps.Session, workerID, worktreePath); err != nil {
 			_ = worktree.Remove(repoPath, worktreePath)
-			_ = exec.Command("git", "-C", repoPath, "branch", "-D", branch).Run()
+			_ = worktree.DeleteTaskBranchIfSafe(repoPath, branch, taskID)
 			return nil, fmt.Errorf("create tmux window: %w", err)
 		}
 
@@ -642,7 +642,7 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 		if updateErr != nil {
 			_ = tmux.KillWindow(toolDeps.Session, workerID)
 			_ = worktree.Remove(repoPath, worktreePath)
-			_ = exec.Command("git", "-C", repoPath, "branch", "-D", branch).Run()
+			_ = worktree.DeleteTaskBranchIfSafe(repoPath, branch, taskID)
 			return nil, fmt.Errorf("update ledger: %w", updateErr)
 		}
 		promptTask, err := loadTaskByID(toolDeps.Ledger, taskID)
@@ -1054,8 +1054,7 @@ func handleNotify(deps *Deps) ToolHandler {
 				filepath.Join(toolDeps.Config.Project.WorktreeBase,
 					toolDeps.Config.Project.Slug+"-"+taskID))
 			if prevTask.Branch != "" {
-				_ = exec.Command("git", "-C", toolDeps.Config.Project.RepoPath,
-					"branch", "-D", prevTask.Branch).Run()
+				_ = worktree.DeleteTaskBranchIfSafe(toolDeps.Config.Project.RepoPath, prevTask.Branch, taskID)
 			}
 			toolDeps.Registry.Remove(wid)
 
@@ -1122,7 +1121,7 @@ func workerIDFor(deps *Deps, taskID string) string {
 }
 
 // stopWorkerCleanup is best-effort cleanup: it kills the tmux window,
-// removes the worktree, deletes the git branch, and evicts the registry entry.
+// removes the worktree, deletes the git branch when safe, and evicts the registry entry.
 // All errors are silently ignored; callers must not rely on this returning nil.
 func stopWorkerCleanup(deps *Deps, workerID, branch, taskID string) {
 	if workerID != "" {
@@ -1134,8 +1133,7 @@ func stopWorkerCleanup(deps *Deps, workerID, branch, taskID string) {
 		_ = worktree.Remove(deps.Config.Project.RepoPath, wPath)
 	}
 	if branch != "" {
-		_ = exec.Command("git", "-C", deps.Config.Project.RepoPath,
-			"branch", "-D", branch).Run()
+		_ = worktree.DeleteTaskBranchIfSafe(deps.Config.Project.RepoPath, branch, taskID)
 	}
 	if workerID != "" {
 		deps.Registry.Remove(workerID)
@@ -1202,7 +1200,7 @@ func loadTaskByID(l *ledger.Ledger, taskID string) (*ledger.Task, error) {
 func rollbackSpawnAfterLedgerUpdate(deps *Deps, workerID, branch, taskID, repoPath, worktreePath string) {
 	_ = tmux.KillWindow(deps.Session, workerID)
 	_ = worktree.Remove(repoPath, worktreePath)
-	_ = exec.Command("git", "-C", repoPath, "branch", "-D", branch).Run()
+	_ = worktree.DeleteTaskBranchIfSafe(repoPath, branch, taskID)
 	// Reset lifecycle fields only — do not restore allowed/forbidden_files
 	// to avoid overwriting concurrent update_task edits. Use UpdateIfStatuses
 	// so a concurrent split_task that already committed (moving the parent to
@@ -1298,6 +1296,10 @@ func buildWorkerPromptWithDeps(deps *Deps, task *ledger.Task, taskID, workerID, 
 Instructions:
 - Only edit files within the allowed_files paths (directory-boundary prefix match).
 - Do not edit any forbidden_files.
+- Work only inside the Worktree path above; do not directly edit the parent repository checkout.
+- Stop and report a blocker if the current checkout is not the Worktree path or Branch above.
+- Do not rewrite history on a default branch or any branch that has an open pull request.
+- Never force push. If an open-PR branch is behind its base, merge the base branch normally.
 - Implement the task, validate, self-review, create a PR, and merge it.
 - Always include your worker_id in notify payloads for ownership verification.
 - Always include project_slug in notify payloads when it is present above.
