@@ -135,7 +135,7 @@ Orchestrator ウィンドウはプロジェクトごとに1つのみ維持する
 単一コマンドでプロセス全体を起動する。
 
 ```sh
-ccx serve --config ~/.config/ccx-t2/config.yaml
+ccx
 ```
 
 `serve` は以下をまとめて起動する。
@@ -146,7 +146,12 @@ ccx serve --config ~/.config/ccx-t2/config.yaml
 - 各プロジェクトの heartbeat scheduler
 - 共通 tmux session
 
-`--config` が省略された場合は `~/.config/ccx-t2/config.yaml` を使用する。
+`ccx serve` も互換のため同じ動作をする。`--config` が省略された場合は
+`~/.config/ccx-t2/config.yaml` を使用する。設定ファイルが存在しない場合は、
+起動したカレントディレクトリを最初の project として登録した設定ファイルを自動生成する。
+
+Web UI はビルド済み asset を Go バイナリに埋め込み、既定ではその asset を配信する。
+開発時に外部 `dist` を確認したい場合のみ `--web-dir` で配信ディレクトリを上書きできる。
 
 ---
 

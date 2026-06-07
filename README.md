@@ -73,8 +73,13 @@ Vite dev server は `127.0.0.1:5173` で起動し、`/api` と `/ws` を
 
 ```sh
 cd server
-go run ./cmd/ccx serve --config ~/.config/ccx-t2/config.yaml --web-dir ../web/dist
+go run ./cmd/ccx
 ```
+
+既定では `~/.config/ccx-t2/config.yaml` を読みます。存在しない場合は、起動した
+カレントディレクトリを最初の project として登録した config を自動生成します。
+Web UI はバイナリに埋め込まれたビルド済み asset を配信します。開発時に外部の
+`dist` を使いたい場合のみ `--web-dir` を指定できます。
 
 ## 設定
 

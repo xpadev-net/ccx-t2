@@ -9,6 +9,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
+	"strings"
 	"syscall"
 	"time"
 
@@ -17,14 +19,20 @@ import (
 	runtimepkg "github.com/xpadev/ccx-t2/internal/runtime"
 	"github.com/xpadev/ccx-t2/internal/tmux"
 	"github.com/xpadev/ccx-t2/internal/web"
+	"github.com/xpadev/ccx-t2/internal/webui"
+	"gopkg.in/yaml.v3"
 )
 
 func main() {
-	if len(os.Args) < 2 || os.Args[1] != "serve" {
-		fmt.Fprintln(os.Stderr, "usage: ccx serve [--config path] [--web-dir path]")
+	args := os.Args[1:]
+	if len(args) > 0 && args[0] == "serve" {
+		args = args[1:]
+	}
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		fmt.Fprintln(os.Stderr, "usage: ccx [serve] [--config path] [--web-dir path]")
 		os.Exit(2)
 	}
-	if err := serve(os.Args[2:]); err != nil {
+	if err := serve(args); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -37,6 +45,9 @@ func serve(args []string) error {
 		return err
 	}
 
+	if err := ensureConfig(*configPath); err != nil {
+		return err
+	}
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		return err
@@ -78,6 +89,12 @@ func serve(args []string) error {
 	mux.Handle("/mcp/worker", workerMCP)
 	if info, err := os.Stat(*webDir); err == nil && info.IsDir() {
 		mux.Handle("/", http.FileServer(http.Dir(*webDir)))
+	} else {
+		handler, err := webui.Handler()
+		if err != nil {
+			return fmt.Errorf("embedded web ui: %w", err)
+		}
+		mux.Handle("/", handler)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -117,4 +134,84 @@ func defaultConfigPath() string {
 		return filepath.Join(home, ".config", "ccx-t2", "config.yaml")
 	}
 	return "config.yaml"
+}
+
+func ensureConfig(path string) error {
+	if _, err := os.Stat(path); err == nil {
+		return nil
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("stat config: %w", err)
+	}
+
+	cfg, err := defaultConfig()
+	if err != nil {
+		return err
+	}
+	data, err := yaml.Marshal(cfg)
+	if err != nil {
+		return fmt.Errorf("marshal default config: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("create config dir: %w", err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		return fmt.Errorf("write default config: %w", err)
+	}
+	log.Printf("created default config at %s", path)
+	return nil
+}
+
+func defaultConfig() (*config.Config, error) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return nil, fmt.Errorf("get cwd: %w", err)
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		home = cwd
+	}
+	slug := sanitizeSlug(filepath.Base(cwd))
+	worktreeBase := filepath.Join(home, ".local", "share", "ccx-t2", "worktrees")
+	project := config.ProjectConfig{
+		Slug:              slug,
+		RepoPath:          cwd,
+		WorktreeBase:      worktreeBase,
+		LedgerPath:        filepath.Join(cwd, "tasks", "ledger.md"),
+		ValidationCommand: "go test ./...",
+		Orchestrator: config.OrchestratorConfig{
+			Harness:           "sh",
+			HeartbeatInterval: time.Minute,
+			Timeout:           30 * time.Minute,
+		},
+	}
+	return &config.Config{
+		Server: config.ServerConfig{Port: 8080},
+		Runtime: config.RuntimeConfig{
+			TmuxSession:  "ccx-t2",
+			WorktreeBase: worktreeBase,
+		},
+		Orchestrator: config.OrchestratorConfig{
+			Harness:           "sh",
+			HeartbeatInterval: time.Minute,
+			Timeout:           30 * time.Minute,
+		},
+		WorkerHarnesses: []string{"sh"},
+		Harnesses: map[string]config.HarnessConfig{
+			"sh": {
+				Command: "sh",
+				McpArgs: "--mcp-url {url}",
+			},
+		},
+		Projects: map[string]config.ProjectConfig{slug: project},
+	}, nil
+}
+
+var reSlugChar = regexp.MustCompile(`[^a-zA-Z0-9_-]+`)
+
+func sanitizeSlug(s string) string {
+	s = strings.Trim(reSlugChar.ReplaceAllString(s, "-"), "-_")
+	if s == "" {
+		return "project"
+	}
+	return strings.ToLower(s)
 }
