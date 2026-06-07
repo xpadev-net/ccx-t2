@@ -19,6 +19,7 @@ import (
 )
 
 const fakeHarnessWait = 30 * time.Second
+const fakeSplitHarnessChildren = 2
 
 func TestWorkerHarnessesCompleteThroughMCPIntegration(t *testing.T) {
 	if _, err := exec.LookPath("tmux"); err != nil {
@@ -456,7 +457,7 @@ func waitForSplitTask(t *testing.T, l *ledger.Ledger, taskID, session, workerID 
 				break
 			}
 		}
-		if parentIndex >= 0 && tasks[parentIndex].Status == "split" && len(tasks) == 3 {
+		if parentIndex >= 0 && tasks[parentIndex].Status == "split" && len(tasks) == 1+fakeSplitHarnessChildren {
 			parent := tasks[parentIndex]
 			if parent.WorkerID != "" || parent.Branch != "" || parent.Harness != "" {
 				t.Fatalf("split parent retained runtime fields: %#v", parent)
