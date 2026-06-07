@@ -811,6 +811,167 @@ func TestGetConfigRedactsSecrets(t *testing.T) {
 	}
 }
 
+func TestPatchConfigUpdatesAndPersistsEditableFields(t *testing.T) {
+	t.Setenv("CCX_TEST_SECRET", "secret-value")
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	cfg := testConfig()
+	cfg.Server.McpSecret = "${CCX_TEST_SECRET}"
+	cfg.Project.ValidationCommand = "GITHUB_TOKEN=${GITHUB_TOKEN} go test ./..."
+	cfg.Harnesses["worker"] = config.HarnessConfig{
+		Command: "sh",
+		McpArgs: "--mcp-url {url} --token {secret}",
+	}
+	cfg.Harnesses["orchestrator"] = config.HarnessConfig{
+		Command: "sh",
+		McpArgs: "--mcp-url {url} --token {secret}",
+	}
+	if err := config.Save(configPath, cfg); err != nil {
+		t.Fatalf("Save config: %v", err)
+	}
+	loaded, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("Load config: %v", err)
+	}
+	server := New(Deps{Config: loaded, ConfigPath: configPath, AuthDisabled: true})
+
+	resp := performJSONRequest(server, http.MethodPatch, "/api/config", `{
+		"project": {"slug": "next", "repo_path": "/repo2"},
+		"server": {"port": 9091},
+		"orchestrator": {"harness": "orchestrator", "heartbeat_interval": "2m", "timeout": "45m"},
+		"worker_harnesses": ["worker"],
+		"harnesses": {"worker": {"command": "sh"}},
+		"github": {"owner": "org", "repo": "repo"}
+	}`)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	body := resp.Body.String()
+	for _, secret := range []string{"CCX_TEST_SECRET", "GITHUB_TOKEN", "mcp_secret", "mcp_args", "validation_command"} {
+		if strings.Contains(body, secret) {
+			t.Fatalf("config response leaked %q in %s", secret, body)
+		}
+	}
+	var patched configResponse
+	if err := json.Unmarshal(resp.Body.Bytes(), &patched); err != nil {
+		t.Fatalf("decode config: %v", err)
+	}
+	if patched.Project.Slug != "next" || patched.Project.RepoPath != "/repo2" || patched.Server.Port != 9091 {
+		t.Fatalf("patched config = %#v, want updated project/server", patched)
+	}
+	if patched.Orchestrator.HeartbeatInterval != "2m0s" || patched.Orchestrator.Timeout != "45m0s" {
+		t.Fatalf("patched orchestrator = %#v, want updated durations", patched.Orchestrator)
+	}
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("ReadFile config: %v", err)
+	}
+	for _, want := range []string{"mcp_secret: ${CCX_TEST_SECRET}", "validation_command: GITHUB_TOKEN=${GITHUB_TOKEN} go test ./...", "mcp_args: --mcp-url {url} --token {secret}"} {
+		if !strings.Contains(string(raw), want) {
+			t.Fatalf("saved config missing %q in:\n%s", want, raw)
+		}
+	}
+}
+
+func TestPatchConfigRejectsInvalidDuration(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	cfg := testConfig()
+	if err := config.Save(configPath, cfg); err != nil {
+		t.Fatalf("Save config: %v", err)
+	}
+
+	resp := performJSONRequest(New(Deps{Config: cfg, ConfigPath: configPath, AuthDisabled: true}), http.MethodPatch, "/api/config", `{
+		"orchestrator": {"heartbeat_interval": "soon"}
+	}`)
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusBadRequest, resp.Body.String())
+	}
+}
+
+func TestPatchConfigRequiresConfigPath(t *testing.T) {
+	resp := performJSONRequest(New(Deps{Config: testConfig(), AuthDisabled: true}), http.MethodPatch, "/api/config", `{
+		"server": {"port": 9091}
+	}`)
+	if resp.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusInternalServerError, resp.Body.String())
+	}
+}
+
+func TestPatchConfigConcurrentRequestsPreserveUpdates(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	cfg := testConfig()
+	if err := config.Save(configPath, cfg); err != nil {
+		t.Fatalf("Save config: %v", err)
+	}
+	loaded, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("Load config: %v", err)
+	}
+	server := New(Deps{Config: loaded, ConfigPath: configPath, AuthDisabled: true})
+
+	errs := make(chan error, 3)
+	go func() {
+		resp := performJSONRequest(server, http.MethodPatch, "/api/config", `{"project":{"slug":"concurrent"}}`)
+		if resp.Code != http.StatusOK {
+			errs <- fmt.Errorf("project patch status = %d body=%s", resp.Code, resp.Body.String())
+			return
+		}
+		errs <- nil
+	}()
+	go func() {
+		resp := performJSONRequest(server, http.MethodPatch, "/api/config", `{"github":{"owner":"org2"}}`)
+		if resp.Code != http.StatusOK {
+			errs <- fmt.Errorf("github patch status = %d body=%s", resp.Code, resp.Body.String())
+			return
+		}
+		errs <- nil
+	}()
+	go func() {
+		resp := performRequest(server, http.MethodGet, "/api/config")
+		if resp.Code != http.StatusOK {
+			errs <- fmt.Errorf("get config status = %d body=%s", resp.Code, resp.Body.String())
+			return
+		}
+		errs <- nil
+	}()
+	for range 3 {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	reloaded, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("Load final config: %v", err)
+	}
+	if reloaded.Project.Slug != "concurrent" || reloaded.GitHub.Owner != "org2" {
+		t.Fatalf("final config = %#v, want both concurrent updates preserved", reloaded)
+	}
+}
+
+func TestPatchConfigDoesNotMutateCallerConfigPointer(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	cfg := testConfig()
+	if err := config.Save(configPath, cfg); err != nil {
+		t.Fatalf("Save config: %v", err)
+	}
+	loaded, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("Load config: %v", err)
+	}
+	server := New(Deps{Config: loaded, ConfigPath: configPath, AuthDisabled: true})
+
+	resp := performJSONRequest(server, http.MethodPatch, "/api/config", `{"project":{"slug":"owned"}}`)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	if loaded.Project.Slug != "ccx-t2" {
+		t.Fatalf("caller config slug = %q, want original ccx-t2", loaded.Project.Slug)
+	}
+}
+
 func TestMethodNotAllowed(t *testing.T) {
 	resp := performRequest(New(Deps{AuthDisabled: true}), http.MethodPut, "/api/tasks")
 	if resp.Code != http.StatusMethodNotAllowed {

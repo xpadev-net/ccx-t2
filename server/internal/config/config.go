@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -59,24 +60,88 @@ type Config struct {
 
 // Load reads and validates the config from the given file path.
 func Load(path string) (*Config, error) {
+	cfg, err := LoadRaw(path)
+	if err != nil {
+		return nil, err
+	}
+	if err := Prepare(cfg); err != nil {
+		return nil, err
+	}
+	return cfg, nil
+}
+
+// LoadRaw reads the config without expanding environment variables or applying
+// defaults. It is intended for edit flows that must preserve placeholders.
+func LoadRaw(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
-
 	var cfg Config
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
-
-	expandEnv(&cfg)
-	applyDefaults(&cfg)
-
-	if err := validate(&cfg); err != nil {
-		return nil, err
-	}
-
 	return &cfg, nil
+}
+
+// Save validates cfg through the normal load pipeline, then writes it atomically.
+func Save(path string, cfg *Config) error {
+	if cfg == nil {
+		return fmt.Errorf("config: nil config")
+	}
+	check := Clone(cfg)
+	if err := Prepare(check); err != nil {
+		return err
+	}
+	data, err := yaml.Marshal(cfg)
+	if err != nil {
+		return fmt.Errorf("marshal config: %w", err)
+	}
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".config-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create temp config: %w", err)
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return fmt.Errorf("write temp config: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return fmt.Errorf("close temp config: %w", err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		os.Remove(tmpName)
+		return fmt.Errorf("replace config: %w", err)
+	}
+	return nil
+}
+
+// Prepare applies runtime normalization and validation in place.
+func Prepare(cfg *Config) error {
+	expandEnv(cfg)
+	applyDefaults(cfg)
+
+	if err := validate(cfg); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Clone returns a deep enough copy for independent mutation of slices and maps.
+func Clone(cfg *Config) *Config {
+	if cfg == nil {
+		return nil
+	}
+	out := *cfg
+	out.WorkerHarnesses = append([]string(nil), cfg.WorkerHarnesses...)
+	out.Harnesses = make(map[string]HarnessConfig, len(cfg.Harnesses))
+	for name, h := range cfg.Harnesses {
+		out.Harnesses[name] = h
+	}
+	return &out
 }
 
 // reEnvVar matches ${VAR} placeholders only (not bare $VAR).
