@@ -76,8 +76,9 @@ cd server
 go run ./cmd/ccx
 ```
 
-既定では `~/.config/ccx-t2/config.yaml` を読みます。存在しない場合は、起動した
-カレントディレクトリを最初の project として登録した config を自動生成します。
+既定では `~/.config/ccx-t2/config.yaml` を読みます。存在しない場合は、project を空のままにした
+config を自動生成します。利用可能な harness CLI は PATH から検出し、検出できたものだけを
+登録します。対応 CLI では `--yolo` や dangerous permissions 系の flag を best-effort で付与します。
 Web UI はバイナリに埋め込まれたビルド済み asset を配信します。開発時に外部の
 `dist` を使いたい場合のみ `--web-dir` を指定できます。
 
@@ -114,15 +115,10 @@ harnesses:
     command: codex
     mcp_args: "--mcp-url {url} --mcp-secret {secret}"
 
-projects:
-  my-project:
-    repo_path: /path/to/repo
-    validation_command: go test ./...
-    github:
-      token: ${GITHUB_TOKEN}
-      owner: org
-      repo: repo-name
+projects: {}
 ```
+
+project は Web UI の Settings から追加できます。
 
 ## API
 

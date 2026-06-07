@@ -308,16 +308,10 @@ func validate(cfg *Config) error {
 		return fmt.Errorf("config: orchestrator.timeout must be positive")
 	}
 
-	if len(cfg.WorkerHarnesses) == 0 {
-		return fmt.Errorf("config: worker_harnesses must have at least one entry")
-	}
-	if len(cfg.Projects) == 0 {
-		return fmt.Errorf("config: projects must have at least one entry")
-	}
-
-	// Validate orchestrator harness.
-	if err := validateHarness(cfg, cfg.Orchestrator.Harness, true); err != nil {
-		return fmt.Errorf("config: orchestrator harness %q: %w", cfg.Orchestrator.Harness, err)
+	if cfg.Orchestrator.Harness != "" {
+		if err := validateHarness(cfg, cfg.Orchestrator.Harness, true); err != nil {
+			return fmt.Errorf("config: orchestrator harness %q: %w", cfg.Orchestrator.Harness, err)
+		}
 	}
 
 	// Validate worker harnesses (binary check deferred to spawn time).
@@ -334,7 +328,6 @@ func validate(cfg *Config) error {
 			{"projects." + slug + ".repo_path", project.RepoPath},
 			{"projects." + slug + ".worktree_base", project.WorktreeBase},
 			{"projects." + slug + ".ledger_path", project.LedgerPath},
-			{"projects." + slug + ".orchestrator.harness", project.Orchestrator.Harness},
 		} {
 			if strings.TrimSpace(f.val) == "" {
 				return fmt.Errorf("config: required field %q is empty", f.name)
@@ -346,8 +339,10 @@ func validate(cfg *Config) error {
 		if project.Orchestrator.Timeout <= 0 {
 			return fmt.Errorf("config: projects.%s.orchestrator.timeout must be positive", slug)
 		}
-		if err := validateHarness(cfg, project.Orchestrator.Harness, true); err != nil {
-			return fmt.Errorf("config: project %q orchestrator harness %q: %w", slug, project.Orchestrator.Harness, err)
+		if project.Orchestrator.Harness != "" {
+			if err := validateHarness(cfg, project.Orchestrator.Harness, true); err != nil {
+				return fmt.Errorf("config: project %q orchestrator harness %q: %w", slug, project.Orchestrator.Harness, err)
+			}
 		}
 	}
 

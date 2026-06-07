@@ -7,9 +7,9 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"syscall"
 	"time"
@@ -162,27 +162,15 @@ func ensureConfig(path string) error {
 }
 
 func defaultConfig() (*config.Config, error) {
-	cwd, err := os.Getwd()
-	if err != nil {
-		return nil, fmt.Errorf("get cwd: %w", err)
-	}
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
-		home = cwd
+		home = "."
 	}
-	slug := sanitizeSlug(filepath.Base(cwd))
 	worktreeBase := filepath.Join(home, ".local", "share", "ccx-t2", "worktrees")
-	project := config.ProjectConfig{
-		Slug:              slug,
-		RepoPath:          cwd,
-		WorktreeBase:      worktreeBase,
-		LedgerPath:        filepath.Join(cwd, "tasks", "ledger.md"),
-		ValidationCommand: "go test ./...",
-		Orchestrator: config.OrchestratorConfig{
-			Harness:           "sh",
-			HeartbeatInterval: time.Minute,
-			Timeout:           30 * time.Minute,
-		},
+	workerHarnesses, harnesses := detectHarnesses()
+	orchestratorHarness := ""
+	if len(workerHarnesses) > 0 {
+		orchestratorHarness = workerHarnesses[0]
 	}
 	return &config.Config{
 		Server: config.ServerConfig{Port: 8080},
@@ -191,27 +179,68 @@ func defaultConfig() (*config.Config, error) {
 			WorktreeBase: worktreeBase,
 		},
 		Orchestrator: config.OrchestratorConfig{
-			Harness:           "sh",
+			Harness:           orchestratorHarness,
 			HeartbeatInterval: time.Minute,
 			Timeout:           30 * time.Minute,
 		},
-		WorkerHarnesses: []string{"sh"},
-		Harnesses: map[string]config.HarnessConfig{
-			"sh": {
-				Command: "sh",
-				McpArgs: "--mcp-url {url}",
-			},
-		},
-		Projects: map[string]config.ProjectConfig{slug: project},
+		WorkerHarnesses: workerHarnesses,
+		Harnesses:       harnesses,
+		Projects:        map[string]config.ProjectConfig{},
 	}, nil
 }
 
-var reSlugChar = regexp.MustCompile(`[^a-zA-Z0-9_-]+`)
+type harnessCandidate struct {
+	name         string
+	fallbackArgs []string
+}
 
-func sanitizeSlug(s string) string {
-	s = strings.Trim(reSlugChar.ReplaceAllString(s, "-"), "-_")
-	if s == "" {
-		return "project"
+var harnessCandidates = []harnessCandidate{
+	{name: "claude", fallbackArgs: []string{"--dangerously-skip-permissions"}},
+	{name: "codex", fallbackArgs: []string{"--yolo"}},
+	{name: "opencode", fallbackArgs: []string{"--permission-mode", "yolo"}},
+	{name: "cursor-agent", fallbackArgs: []string{"--yolo"}},
+}
+
+func detectHarnesses() ([]string, map[string]config.HarnessConfig) {
+	names := make([]string, 0, len(harnessCandidates))
+	harnesses := make(map[string]config.HarnessConfig)
+	for _, candidate := range harnessCandidates {
+		if _, err := exec.LookPath(candidate.name); err != nil {
+			continue
+		}
+		args := append(dangerousPermissionArgs(candidate), "--mcp-url", "{url}")
+		names = append(names, candidate.name)
+		harnesses[candidate.name] = config.HarnessConfig{
+			Command: candidate.name,
+			McpArgs: strings.Join(args, " "),
+		}
 	}
-	return strings.ToLower(s)
+	return names, harnesses
+}
+
+func dangerousPermissionArgs(candidate harnessCandidate) []string {
+	help := commandHelp(candidate.name)
+	switch {
+	case strings.Contains(help, "--dangerously-skip-permissions"):
+		return []string{"--dangerously-skip-permissions"}
+	case strings.Contains(help, "--dangerously-bypass-approvals-and-sandbox"):
+		return []string{"--dangerously-bypass-approvals-and-sandbox"}
+	case strings.Contains(help, "--allow-dangerous-permissions"):
+		return []string{"--allow-dangerous-permissions"}
+	case strings.Contains(help, "--yolo"):
+		return []string{"--yolo"}
+	case strings.Contains(help, "--permission-mode") && strings.Contains(strings.ToLower(help), "yolo"):
+		return []string{"--permission-mode", "yolo"}
+	}
+	return candidate.fallbackArgs
+}
+
+func commandHelp(command string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 750*time.Millisecond)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, command, "--help").CombinedOutput()
+	if err != nil && len(out) == 0 {
+		return ""
+	}
+	return string(out)
 }

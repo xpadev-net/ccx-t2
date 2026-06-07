@@ -78,6 +78,19 @@ button:disabled {
   min-width: 180px;
 }
 
+.project-add {
+  display: grid;
+  grid-template-columns: minmax(120px, 180px) minmax(240px, 1fr) auto;
+  gap: 12px;
+  align-items: end;
+  margin-top: 12px;
+}
+
+.project-list {
+  display: grid;
+  gap: 8px;
+}
+
 .topbar h1,
 .section-heading h2 {
   margin: 0;

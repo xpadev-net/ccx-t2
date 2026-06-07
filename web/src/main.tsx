@@ -116,6 +116,8 @@ function App() {
   const [workerLog, setWorkerLog] = useState<string[]>([]);
   const [projects, setProjects] = useState<ProjectInfo[]>([]);
   const [selectedProjectSlug, setSelectedProjectSlug] = useState("");
+  const [newProjectSlug, setNewProjectSlug] = useState("");
+  const [newProjectRepoPath, setNewProjectRepoPath] = useState("");
   const [config, setConfig] = useState<ConfigResponse | null>(null);
   const [configDraft, setConfigDraft] = useState<ConfigDraft>(() => emptyConfigDraft());
   const [settingsDirty, setSettingsDirty] = useState(false);
@@ -245,6 +247,12 @@ function App() {
   }, [selectedTask?.id, selectedTask?.title, selectedTask?.body, selectedTask?.status]);
 
   async function refreshTasks(showLoading = true, authToken = token) {
+    if (!selectedProjectSlug) {
+      setTasks([]);
+      setSelectedID("");
+      setLoading(false);
+      return;
+    }
     if (showLoading) {
       setLoading(true);
     }
@@ -261,6 +269,11 @@ function App() {
   }
 
   async function refreshWorkers(authToken = token) {
+    if (!selectedProjectSlug) {
+      setWorkers([]);
+      setSelectedWorkerID("");
+      return;
+    }
     try {
       const data = await api<WorkerInfo[]>(workersPath(selectedProjectSlug), {}, authToken);
       setWorkers(data);
@@ -413,6 +426,44 @@ function App() {
       setSettingsDirty(false);
       setHarnesses(harnessData);
       setMessage("Settings updated.");
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function addProject() {
+    const slug = newProjectSlug.trim();
+    const repoPath = newProjectRepoPath.trim();
+    if (!slug || !repoPath) {
+      setError("Project slug and repository path are required.");
+      return;
+    }
+    setSaving(true);
+    setError("");
+    setMessage("");
+    try {
+      await api<ConfigResponse>(
+        "/api/config",
+        {
+          method: "PATCH",
+          body: JSON.stringify({
+            projects: {
+              [slug]: {
+                repo_path: repoPath,
+                worktree_base: config?.runtime?.worktree_base || config?.project.worktree_base || ""
+              }
+            }
+          })
+        },
+        token
+      );
+      setNewProjectSlug("");
+      setNewProjectRepoPath("");
+      setSelectedProjectSlug(slug);
+      await refreshSettings(token, true);
+      setMessage("Project added.");
     } catch (err) {
       setError(errorMessage(err));
     } finally {
@@ -721,6 +772,39 @@ function App() {
                 </div>
               ))}
               {!settingsLoading && harnesses.length === 0 && <div className="empty">No worker harnesses configured.</div>}
+            </div>
+
+            <div className="wide project-editor">
+              <div className="subheading">
+                <h3>Projects</h3>
+                <span>{projects.length} configured</span>
+              </div>
+              <div className="project-list">
+                {projects.map((project) => (
+                  <div className="availability-row" key={project.slug}>
+                    <span>{project.slug}</span>
+                    <span>{project.repo_path}</span>
+                  </div>
+                ))}
+                {projects.length === 0 && <div className="empty">No projects configured.</div>}
+              </div>
+              <div className="project-add">
+                <label>
+                  Slug
+                  <input value={newProjectSlug} onChange={(event) => setNewProjectSlug(event.target.value)} />
+                </label>
+                <label>
+                  Repository path
+                  <input value={newProjectRepoPath} onChange={(event) => setNewProjectRepoPath(event.target.value)} />
+                </label>
+                <button
+                  type="button"
+                  onClick={() => void addProject()}
+                  disabled={saving || !newProjectSlug.trim() || !newProjectRepoPath.trim()}
+                >
+                  Add Project
+                </button>
+              </div>
             </div>
 
             <div className="actions wide">

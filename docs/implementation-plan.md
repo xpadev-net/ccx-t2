@@ -56,7 +56,9 @@ ccx-t2/
 
 - 起動は `ccx` の単一コマンドに集約する。`ccx serve` も互換 alias として受け付ける
 - `--config` 省略時は `~/.config/ccx-t2/config.yaml` を読む
-- 設定ファイルが存在しない場合は、カレントディレクトリを最初の project とする設定ファイルを自動生成する
+- 設定ファイルが存在しない場合は、projects を空にした設定ファイルを自動生成する
+- 初回生成時は PATH 上の対応 harness CLI を検出し、存在するものだけを `harnesses` / `worker_harnesses` に追加する
+- 検出した harness の起動引数には、`--yolo` や dangerous permissions 系の flag を best-effort で含める
 - Web UI のビルド済み asset は Go バイナリに embed し、`--web-dir` は開発用 override とする
 - 設定ファイルはグローバルに1つだけ持ち、`projects` 配下に複数プロジェクトを登録する
 - Go プロセスは REST API / WebSocket / MCP / Web UI 静的配信 / heartbeat scheduler をまとめて起動する
@@ -137,7 +139,7 @@ worktree path は `runtime.worktree_base/{project_slug}-{task_id}` を既定と�
 **`server/cmd/ccx/main.go`**
 - `ccx [serve] --config <path>` を実装する
 - `--config` 省略時は `~/.config/ccx-t2/config.yaml`
-- 設定ファイルが存在しない場合は既定設定を生成して保存する
+- 設定ファイルが存在しない場合は、projects 空・利用可能 harness 自動検出済みの既定設定を生成して保存する
 - 設定をロードし、tmux session を ensure する
 - `runtime.Manager` を生成し、各プロジェクトの ledger / registry / orchestrator / scheduler を初期化する
 - HTTP server を `server.port` で起動する
