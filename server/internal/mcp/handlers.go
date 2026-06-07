@@ -466,7 +466,7 @@ func handleArchiveTask(deps *Deps) ToolHandler {
 				return nil, err
 			}
 			if archived {
-				cleanupArchivedTaskResources(ctx, toolDeps, id, archivedTask.Branch)
+				cleanupArchivedTaskResources(toolDeps, id, archivedTask.Branch)
 				return map[string]any{"archived": id}, nil
 			}
 			return nil, fmt.Errorf("task not found: %s", id)
@@ -482,7 +482,7 @@ func handleArchiveTask(deps *Deps) ToolHandler {
 			return nil, err
 		}
 
-		cleanupArchivedTaskResources(ctx, toolDeps, id, t.Branch)
+		cleanupArchivedTaskResources(toolDeps, id, t.Branch)
 
 		return map[string]any{"archived": id}, nil
 	}
@@ -494,7 +494,7 @@ func handleListHarnesses(deps *Deps) ToolHandler {
 	}
 }
 
-func cleanupArchivedTaskResources(ctx context.Context, deps *Deps, taskID, branch string) {
+func cleanupArchivedTaskResources(deps *Deps, taskID, branch string) {
 	workerID := workerIDFor(deps, taskID)
 	_ = tmux.KillWindow(deps.Session, workerID)
 	deps.Registry.Remove(workerID)
@@ -651,7 +651,7 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 		}
 		promptTask, err := loadTaskByID(toolDeps.Ledger, taskID)
 		if err != nil {
-			rollbackSpawnAfterLedgerUpdate(ctx, toolDeps, workerID, branch, taskID, repoPath, worktreePath)
+			rollbackSpawnAfterLedgerUpdate(toolDeps, workerID, branch, taskID, repoPath, worktreePath)
 			return nil, fmt.Errorf("reload task after update: %w", err)
 		}
 
@@ -668,7 +668,7 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 		// URL/secret values with shell metacharacters are not interpreted by the shell.
 		harnessCmd := buildHarnessCommand(hCfg.Command, mcpTokens)
 		if err := tmux.SendKeys(toolDeps.Session, workerID, harnessCmd); err != nil {
-			rollbackSpawnAfterLedgerUpdate(ctx, toolDeps, workerID, branch, taskID, repoPath, worktreePath)
+			rollbackSpawnAfterLedgerUpdate(toolDeps, workerID, branch, taskID, repoPath, worktreePath)
 			return nil, fmt.Errorf("send harness command: %w", err)
 		}
 		if err := waitForHarnessProcess(toolDeps.Session, workerID, 2*time.Second); err != nil {
@@ -1222,7 +1222,7 @@ func loadTaskByID(l *ledger.Ledger, taskID string) (*ledger.Task, error) {
 	return nil, fmt.Errorf("task not found: %s", taskID)
 }
 
-func rollbackSpawnAfterLedgerUpdate(ctx context.Context, deps *Deps, workerID, branch, taskID, repoPath, worktreePath string) {
+func rollbackSpawnAfterLedgerUpdate(deps *Deps, workerID, branch, taskID, repoPath, worktreePath string) {
 	_ = tmux.KillWindow(deps.Session, workerID)
 	_ = worktree.Remove(repoPath, worktreePath)
 	cleanupTaskBranch(repoPath, branch, taskID)

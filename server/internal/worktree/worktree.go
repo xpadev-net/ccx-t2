@@ -245,11 +245,11 @@ func branchExistsOnRemote(ctx context.Context, repoPath, branch string) (bool, e
 	if len(remotes) == 0 {
 		return false, nil
 	}
-	remoteCtx, cancel := contextWithDefaultTimeout(ctx, 5*time.Second)
-	defer cancel()
 	want := "refs/heads/" + branch
 	for _, remote := range remotes {
+		remoteCtx, cancel := contextWithDefaultTimeout(ctx, 5*time.Second)
 		out, err := exec.CommandContext(remoteCtx, "git", "-C", repoPath, "ls-remote", "--heads", remote).CombinedOutput()
+		cancel()
 		if err != nil {
 			return false, fmt.Errorf("%w: check remote branch on %s: %w: %s", ErrOriginUnavailable, remote, err, strings.TrimSpace(string(out)))
 		}
