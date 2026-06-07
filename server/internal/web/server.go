@@ -1,11 +1,13 @@
 package web
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"log"
 	"net/http"
 	"os/exec"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/xpadev/ccx-t2/internal/config"
@@ -18,6 +20,7 @@ type Server struct {
 	cfg       *config.Config
 	ledger    *ledger.Ledger
 	registry  *worker.Registry
+	secret    string
 	harnesses []harnessResponse
 	mux       *http.ServeMux
 }
@@ -27,6 +30,7 @@ type Deps struct {
 	Config   *config.Config
 	Ledger   *ledger.Ledger
 	Registry *worker.Registry
+	Secret   string
 }
 
 // New constructs a web API handler.
@@ -35,6 +39,7 @@ func New(deps Deps) *Server {
 		cfg:       deps.Config,
 		ledger:    deps.Ledger,
 		registry:  deps.Registry,
+		secret:    deps.Secret,
 		harnesses: harnessResponsesFromConfig(deps.Config),
 		mux:       http.NewServeMux(),
 	}
@@ -44,7 +49,38 @@ func New(deps Deps) *Server {
 
 // ServeHTTP implements http.Handler.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	setCORSHeaders(w)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if !s.authorize(w, r) {
+		return
+	}
 	s.mux.ServeHTTP(w, r)
+}
+
+func (s *Server) authorize(w http.ResponseWriter, r *http.Request) bool {
+	if s.secret == "" {
+		return true
+	}
+	hdr := r.Header.Get("Authorization")
+	if !strings.HasPrefix(hdr, "Bearer ") {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return false
+	}
+	token := hdr[len("Bearer "):]
+	if subtle.ConstantTimeCompare([]byte(token), []byte(s.secret)) != 1 {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return false
+	}
+	return true
+}
+
+func setCORSHeaders(w http.ResponseWriter) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
 }
 
 func (s *Server) routes() {

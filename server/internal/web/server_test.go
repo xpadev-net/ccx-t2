@@ -157,6 +157,45 @@ func TestMethodNotAllowed(t *testing.T) {
 	}
 }
 
+func TestBearerAuth(t *testing.T) {
+	l := newTestLedger(t)
+	server := New(Deps{Ledger: l, Secret: "web-secret"})
+
+	resp := performRequest(server, http.MethodGet, "/api/tasks")
+	if resp.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized status = %d, want %d", resp.Code, http.StatusUnauthorized)
+	}
+	if got := resp.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+		t.Fatalf("unauthorized Access-Control-Allow-Origin = %q, want *", got)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/tasks", nil)
+	req.Header.Set("Authorization", "Bearer web-secret")
+	authorized := httptest.NewRecorder()
+	server.ServeHTTP(authorized, req)
+	if authorized.Code != http.StatusOK {
+		t.Fatalf("authorized status = %d, want %d; body=%s", authorized.Code, http.StatusOK, authorized.Body.String())
+	}
+	if got := authorized.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+		t.Fatalf("authorized Access-Control-Allow-Origin = %q, want *", got)
+	}
+}
+
+func TestCORSPreflight(t *testing.T) {
+	server := New(Deps{Secret: "web-secret"})
+
+	resp := performRequest(server, http.MethodOptions, "/api/tasks")
+	if resp.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", resp.Code, http.StatusNoContent)
+	}
+	if got := resp.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+		t.Fatalf("Access-Control-Allow-Origin = %q, want *", got)
+	}
+	if got := resp.Header().Get("Access-Control-Allow-Headers"); !strings.Contains(got, "Authorization") {
+		t.Fatalf("Access-Control-Allow-Headers = %q, want Authorization", got)
+	}
+}
+
 func newTestLedger(t *testing.T) *ledger.Ledger {
 	t.Helper()
 	dir := t.TempDir()
