@@ -1,4 +1,4 @@
-import { FormEvent, StrictMode, useEffect, useMemo, useState } from "react";
+import { FormEvent, StrictMode, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import "./styles.css";
 
@@ -35,6 +35,51 @@ type WorkerInfo = {
   started_at?: string;
 };
 
+type ConfigResponse = {
+  project: {
+    slug: string;
+    repo_path: string;
+    worktree_base: string;
+  };
+  server: {
+    port: number;
+  };
+  orchestrator: {
+    harness: string;
+    heartbeat_interval: string;
+    timeout: string;
+  };
+  worker_harnesses: string[];
+  harnesses: Record<string, { command: string }>;
+  github: {
+    owner?: string;
+    repo?: string;
+  };
+};
+
+type ConfigDraft = {
+  projectSlug: string;
+  repoPath: string;
+  worktreeBase: string;
+  serverPort: string;
+  orchestratorHarness: string;
+  heartbeatInterval: string;
+  timeout: string;
+  workerHarnesses: string;
+  harnesses: Record<string, string>;
+  githubOwner: string;
+  githubRepo: string;
+};
+
+type HarnessInfo = {
+  name: string;
+  available: boolean;
+  usage: {
+    command?: string;
+    note?: string;
+  };
+};
+
 const statusOptions = ["unstarted", "in_progress", "blocked", "completed", "split"];
 const tokenStorageKey = "ccx.webToken";
 
@@ -51,10 +96,16 @@ function App() {
   const [workers, setWorkers] = useState<WorkerInfo[]>([]);
   const [selectedWorkerID, setSelectedWorkerID] = useState("");
   const [workerLog, setWorkerLog] = useState<string[]>([]);
+  const [config, setConfig] = useState<ConfigResponse | null>(null);
+  const [configDraft, setConfigDraft] = useState<ConfigDraft>(() => emptyConfigDraft());
+  const [settingsDirty, setSettingsDirty] = useState(false);
+  const [harnesses, setHarnesses] = useState<HarnessInfo[]>([]);
+  const [settingsLoading, setSettingsLoading] = useState(true);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
+  const settingsDirtyRef = useRef(false);
 
   const selectedTask = useMemo(
     () => tasks.find((task) => task.id === selectedID) ?? tasks[0],
@@ -68,10 +119,13 @@ function App() {
     () => tasks.find((task) => task.id === selectedWorker?.task_id),
     [selectedWorker?.task_id, tasks]
   );
+  const harnessNames = useMemo(
+    () => Object.keys(configDraft.harnesses).sort((a, b) => a.localeCompare(b)),
+    [configDraft.harnesses]
+  );
 
   useEffect(() => {
-    void refreshTasks();
-    void refreshWorkers();
+    void refreshAll(true, token, true);
   }, []);
 
   useEffect(() => {
@@ -187,8 +241,33 @@ function App() {
     }
   }
 
-  async function refreshAll(showLoading = true, authToken = token) {
-    await Promise.all([refreshTasks(showLoading, authToken), refreshWorkers(authToken)]);
+  async function refreshAll(showLoading = true, authToken = token, replaceSettingsDraft = false) {
+    await Promise.all([
+      refreshTasks(showLoading, authToken),
+      refreshWorkers(authToken),
+      refreshSettings(authToken, replaceSettingsDraft)
+    ]);
+  }
+
+  async function refreshSettings(authToken = token, replaceDraft = false) {
+    setSettingsLoading(true);
+    try {
+      const [configData, harnessData] = await Promise.all([
+        api<ConfigResponse>("/api/config", {}, authToken),
+        api<HarnessInfo[]>("/api/harnesses", {}, authToken)
+      ]);
+      setConfig(configData);
+      if (replaceDraft || !settingsDirtyRef.current) {
+        setConfigDraft(configToDraft(configData));
+        settingsDirtyRef.current = false;
+        setSettingsDirty(false);
+      }
+      setHarnesses(harnessData);
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setSettingsLoading(false);
+    }
   }
 
   async function createTask(event: FormEvent) {
@@ -278,6 +357,55 @@ function App() {
     } finally {
       setSaving(false);
     }
+  }
+
+  async function saveConfig(event: FormEvent) {
+    event.preventDefault();
+    setSaving(true);
+    setError("");
+    setMessage("");
+    try {
+      const updated = await api<ConfigResponse>(
+        "/api/config",
+        {
+          method: "PATCH",
+          body: JSON.stringify(configPatchFromDraft(configDraft))
+        },
+        token
+      );
+      const harnessData = await api<HarnessInfo[]>("/api/harnesses", {}, token);
+      setConfig(updated);
+      setConfigDraft(configToDraft(updated));
+      settingsDirtyRef.current = false;
+      setSettingsDirty(false);
+      setHarnesses(harnessData);
+      setMessage("Settings updated.");
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  function updateConfigDraft(patch: Partial<ConfigDraft>) {
+    markSettingsDirty();
+    setConfigDraft((current) => ({ ...current, ...patch }));
+  }
+
+  function updateHarnessCommand(name: string, command: string) {
+    markSettingsDirty();
+    setConfigDraft((current) => ({
+      ...current,
+      harnesses: {
+        ...current.harnesses,
+        [name]: command
+      }
+    }));
+  }
+
+  function markSettingsDirty() {
+    settingsDirtyRef.current = true;
+    setSettingsDirty(true);
   }
 
   return (
@@ -408,6 +536,148 @@ function App() {
           </div>
         </section>
 
+        <section className="settings-panel" aria-label="Settings">
+          <div className="section-heading">
+            <h2>Settings</h2>
+            <span>{settingsDirty ? "Unsaved" : settingsLoading ? "Loading" : "Config"}</span>
+          </div>
+          <form onSubmit={saveConfig} className="settings-grid">
+            <label>
+              Project slug
+              <input
+                value={configDraft.projectSlug}
+                onChange={(event) => updateConfigDraft({ projectSlug: event.target.value })}
+                disabled={!config}
+              />
+            </label>
+            <label>
+              Server port
+              <input
+                inputMode="numeric"
+                value={configDraft.serverPort}
+                onChange={(event) => updateConfigDraft({ serverPort: event.target.value })}
+                disabled={!config}
+              />
+            </label>
+            <label className="wide">
+              Repository path
+              <input
+                value={configDraft.repoPath}
+                onChange={(event) => updateConfigDraft({ repoPath: event.target.value })}
+                disabled={!config}
+              />
+            </label>
+            <label className="wide">
+              Worktree base
+              <input
+                value={configDraft.worktreeBase}
+                onChange={(event) => updateConfigDraft({ worktreeBase: event.target.value })}
+                disabled={!config}
+              />
+            </label>
+            <label>
+              Orchestrator harness
+              <select
+                value={configDraft.orchestratorHarness}
+                onChange={(event) => updateConfigDraft({ orchestratorHarness: event.target.value })}
+                disabled={!config}
+              >
+                {harnessNames.includes(configDraft.orchestratorHarness) ? null : (
+                  <option value={configDraft.orchestratorHarness}>{configDraft.orchestratorHarness || "Unset"}</option>
+                )}
+                {harnessNames.map((name) => (
+                  <option key={name} value={name}>
+                    {name}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              Worker harnesses
+              <input
+                value={configDraft.workerHarnesses}
+                onChange={(event) => updateConfigDraft({ workerHarnesses: event.target.value })}
+                disabled={!config}
+              />
+            </label>
+            <label>
+              Heartbeat interval
+              <input
+                value={configDraft.heartbeatInterval}
+                onChange={(event) => updateConfigDraft({ heartbeatInterval: event.target.value })}
+                disabled={!config}
+              />
+            </label>
+            <label>
+              Orchestrator timeout
+              <input
+                value={configDraft.timeout}
+                onChange={(event) => updateConfigDraft({ timeout: event.target.value })}
+                disabled={!config}
+              />
+            </label>
+            <label>
+              GitHub owner
+              <input
+                value={configDraft.githubOwner}
+                onChange={(event) => updateConfigDraft({ githubOwner: event.target.value })}
+                disabled={!config}
+              />
+            </label>
+            <label>
+              GitHub repo
+              <input
+                value={configDraft.githubRepo}
+                onChange={(event) => updateConfigDraft({ githubRepo: event.target.value })}
+                disabled={!config}
+              />
+            </label>
+
+            <div className="wide harness-editor">
+              <div className="subheading">
+                <h3>Harness Commands</h3>
+                <span>{harnessNames.length} configured</span>
+              </div>
+              <div className="harness-grid">
+                {harnessNames.map((name) => (
+                  <label key={name}>
+                    {name}
+                    <input
+                      value={configDraft.harnesses[name] ?? ""}
+                      onChange={(event) => updateHarnessCommand(name, event.target.value)}
+                      disabled={!config}
+                    />
+                  </label>
+                ))}
+                {harnessNames.length === 0 && <div className="empty">No harnesses configured.</div>}
+              </div>
+            </div>
+
+            <div className="wide availability-list">
+              <div className="subheading">
+                <h3>Availability</h3>
+                <span>{harnesses.length} worker harnesses</span>
+              </div>
+              {harnesses.map((harness) => (
+                <div className="availability-row" key={harness.name}>
+                  <span>{harness.name}</span>
+                  <span className={`status ${harness.available ? "completed" : "blocked"}`}>
+                    {harness.available ? "available" : "unavailable"}
+                  </span>
+                  <span>{harness.usage.command || harness.usage.note || "No command"}</span>
+                </div>
+              ))}
+              {!settingsLoading && harnesses.length === 0 && <div className="empty">No worker harnesses configured.</div>}
+            </div>
+
+            <div className="actions wide">
+              <button type="submit" disabled={!config || saving}>
+                Save Settings
+              </button>
+            </div>
+          </form>
+        </section>
+
         <section className="auth-panel" aria-label="API token">
           <div className="section-heading">
             <h2>API Token</h2>
@@ -427,7 +697,7 @@ function App() {
               onClick={() => {
                 setToken(tokenDraft);
                 storeToken(tokenDraft);
-                void refreshAll(true, tokenDraft);
+                void refreshAll(true, tokenDraft, true);
               }}
             >
               Apply
@@ -437,6 +707,75 @@ function App() {
       </section>
     </main>
   );
+}
+
+function emptyConfigDraft(): ConfigDraft {
+  return {
+    projectSlug: "",
+    repoPath: "",
+    worktreeBase: "",
+    serverPort: "",
+    orchestratorHarness: "",
+    heartbeatInterval: "",
+    timeout: "",
+    workerHarnesses: "",
+    harnesses: {},
+    githubOwner: "",
+    githubRepo: ""
+  };
+}
+
+function configToDraft(config: ConfigResponse): ConfigDraft {
+  return {
+    projectSlug: config.project.slug,
+    repoPath: config.project.repo_path,
+    worktreeBase: config.project.worktree_base,
+    serverPort: String(config.server.port),
+    orchestratorHarness: config.orchestrator.harness,
+    heartbeatInterval: config.orchestrator.heartbeat_interval,
+    timeout: config.orchestrator.timeout,
+    workerHarnesses: config.worker_harnesses.join(", "),
+    harnesses: Object.fromEntries(Object.entries(config.harnesses).map(([name, harness]) => [name, harness.command])),
+    githubOwner: config.github.owner ?? "",
+    githubRepo: config.github.repo ?? ""
+  };
+}
+
+function configPatchFromDraft(draft: ConfigDraft) {
+  const trimmedPort = draft.serverPort.trim();
+  if (!/^\d+$/.test(trimmedPort)) {
+    throw new Error("Server port must be an integer");
+  }
+  const serverPort = Number(trimmedPort);
+  if (serverPort < 1 || serverPort > 65535) {
+    throw new Error("Server port must be between 1 and 65535");
+  }
+  return {
+    project: {
+      slug: draft.projectSlug,
+      repo_path: draft.repoPath,
+      worktree_base: draft.worktreeBase
+    },
+    server: {
+      port: serverPort
+    },
+    orchestrator: {
+      harness: draft.orchestratorHarness,
+      heartbeat_interval: draft.heartbeatInterval,
+      timeout: draft.timeout
+    },
+    worker_harnesses: draft.workerHarnesses
+      .split(",")
+      .map((name) => name.trim())
+      .filter(Boolean),
+    harnesses: Object.fromEntries(
+      Object.entries(draft.harnesses).map(([name, command]) => [name, { command }])
+    ),
+    github: {
+      owner: draft.githubOwner,
+      repo: draft.githubRepo
+    }
+  };
 }
 
 async function api<T>(path: string, init: RequestInit = {}, token = ""): Promise<T> {
