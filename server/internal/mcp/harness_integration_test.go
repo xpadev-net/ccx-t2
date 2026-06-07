@@ -240,7 +240,7 @@ func waitForCompletedTask(t *testing.T, l *ledger.Ledger, taskID, harnessName, s
 
 func waitForWorkerCleanup(t *testing.T, registry *worker.Registry, session, workerID, worktreePath string) {
 	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(fakeHarnessWait)
 	for time.Now().Before(deadline) {
 		_, registered := registry.Get(workerID)
 		_, statErr := os.Stat(worktreePath)

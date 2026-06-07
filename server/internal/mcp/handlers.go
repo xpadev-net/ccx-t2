@@ -1136,8 +1136,6 @@ func waitForHarnessProcess(session, window string, timeout time.Duration) error 
 				return nil
 			}
 			seen = true
-		} else if seen {
-			seen = false
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
