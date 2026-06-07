@@ -1123,3 +1123,9 @@ func titleToSlug(title string) string {
 func removeMergeCommitComment(body string) string {
 	return reMergeCommit.ReplaceAllString(body, "")
 }
+
+// RemoveMergeCommitComments strips internal merge_commit markers from task body
+// text before a fresh verified marker is appended.
+func RemoveMergeCommitComments(body string) string {
+	return removeMergeCommitComment(body)
+}

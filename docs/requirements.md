@@ -230,8 +230,8 @@ notify(type, payload)
   payload: {
     project_slug,
     task_id,
-    pr_url?,         -- completed 時
-    merge_commit?,   -- completed 時
+    pr_url,          -- completed 時は必須
+    merge_commit,    -- completed 時は必須
     reason?,         -- blocked / split_request 時
     proposed_slices? -- split_request 時
   }

@@ -213,6 +213,45 @@ func TestTriggerStartsOrchestratorWithSnapshotAndMCPArgs(t *testing.T) {
 	}
 }
 
+func TestTriggerIncludesCompletedTasksForArchiveDecision(t *testing.T) {
+	l, cfg := newTestDeps(t)
+	if err := l.Add(ledger.Task{
+		ID:     "task-001",
+		Title:  "Done task",
+		Status: "completed",
+		PrURL:  "https://example.test/pull/123",
+		Body:   "done\n<!-- merge_commit: abc123def456 -->",
+	}); err != nil {
+		t.Fatalf("Add completed task: %v", err)
+	}
+	if err := l.Add(ledger.Task{ID: "task-002", Title: "Still active", Status: "unstarted"}); err != nil {
+		t.Fatalf("Add active task: %v", err)
+	}
+	fake := &fakeTmux{idle: true}
+	o := New(l, cfg, "proj", "http://localhost:8080")
+	o.tmux = fake
+
+	if err := o.Trigger(context.Background(), "worker completed"); err != nil {
+		t.Fatalf("Trigger: %v", err)
+	}
+
+	fake.mu.Lock()
+	prompt := fake.prompts[0]
+	fake.mu.Unlock()
+	for _, want := range []string{
+		"archive completed tasks",
+		`"id": "task-001"`,
+		`"status": "completed"`,
+		`"pr_url": "https://example.test/pull/123"`,
+		`"id": "task-002"`,
+		`"status": "unstarted"`,
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt does not contain %q:\n%s", want, prompt)
+		}
+	}
+}
+
 func TestTriggerQueuesWhileWindowActiveAndDrainsAfterIdle(t *testing.T) {
 	l, cfg := newTestDeps(t)
 	fake := &fakeTmux{alive: true, idle: false}
