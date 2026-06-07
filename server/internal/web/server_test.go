@@ -216,6 +216,9 @@ func TestPatchTaskUpdatesFields(t *testing.T) {
 	if updated.Title != "Updated" || updated.Status != "blocked" || updated.Reason != "Needs detail" || updated.Body != "new body" {
 		t.Fatalf("updated task = %#v, want patched fields", updated)
 	}
+	if updated.UpdatedAt != "" {
+		t.Fatalf("updated_at = %q, want omitted from PATCH response", updated.UpdatedAt)
+	}
 }
 
 func TestPatchTaskNotFound(t *testing.T) {

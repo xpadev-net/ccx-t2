@@ -272,6 +272,7 @@ func (s *Server) updateTask(w http.ResponseWriter, r *http.Request, id string) {
 		return
 	}
 	updated := taskSnapshotWithFields(prev, fields)
+	updated.UpdatedAt = ""
 	writeJSON(w, http.StatusOK, taskResponseFromLedger(updated))
 }
 
@@ -431,7 +432,6 @@ func taskSnapshotWithFields(task ledger.Task, fields map[string]any) ledger.Task
 	if body, ok := fields["body"].(string); ok {
 		task.Body = body
 	}
-	task.UpdatedAt = time.Now().Format(time.RFC3339)
 	return task
 }
 
