@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
@@ -103,10 +104,78 @@ func TestBuildWorkerPromptFromTaskUsesTaskRestrictions(t *testing.T) {
 		"Reloaded body",
 		"  - server/internal/mcp\n",
 		"  - server/internal/mcp/old.go\n",
+		"Work only inside the Worktree path above",
+		"Do not rewrite history on a default branch or any branch that has an open pull request",
+		"Never force push",
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("prompt does not contain %q:\n%s", want, prompt)
 		}
+	}
+}
+
+func TestHandleSpawnWorkerRejectsBranchWithoutTaskID(t *testing.T) {
+	dir := t.TempDir()
+	l := ledger.NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
+	if err := l.Add(ledger.Task{ID: "task-001", Title: "Task", Status: "unstarted"}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	deps := &Deps{
+		Ledger:   l,
+		Registry: worker.NewRegistry(),
+		Config: &config.Config{
+			Project: config.ProjectConfig{
+				Slug:         "proj",
+				RepoPath:     dir,
+				WorktreeBase: filepath.Join(dir, "worktrees"),
+			},
+		},
+	}
+
+	_, err := handleSpawnWorker(deps)(context.Background(), map[string]any{
+		"task_id":       "task-001",
+		"branch":        "feature/my-work",
+		"allowed_files": []any{"server/internal/mcp"},
+	})
+	if err == nil {
+		t.Fatal("handleSpawnWorker error = nil, want task-scoped branch validation error")
+	}
+	if !strings.Contains(err.Error(), "must include task_id") {
+		t.Fatalf("handleSpawnWorker error = %v, want task-scoped branch validation error", err)
+	}
+}
+
+func TestCleanupTaskBranchNormalizesRelativeRepoPath(t *testing.T) {
+	dir := t.TempDir()
+	repoPath := filepath.Join(dir, "repo")
+	if err := exec.Command("git", "init", "-b", "main", repoPath).Run(); err != nil {
+		t.Fatalf("git init: %v", err)
+	}
+	runGit(t, repoPath, "config", "user.email", "test@example.com")
+	runGit(t, repoPath, "config", "user.name", "Test User")
+	runGit(t, repoPath, "commit", "--allow-empty", "-m", "init")
+	runGit(t, repoPath, "branch", "feature/task-001")
+	previousWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatalf("Chdir: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(previousWD); err != nil {
+			t.Fatalf("restore working directory: %v", err)
+		}
+	})
+
+	cleanupTaskBranch("repo", "feature/task-001", "task-001")
+
+	exists, err := gitBranchExists(repoPath, "feature/task-001")
+	if err != nil {
+		t.Fatalf("gitBranchExists: %v", err)
+	}
+	if exists {
+		t.Fatal("feature/task-001 still exists, want cleanup to delete it")
 	}
 }
 

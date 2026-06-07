@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os/exec"
@@ -501,7 +502,7 @@ func cleanupArchivedTaskResources(deps *Deps, taskID, branch string) {
 		deps.Config.Project.Slug+"-"+taskID)
 	_ = worktree.Remove(deps.Config.Project.RepoPath, wPath)
 	if branch != "" {
-		_ = exec.Command("git", "-C", deps.Config.Project.RepoPath, "branch", "-D", branch).Run()
+		cleanupTaskBranch(deps.Config.Project.RepoPath, branch, taskID)
 	}
 }
 
@@ -578,6 +579,9 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 		if err := validateGitBranchName(branch); err != nil {
 			return nil, err
 		}
+		if !worktree.BranchMatchesTaskID(branch, taskID) {
+			return nil, fmt.Errorf("branch %q must include task_id %q as a path or delimiter-bounded segment", branch, taskID)
+		}
 
 		// Resolve harness.
 		resolvedHarness, hCfg, err := harness.Resolve(toolDeps.Config, harnessName)
@@ -624,7 +628,7 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 		// Step 2: Create tmux window.
 		if err := tmux.CreateWindow(toolDeps.Session, workerID, worktreePath); err != nil {
 			_ = worktree.Remove(repoPath, worktreePath)
-			_ = exec.Command("git", "-C", repoPath, "branch", "-D", branch).Run()
+			cleanupTaskBranch(repoPath, branch, taskID)
 			return nil, fmt.Errorf("create tmux window: %w", err)
 		}
 
@@ -642,7 +646,7 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 		if updateErr != nil {
 			_ = tmux.KillWindow(toolDeps.Session, workerID)
 			_ = worktree.Remove(repoPath, worktreePath)
-			_ = exec.Command("git", "-C", repoPath, "branch", "-D", branch).Run()
+			cleanupTaskBranch(repoPath, branch, taskID)
 			return nil, fmt.Errorf("update ledger: %w", updateErr)
 		}
 		promptTask, err := loadTaskByID(toolDeps.Ledger, taskID)
@@ -1054,8 +1058,7 @@ func handleNotify(deps *Deps) ToolHandler {
 				filepath.Join(toolDeps.Config.Project.WorktreeBase,
 					toolDeps.Config.Project.Slug+"-"+taskID))
 			if prevTask.Branch != "" {
-				_ = exec.Command("git", "-C", toolDeps.Config.Project.RepoPath,
-					"branch", "-D", prevTask.Branch).Run()
+				cleanupTaskBranch(toolDeps.Config.Project.RepoPath, prevTask.Branch, taskID)
 			}
 			toolDeps.Registry.Remove(wid)
 
@@ -1121,8 +1124,29 @@ func workerIDFor(deps *Deps, taskID string) string {
 	return "worker-" + taskID
 }
 
+func cleanupTaskBranch(repoPath, branch, taskID string) {
+	absRepoPath, err := filepath.Abs(repoPath)
+	if err != nil {
+		log.Printf("warn: worker cleanup failed to resolve repo path %q for task %s: %v", repoPath, taskID, err)
+		return
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := worktree.DeleteTaskBranchIfSafeContext(cleanupCtx, absRepoPath, branch, taskID); err != nil {
+		if errors.Is(err, worktree.ErrUnsafeBranchDelete) {
+			log.Printf("warn: worker cleanup skipped unsafe branch delete for task %s: %v", taskID, err)
+			return
+		}
+		if errors.Is(err, worktree.ErrOriginUnavailable) {
+			log.Printf("warn: worker cleanup skipped branch delete for task %s (origin unavailable): %v", taskID, err)
+			return
+		}
+		log.Printf("warn: worker cleanup failed to delete branch %q for task %s: %v", branch, taskID, err)
+	}
+}
+
 // stopWorkerCleanup is best-effort cleanup: it kills the tmux window,
-// removes the worktree, deletes the git branch, and evicts the registry entry.
+// removes the worktree, deletes the git branch when safe, and evicts the registry entry.
 // All errors are silently ignored; callers must not rely on this returning nil.
 func stopWorkerCleanup(deps *Deps, workerID, branch, taskID string) {
 	if workerID != "" {
@@ -1134,8 +1158,7 @@ func stopWorkerCleanup(deps *Deps, workerID, branch, taskID string) {
 		_ = worktree.Remove(deps.Config.Project.RepoPath, wPath)
 	}
 	if branch != "" {
-		_ = exec.Command("git", "-C", deps.Config.Project.RepoPath,
-			"branch", "-D", branch).Run()
+		cleanupTaskBranch(deps.Config.Project.RepoPath, branch, taskID)
 	}
 	if workerID != "" {
 		deps.Registry.Remove(workerID)
@@ -1202,7 +1225,7 @@ func loadTaskByID(l *ledger.Ledger, taskID string) (*ledger.Task, error) {
 func rollbackSpawnAfterLedgerUpdate(deps *Deps, workerID, branch, taskID, repoPath, worktreePath string) {
 	_ = tmux.KillWindow(deps.Session, workerID)
 	_ = worktree.Remove(repoPath, worktreePath)
-	_ = exec.Command("git", "-C", repoPath, "branch", "-D", branch).Run()
+	cleanupTaskBranch(repoPath, branch, taskID)
 	// Reset lifecycle fields only — do not restore allowed/forbidden_files
 	// to avoid overwriting concurrent update_task edits. Use UpdateIfStatuses
 	// so a concurrent split_task that already committed (moving the parent to
@@ -1298,6 +1321,10 @@ func buildWorkerPromptWithDeps(deps *Deps, task *ledger.Task, taskID, workerID, 
 Instructions:
 - Only edit files within the allowed_files paths (directory-boundary prefix match).
 - Do not edit any forbidden_files.
+- Work only inside the Worktree path above; do not directly edit the parent repository checkout.
+- Stop and report a blocker if the current checkout is not the Worktree path or Branch above.
+- Do not rewrite history on a default branch or any branch that has an open pull request.
+- Never force push. If an open-PR branch is behind its base, merge the base branch normally.
 - Implement the task, validate, self-review, create a PR, and merge it.
 - Always include your worker_id in notify payloads for ownership verification.
 - Always include project_slug in notify payloads when it is present above.

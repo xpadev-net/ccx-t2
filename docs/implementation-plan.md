@@ -123,6 +123,7 @@ tmux ウィンドウの作成・削除・キー送信と git worktree の管理�
 **`internal/worktree/worktree.go`**
 - `Create(repoPath, branch, worktreePath string) error` — `git worktree add -b {branch}`（ブランチを新規作成）
 - `Remove(repoPath, worktreePath string) error` — `git -C {repoPath} worktree remove --force`
+- `DeleteTaskBranchIfSafe(repoPath, branch, taskID string) error` — task ID に明確に紐づく cleanup 用の local branch、または移行用の namespaced legacy branch のみ削除し、default branch、別 worktree で checkout 中のブランチ、remote/upstream ref を持つブランチは削除しない
 
 worktree path は `runtime.worktree_base/{project_slug}-{task_id}` を既定とする。
 
@@ -182,13 +183,14 @@ Orchestrator・Worker がツールを呼べる HTTP MCP サーバーを立てる
 
 `spawn_worker` の実行順序：
 1. `project_slug` で runtime manager から対象プロジェクトを解決
-2. `worktree.Create(project.repo_path, branch, worktreePath)` — worktree を生成してブランチを作成
+2. `branch` が `task_id` を delimiter-bounded segment として含むことを検証し、`worktree.Create(project.repo_path, branch, worktreePath)` で worktree を生成してブランチを作成
 3. `tmux.CreateWindow(runtime.tmux_session, "{project_slug}-worker-{task_id}")` — tmux ウィンドウを作成
 4. ハーネス起動コマンドを組み立て（project_slug・worktree path・MCP URL `/mcp/worker`・タスク詳細を注入）
 5. `tmux.SendKeys` でハーネスを起動
 6. 対象プロジェクトの台帳の status を in_progress に更新し branch / worker_id / harness フィールドを設定
 
 ステップ6（台帳更新）が失敗した場合、ウィンドウを `KillWindow` で停止した後に worktree を削除してエラーを返す。ステップ1〜5が失敗した場合、それまでに作成済みのリソース（worktree・ウィンドウ）を逆順で削除してエラーを返す。
+rollback / stop / archive / split / task delete cleanup で branch を削除する場合は `DeleteTaskBranchIfSafe` を経由し、default branch や PR が存在し得る remote/upstream 付き branch の履歴を壊さない。
 
 ---
 

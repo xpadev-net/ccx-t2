@@ -206,10 +206,14 @@ list_harnesses()
 spawn_worker(project_slug, task_id, branch, allowed_files, forbidden_files, harness)
   → ブランチを作成（git worktree add -b）し、tmux ウィンドウを作成してハーネスを起動。
     台帳の status を in_progress に更新し、branch / worker_id / harness フィールドを設定する。
+    branch は task_id を delimiter-bounded segment として含む必要がある。
+    Worker には task ごとの worktree path と branch を注入し、親リポジトリ checkout を直接編集しないことを明示する。
+    default branch または PR が存在するブランチでは履歴を書き換えず、force push しない。
     ハーネスバイナリが見つからない場合はエラーを返し台帳を更新しない。
 
 stop_worker(project_slug, worker_id)
   → tmux ウィンドウを終了し、対応する worktree を削除する。
+    ブランチ削除は cleanup 用の local branch に限定し、default branch、別 worktree で checkout 中のブランチ、remote/upstream ref を持つ PR 可能性のあるブランチは削除しない。
 
 followup_worker(project_slug, worker_id, message)
   → tmux send-keys でメッセージを送信。
@@ -255,7 +259,7 @@ Orchestrator 起動時は対象プロジェクトの設定、台帳スナップ�
 2. Go が `project_slug` から対象プロジェクトを解決する
 3. Go が対象リポジトリでブランチを作成し worktree を生成する
 4. Go が tmux ウィンドウを作成し、タスク詳細（project_slug, id, title, branch, allowed_files, forbidden_files, worktree path, 検証コマンド, MCP サーバー URL）をプロンプトまたはハーネス固有の設定フラグで注入してハーネスを起動する
-5. Worker はプロンプトに従って実装・レビュー・PR 作成・マージを実行する
+5. Worker は注入された worktree 内でプロンプトに従って実装・レビュー・PR 作成・マージを実行する
 6. 完了・ブロック・分割要求の際に `notify()` を呼ぶ
 7. Go がイベントを受信し、同じプロジェクトの Orchestrator を即時起動する
 

@@ -61,7 +61,7 @@ func TestWorkerHarnessesCompleteThroughMCPIntegration(t *testing.T) {
 			cfg := integrationConfig(repoPath, worktreeBase, harnessName, harnessCommand)
 			registry := worker.NewRegistry()
 			session := "ccx-t2-test-" + harnessName + "-" + fmt.Sprint(time.Now().UnixNano())
-			branch := "phase6/" + harnessName
+			branch := "phase6/" + taskID + "-" + harnessName
 			worktreePath := filepath.Join(worktreeBase, cfg.Project.Slug+"-"+taskID)
 			t.Cleanup(func() {
 				_ = exec.Command("git", "-C", repoPath, "worktree", "remove", "--force", worktreePath).Run()
@@ -151,7 +151,7 @@ func TestWorkerSplitRequestThroughMCPIntegration(t *testing.T) {
 	cfg := integrationConfig(repoPath, worktreeBase, harnessName, splitHarnessCommand)
 	registry := worker.NewRegistry()
 	session := "ccx-t2-test-split-" + fmt.Sprint(time.Now().UnixNano())
-	branch := "phase6/split-request"
+	branch := "phase6/" + taskID + "-split-request"
 	worktreePath := filepath.Join(worktreeBase, cfg.Project.Slug+"-"+taskID)
 	t.Cleanup(func() {
 		_ = exec.Command("git", "-C", repoPath, "worktree", "remove", "--force", worktreePath).Run()
@@ -196,7 +196,7 @@ func TestWorkerSplitRequestThroughMCPIntegration(t *testing.T) {
 		Command: completeHarnessCommand,
 		McpArgs: "--mcp-url {url} --mcp-secret {secret}",
 	}
-	childBranch := "phase6/split-child"
+	childBranch := "phase6/" + childID + "-split-child"
 	childWorktreePath := filepath.Join(worktreeBase, cfg.Project.Slug+"-"+childID)
 	t.Cleanup(func() {
 		_ = exec.Command("git", "-C", repoPath, "worktree", "remove", "--force", childWorktreePath).Run()
