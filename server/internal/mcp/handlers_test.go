@@ -168,7 +168,7 @@ func TestCleanupTaskBranchNormalizesRelativeRepoPath(t *testing.T) {
 		}
 	})
 
-	cleanupTaskBranch(context.Background(), "repo", "feature/task-001", "task-001")
+	cleanupTaskBranch("repo", "feature/task-001", "task-001")
 
 	exists, err := gitBranchExists(repoPath, "feature/task-001")
 	if err != nil {

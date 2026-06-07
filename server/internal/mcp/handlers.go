@@ -502,7 +502,7 @@ func cleanupArchivedTaskResources(ctx context.Context, deps *Deps, taskID, branc
 		deps.Config.Project.Slug+"-"+taskID)
 	_ = worktree.Remove(deps.Config.Project.RepoPath, wPath)
 	if branch != "" {
-		cleanupTaskBranch(ctx, deps.Config.Project.RepoPath, branch, taskID)
+		cleanupTaskBranch(deps.Config.Project.RepoPath, branch, taskID)
 	}
 }
 
@@ -628,7 +628,7 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 		// Step 2: Create tmux window.
 		if err := tmux.CreateWindow(toolDeps.Session, workerID, worktreePath); err != nil {
 			_ = worktree.Remove(repoPath, worktreePath)
-			cleanupTaskBranch(ctx, repoPath, branch, taskID)
+			cleanupTaskBranch(repoPath, branch, taskID)
 			return nil, fmt.Errorf("create tmux window: %w", err)
 		}
 
@@ -646,7 +646,7 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 		if updateErr != nil {
 			_ = tmux.KillWindow(toolDeps.Session, workerID)
 			_ = worktree.Remove(repoPath, worktreePath)
-			cleanupTaskBranch(ctx, repoPath, branch, taskID)
+			cleanupTaskBranch(repoPath, branch, taskID)
 			return nil, fmt.Errorf("update ledger: %w", updateErr)
 		}
 		promptTask, err := loadTaskByID(toolDeps.Ledger, taskID)
@@ -1058,7 +1058,7 @@ func handleNotify(deps *Deps) ToolHandler {
 				filepath.Join(toolDeps.Config.Project.WorktreeBase,
 					toolDeps.Config.Project.Slug+"-"+taskID))
 			if prevTask.Branch != "" {
-				cleanupTaskBranch(ctx, toolDeps.Config.Project.RepoPath, prevTask.Branch, taskID)
+				cleanupTaskBranch(toolDeps.Config.Project.RepoPath, prevTask.Branch, taskID)
 			}
 			toolDeps.Registry.Remove(wid)
 
@@ -1124,13 +1124,15 @@ func workerIDFor(deps *Deps, taskID string) string {
 	return "worker-" + taskID
 }
 
-func cleanupTaskBranch(ctx context.Context, repoPath, branch, taskID string) {
+func cleanupTaskBranch(repoPath, branch, taskID string) {
 	absRepoPath, err := filepath.Abs(repoPath)
 	if err != nil {
 		log.Printf("warn: worker cleanup failed to resolve repo path %q for task %s: %v", repoPath, taskID, err)
 		return
 	}
-	if err := worktree.DeleteTaskBranchIfSafeContext(ctx, absRepoPath, branch, taskID); err != nil {
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := worktree.DeleteTaskBranchIfSafeContext(cleanupCtx, absRepoPath, branch, taskID); err != nil {
 		if errors.Is(err, worktree.ErrUnsafeBranchDelete) {
 			log.Printf("warn: worker cleanup skipped unsafe branch delete for task %s: %v", taskID, err)
 			return
@@ -1156,7 +1158,7 @@ func stopWorkerCleanup(deps *Deps, workerID, branch, taskID string) {
 		_ = worktree.Remove(deps.Config.Project.RepoPath, wPath)
 	}
 	if branch != "" {
-		cleanupTaskBranch(context.Background(), deps.Config.Project.RepoPath, branch, taskID)
+		cleanupTaskBranch(deps.Config.Project.RepoPath, branch, taskID)
 	}
 	if workerID != "" {
 		deps.Registry.Remove(workerID)
@@ -1223,7 +1225,7 @@ func loadTaskByID(l *ledger.Ledger, taskID string) (*ledger.Task, error) {
 func rollbackSpawnAfterLedgerUpdate(ctx context.Context, deps *Deps, workerID, branch, taskID, repoPath, worktreePath string) {
 	_ = tmux.KillWindow(deps.Session, workerID)
 	_ = worktree.Remove(repoPath, worktreePath)
-	cleanupTaskBranch(ctx, repoPath, branch, taskID)
+	cleanupTaskBranch(repoPath, branch, taskID)
 	// Reset lifecycle fields only — do not restore allowed/forbidden_files
 	// to avoid overwriting concurrent update_task edits. Use UpdateIfStatuses
 	// so a concurrent split_task that already committed (moving the parent to
