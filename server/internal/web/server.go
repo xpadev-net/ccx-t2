@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -196,7 +197,7 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 	id := task.ID
 	if id != "" {
 		if err := s.ledger.Add(task); err != nil {
-			if strings.Contains(err.Error(), "task ID already exists") {
+			if errors.Is(err, ledger.ErrTaskExists) {
 				existing, ok, loadErr := s.loadTaskIfExists(id)
 				if loadErr != nil {
 					writeError(w, http.StatusInternalServerError, "load tasks")
@@ -262,9 +263,13 @@ func (s *Server) updateTask(w http.ResponseWriter, r *http.Request, id string) {
 		writeError(w, http.StatusBadRequest, "no task fields provided")
 		return
 	}
+	if status, ok := fields["status"].(string); ok && strings.TrimSpace(status) == "" {
+		writeError(w, http.StatusBadRequest, "status cannot be empty")
+		return
+	}
 	prev, err := s.ledger.UpdateReturnPrev(id, fields)
 	if err != nil {
-		if strings.Contains(err.Error(), "task not found:") {
+		if errors.Is(err, ledger.ErrTaskNotFound) {
 			writeError(w, http.StatusNotFound, "task not found")
 			return
 		}
@@ -288,16 +293,7 @@ func (s *Server) loadTask(id string) (ledger.Task, error) {
 }
 
 func (s *Server) loadTaskIfExists(id string) (ledger.Task, bool, error) {
-	tasks, err := s.ledger.Load()
-	if err != nil {
-		return ledger.Task{}, false, err
-	}
-	for _, task := range tasks {
-		if task.ID == id {
-			return task, true, nil
-		}
-	}
-	return ledger.Task{}, false, nil
+	return s.ledger.LoadByID(id)
 }
 
 func (s *Server) handleWorkers(w http.ResponseWriter, r *http.Request) {

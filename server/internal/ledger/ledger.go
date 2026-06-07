@@ -1,6 +1,7 @@
 package ledger
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -8,6 +9,13 @@ import (
 	"strings"
 	"sync"
 	"time"
+)
+
+var (
+	// ErrTaskExists reports an attempted insert for an existing task ID.
+	ErrTaskExists = errors.New("task ID already exists")
+	// ErrTaskNotFound reports a requested task ID that is not present.
+	ErrTaskNotFound = errors.New("task not found")
 )
 
 // Task represents a single task in the ledger.
@@ -59,6 +67,22 @@ func (l *Ledger) Load() ([]Task, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.load()
+}
+
+// LoadByID reads and returns a single task by ID.
+func (l *Ledger) LoadByID(id string) (Task, bool, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	tasks, err := l.load()
+	if err != nil {
+		return Task{}, false, err
+	}
+	for _, task := range tasks {
+		if task.ID == id {
+			return task, true, nil
+		}
+	}
+	return Task{}, false, nil
 }
 
 func (l *Ledger) load() ([]Task, error) {
@@ -187,7 +211,7 @@ func (l *Ledger) Add(task Task) error {
 	for _, t := range tasks {
 		if t.ID == task.ID {
 			l.mu.Unlock()
-			return fmt.Errorf("task ID already exists: %s", task.ID)
+			return fmt.Errorf("%w: %s", ErrTaskExists, task.ID)
 		}
 	}
 	task.UpdatedAt = time.Now().Format(time.RFC3339)
@@ -221,7 +245,7 @@ func (l *Ledger) AddAll(newTasks []Task) error {
 	for i, t := range newTasks {
 		if existing[t.ID] {
 			l.mu.Unlock()
-			return fmt.Errorf("task ID already exists: %s", t.ID)
+			return fmt.Errorf("%w: %s", ErrTaskExists, t.ID)
 		}
 		existing[t.ID] = true
 		t.UpdatedAt = now
@@ -378,7 +402,7 @@ func (l *Ledger) UpdateIfStatusesReturnPrevWith(id string, allowedStatuses []str
 	}
 	if !found {
 		l.mu.Unlock()
-		return Task{}, fmt.Errorf("task not found: %s", id)
+		return Task{}, fmt.Errorf("%w: %s", ErrTaskNotFound, id)
 	}
 	err = l.save(tasks)
 	onChange := l.onChange
@@ -417,7 +441,7 @@ func (l *Ledger) UpdateReturnPrev(id string, fields map[string]any) (prev Task, 
 	}
 	if !found {
 		l.mu.Unlock()
-		return Task{}, fmt.Errorf("task not found: %s", id)
+		return Task{}, fmt.Errorf("%w: %s", ErrTaskNotFound, id)
 	}
 	err = l.save(tasks)
 	onChange := l.onChange

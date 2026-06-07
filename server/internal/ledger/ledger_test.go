@@ -1,6 +1,7 @@
 package ledger
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -210,6 +211,29 @@ func TestUpdateUpdatesUpdatedAt(t *testing.T) {
 	}
 	if tasks[0].UpdatedAt == firstUpdatedAt {
 		t.Error("updated_at not changed after Update")
+	}
+}
+
+func TestAddDuplicateReturnsErrTaskExists(t *testing.T) {
+	dir := t.TempDir()
+	l := NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
+
+	if err := l.Add(Task{ID: "task-001", Title: "T", Status: "unstarted"}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	err := l.Add(Task{ID: "task-001", Title: "Duplicate", Status: "unstarted"})
+	if !errors.Is(err, ErrTaskExists) {
+		t.Fatalf("Add duplicate error = %v, want ErrTaskExists", err)
+	}
+}
+
+func TestUpdateMissingReturnsErrTaskNotFound(t *testing.T) {
+	dir := t.TempDir()
+	l := NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
+
+	_, err := l.UpdateReturnPrev("missing", map[string]any{"title": "Updated"})
+	if !errors.Is(err, ErrTaskNotFound) {
+		t.Fatalf("UpdateReturnPrev missing error = %v, want ErrTaskNotFound", err)
 	}
 }
 
