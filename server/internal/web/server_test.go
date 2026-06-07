@@ -627,6 +627,26 @@ func TestPatchTaskNormalizesBodyNewlines(t *testing.T) {
 	}
 }
 
+func TestPatchTaskIgnoresEmptyNaturalLanguageRequest(t *testing.T) {
+	l := newTestLedger(t)
+	if err := l.Add(ledger.Task{ID: "task-001", Title: "Old", Status: "unstarted", Body: "old body"}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	resp := performJSONRequest(New(Deps{Ledger: l, AuthDisabled: true}), http.MethodPatch, "/api/tasks/task-001", `{"request":" "}`)
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusBadRequest, resp.Body.String())
+	}
+
+	tasks, err := l.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(tasks) != 1 || tasks[0].Body != "old body" {
+		t.Fatalf("tasks = %#v, want body preserved", tasks)
+	}
+}
+
 func TestPatchRejectsEmptyTitleAndBody(t *testing.T) {
 	l := newTestLedger(t)
 	if err := l.Add(ledger.Task{ID: "task-001", Title: "Old", Status: "unstarted", Body: "old body"}); err != nil {

@@ -59,8 +59,19 @@ func (realTmux) IsPaneIdle(ctx context.Context, session, window string) (bool, e
 }
 
 type promptTask struct {
-	ledger.Task
-	Body string `json:"body,omitempty"`
+	ID             string   `json:"id"`
+	Title          string   `json:"title,omitempty"`
+	Status         string   `json:"status,omitempty"`
+	Branch         string   `json:"branch,omitempty"`
+	WorkerID       string   `json:"worker_id,omitempty"`
+	Harness        string   `json:"harness,omitempty"`
+	AllowedFiles   []string `json:"allowed_files,omitempty"`
+	ForbiddenFiles []string `json:"forbidden_files,omitempty"`
+	PrURL          string   `json:"pr_url,omitempty"`
+	MergeCommit    string   `json:"merge_commit,omitempty"`
+	Reason         string   `json:"reason,omitempty"`
+	UpdatedAt      string   `json:"updated_at,omitempty"`
+	Body           string   `json:"body,omitempty"`
 }
 
 // Orchestrator starts and queues stateless orchestrator harness runs.
@@ -581,7 +592,21 @@ func (o *Orchestrator) buildPrompt(reason string) (string, error) {
 func promptTasksFromLedger(tasks []ledger.Task) []promptTask {
 	out := make([]promptTask, len(tasks))
 	for i, task := range tasks {
-		out[i] = promptTask{Task: task, Body: task.Body}
+		out[i] = promptTask{
+			ID:             task.ID,
+			Title:          task.Title,
+			Status:         task.Status,
+			Branch:         task.Branch,
+			WorkerID:       task.WorkerID,
+			Harness:        task.Harness,
+			AllowedFiles:   task.AllowedFiles,
+			ForbiddenFiles: task.ForbiddenFiles,
+			PrURL:          task.PrURL,
+			MergeCommit:    task.MergeCommit,
+			Reason:         task.Reason,
+			UpdatedAt:      task.UpdatedAt,
+			Body:           task.Body,
+		}
 	}
 	return out
 }

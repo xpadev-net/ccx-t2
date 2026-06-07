@@ -1223,7 +1223,7 @@ func taskFromCreateRequest(req taskMutationRequest) (ledger.Task, error) {
 		task.Title = "Natural language intake"
 	}
 	if strings.TrimSpace(task.Title) == "" && strings.TrimSpace(task.Body) == "" {
-		return ledger.Task{}, fmt.Errorf("title, body, or request is required")
+		return ledger.Task{}, fmt.Errorf("title or body (or request) is required")
 	}
 	return task, nil
 }
@@ -1332,7 +1332,7 @@ func fieldsFromUpdateRequest(req taskMutationRequest) map[string]any {
 			body = strings.Trim(*req.Request, "\n")
 		}
 		fields["body"] = body
-	} else if req.Request != nil {
+	} else if req.Request != nil && strings.TrimSpace(*req.Request) != "" {
 		fields["body"] = strings.Trim(*req.Request, "\n")
 	}
 	return fields
