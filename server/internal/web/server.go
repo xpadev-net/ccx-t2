@@ -116,7 +116,7 @@ func (c defaultWorkerCleaner) CleanupWorker(ctx context.Context, task ledger.Tas
 		}
 	}
 	worktreePath := filepath.Join(c.cfg.Project.WorktreeBase, c.cfg.Project.Slug+"-"+task.ID)
-	if err := worktree.Remove(c.cfg.Project.RepoPath, worktreePath); err != nil {
+	if err := worktree.RemoveContext(ctx, c.cfg.Project.RepoPath, worktreePath); err != nil {
 		if !isMissingWorktreeError(err) {
 			errs = append(errs, fmt.Errorf("remove worktree: %w", err))
 		}
@@ -412,13 +412,6 @@ func (s *Server) deleteTask(w http.ResponseWriter, r *http.Request, id string) {
 	}
 	resp := taskDeleteResponse{Deleted: taskResponseFromLedger(task)}
 	if needsCleanup {
-		if s.cleaner == nil {
-			if _, err := s.ledger.RestoreTaskSnapshotIfCurrent(task, marker); err != nil {
-				log.Printf("web: restore after missing cleaner failed: %v", err)
-			}
-			writeError(w, http.StatusInternalServerError, "worker cleaner is not configured")
-			return
-		}
 		if err := s.cleaner.CleanupWorker(context.WithoutCancel(r.Context()), task); err != nil {
 			log.Printf("web: cleanup after task delete failed: %v", err)
 			restored, restoreErr := s.ledger.RestoreTaskSnapshotIfCurrent(task, marker)

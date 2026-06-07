@@ -1,6 +1,7 @@
 package worktree
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -32,17 +33,26 @@ func Create(repoPath, branch, worktreePath, baseRef string) error {
 // cleaning up a Worker (stop_worker, completed, split_request), at which point
 // any uncommitted changes in the worktree are intentionally discarded.
 func Remove(repoPath, worktreePath string) error {
+	return RemoveContext(context.Background(), repoPath, worktreePath)
+}
+
+// RemoveContext removes a git worktree with cancellation support.
+func RemoveContext(ctx context.Context, repoPath, worktreePath string) error {
 	if !filepath.IsAbs(repoPath) {
 		return fmt.Errorf("repoPath must be absolute, got: %s", repoPath)
 	}
 	if !filepath.IsAbs(worktreePath) {
 		return fmt.Errorf("worktreePath must be absolute, got: %s", worktreePath)
 	}
-	return run("git", "-C", repoPath, "worktree", "remove", "--force", worktreePath)
+	return runContext(ctx, "git", "-C", repoPath, "worktree", "remove", "--force", worktreePath)
 }
 
 func run(name string, args ...string) error {
-	cmd := exec.Command(name, args...)
+	return runContext(context.Background(), name, args...)
+}
+
+func runContext(ctx context.Context, name string, args ...string) error {
+	cmd := exec.CommandContext(ctx, name, args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%s %v: %w: %s", name, args, err, strings.TrimSpace(string(out)))
