@@ -564,6 +564,19 @@ func TestPatchDeletingTaskRejectedDuringCleanup(t *testing.T) {
 	}
 }
 
+func TestDeletingMarkerWithNanoTimestampIsFresh(t *testing.T) {
+	now := time.Date(2026, 6, 7, 12, 0, 0, 123456789, time.UTC)
+	task := ledger.Task{
+		ID:        "task-001",
+		Status:    "deleting",
+		UpdatedAt: now.Format(time.RFC3339Nano),
+	}
+
+	if taskNeedsDeleteCleanup(task, now.Add(time.Minute)) {
+		t.Fatal("taskNeedsDeleteCleanup = true, want fresh deleting marker to be pending")
+	}
+}
+
 func TestDeleteStaleDeletingTaskRetriesCleanup(t *testing.T) {
 	l := newTestLedger(t)
 	task := ledger.Task{

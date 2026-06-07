@@ -473,7 +473,7 @@ func deletingMarkerExpired(updatedAt string, now time.Time) bool {
 	if updatedAt == "" {
 		return true
 	}
-	ts, err := time.Parse(time.RFC3339, updatedAt)
+	ts, err := time.Parse(time.RFC3339Nano, updatedAt)
 	if err != nil {
 		return true
 	}
