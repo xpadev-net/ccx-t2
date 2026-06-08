@@ -118,8 +118,7 @@ function App() {
   const [title, setTitle] = useState("");
   const [body, setBody] = useState("");
   const [status, setStatus] = useState("unstarted");
-  const [newTitle, setNewTitle] = useState("");
-  const [newBody, setNewBody] = useState("");
+  const [newRequest, setNewRequest] = useState("");
   const [token, setToken] = useState(() => initialToken());
   const [tokenDraft, setTokenDraft] = useState(() => initialToken());
   const [workers, setWorkers] = useState<WorkerInfo[]>([]);
@@ -422,6 +421,10 @@ function App() {
 
   async function createTask(event: FormEvent) {
     event.preventDefault();
+    const request = newRequest.trim();
+    if (!request) {
+      return;
+    }
     setSaving(true);
     setError("");
     setMessage("");
@@ -431,15 +434,12 @@ function App() {
         {
           method: "POST",
           body: JSON.stringify({
-            title: newTitle,
-            body: newBody,
-            status: "unstarted"
+            request
           })
         },
         token
       );
-      setNewTitle("");
-      setNewBody("");
+      setNewRequest("");
       setMessage(
         response.trigger_error
           ? "Task created; orchestrator trigger failed."
@@ -797,16 +797,17 @@ function App() {
             <span>Orchestrator trigger</span>
           </div>
           <form onSubmit={createTask} className="form-grid">
-            <label>
-              Title
-              <input value={newTitle} onChange={(event) => setNewTitle(event.target.value)} />
-            </label>
             <label className="wide">
-              Body
-              <textarea value={newBody} onChange={(event) => setNewBody(event.target.value)} />
+              Request
+              <textarea
+                className="natural-request"
+                value={newRequest}
+                onChange={(event) => setNewRequest(event.target.value)}
+                placeholder="Describe the task in your own words"
+              />
             </label>
             <div className="actions wide">
-              <button type="submit" disabled={saving || (!newTitle.trim() && !newBody.trim())}>
+              <button type="submit" disabled={saving || !newRequest.trim()}>
                 Create
               </button>
             </div>

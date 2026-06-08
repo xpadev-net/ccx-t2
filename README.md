@@ -156,7 +156,7 @@ MCP 向け:
 自然文 intake は `Natural language intake` の仮タイトルで台帳に保存され、Orchestrator が
 コードベースを調査してから MCP の `update_task` / `create_task` / `split_task` /
 `archive_task` で調査結果、実装範囲、禁止範囲、検証方法、または不足情報を明記します。
-既存の Add Task UI は同じ backend API に `body` を送っているため、この経路では追加 UI 変更は不要です。
+Web UI の Add Task は自然文入力を `request` として同じ backend API に送ります。
 
 詳細な要件は [docs/requirements.md](docs/requirements.md)、実装の段階計画は
 [docs/implementation-plan.md](docs/implementation-plan.md) を参照してください。自然文投入から
