@@ -159,7 +159,9 @@ MCP 向け:
 既存の Add Task UI は同じ backend API に `body` を送っているため、この経路では追加 UI 変更は不要です。
 
 詳細な要件は [docs/requirements.md](docs/requirements.md)、実装の段階計画は
-[docs/implementation-plan.md](docs/implementation-plan.md) を参照してください。
+[docs/implementation-plan.md](docs/implementation-plan.md) を参照してください。自然文投入から
+PR マージ後の完了通知までの受け入れ確認は
+[docs/acceptance-scenario.md](docs/acceptance-scenario.md) にまとめています。
 
 ## ライセンス
 
