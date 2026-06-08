@@ -439,6 +439,10 @@ textarea {
   resize: vertical;
 }
 
+.natural-request {
+  min-height: 140px;
+}
+
 .wide,
 .actions,
 .metadata {
