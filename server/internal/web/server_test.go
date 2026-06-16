@@ -1700,6 +1700,25 @@ func TestWebSocketAllowsSameOrigin(t *testing.T) {
 	conn.Close()
 }
 
+func TestWebSocketAllowsSameOriginBehindTLSProxy(t *testing.T) {
+	server := httptest.NewServer(New(Deps{
+		Config:       testConfig(),
+		AuthDisabled: true,
+	}))
+	defer server.Close()
+	host := strings.TrimPrefix(server.URL, "http://")
+	header := http.Header{
+		"Origin":            []string{"https://" + host},
+		"X-Forwarded-Proto": []string{"https"},
+	}
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(server.URL, "/ws/ledger"), header)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	conn.Close()
+}
+
 func TestWebSocketAllowsConfiguredOrigin(t *testing.T) {
 	server := httptest.NewServer(New(Deps{
 		Config:         testConfig(),

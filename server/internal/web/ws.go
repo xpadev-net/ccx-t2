@@ -223,10 +223,25 @@ func (s *Server) isAllowedWSOrigin(r *http.Request) bool {
 }
 
 func requestScheme(r *http.Request) string {
+	if proto := forwardedProto(r.Header.Get("X-Forwarded-Proto")); proto != "" {
+		return proto
+	}
 	if r.TLS != nil {
 		return "https"
 	}
 	return "http"
+}
+
+func forwardedProto(header string) string {
+	proto, _, _ := strings.Cut(header, ",")
+	proto = strings.TrimSpace(proto)
+	if strings.EqualFold(proto, "http") {
+		return "http"
+	}
+	if strings.EqualFold(proto, "https") {
+		return "https"
+	}
+	return ""
 }
 
 func writeWSJSON(conn *websocket.Conn, msg wsMessage) error {
