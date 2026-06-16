@@ -100,6 +100,12 @@ type ConfigDraft = {
   githubRepo: string;
 };
 
+type TaskEditorDirty = {
+  title: boolean;
+  body: boolean;
+  status: boolean;
+};
+
 type HarnessInfo = {
   name: string;
   available: boolean;
@@ -139,8 +145,11 @@ function App() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState("");
+  const [warning, setWarning] = useState("");
   const [error, setError] = useState("");
   const settingsDirtyRef = useRef(false);
+  const taskEditorDirtyRef = useRef<TaskEditorDirty>(emptyTaskEditorDirty());
+  const taskEditorTaskIDRef = useRef("");
 
   const selectedTask = useMemo(
     () => tasks.find((task) => task.id === selectedID) ?? tasks[0],
@@ -186,8 +195,7 @@ function App() {
       try {
         const msg = JSON.parse(String(event.data)) as { type?: string };
         if (msg.type === "ledger_changed") {
-          void refreshTasks(false);
-          void refreshWorkers();
+          void refreshProjectData(false);
         }
       } catch {
         // Ignore malformed websocket messages; the next manual refresh will recover.
@@ -334,16 +342,39 @@ function App() {
       setTitle("");
       setBody("");
       setStatus("unstarted");
+      taskEditorTaskIDRef.current = "";
+      clearTaskEditorDirty();
       return;
     }
+    const taskChanged = taskEditorTaskIDRef.current !== selectedTask.id;
     setSelectedID(selectedTask.id);
-    setTitle(selectedTask.title ?? "");
-    setBody(selectedTask.body ?? "");
-    setStatus(selectedTask.status || "unstarted");
+    if (taskChanged) {
+      taskEditorTaskIDRef.current = selectedTask.id;
+      setTitle(selectedTask.title ?? "");
+      setBody(selectedTask.body ?? "");
+      setStatus(selectedTask.status || "unstarted");
+      clearTaskEditorDirty();
+      return;
+    }
+    const dirty = taskEditorDirtyRef.current;
+    if (!dirty.title) {
+      setTitle(selectedTask.title ?? "");
+    }
+    if (!dirty.body) {
+      setBody(selectedTask.body ?? "");
+    }
+    if (!dirty.status) {
+      setStatus(selectedTask.status || "unstarted");
+    }
   }, [selectedTask?.id, selectedTask?.title, selectedTask?.body, selectedTask?.status]);
 
-  async function refreshTasks(showLoading = true, authToken = token) {
-    if (!selectedProjectSlug) {
+  async function refreshTasks(
+    showLoading = true,
+    authToken = token,
+    projectSlug = selectedProjectSlug,
+    rethrowErrors = false
+  ) {
+    if (!projectSlug) {
       setTasks([]);
       setSelectedID("");
       setLoading(false);
@@ -354,43 +385,62 @@ function App() {
     }
     setError("");
     try {
-      const data = await api<Task[]>(tasksPath(selectedProjectSlug), {}, authToken);
+      const data = await api<Task[]>(tasksPath(projectSlug), {}, authToken);
       setTasks(data);
       setSelectedID((current) => (data.some((task) => task.id === current) ? current : data[0]?.id || ""));
     } catch (err) {
       setError(errorMessage(err));
+      if (rethrowErrors) {
+        throw err;
+      }
     } finally {
       setLoading(false);
     }
   }
 
-  async function refreshWorkers(authToken = token) {
-    if (!selectedProjectSlug) {
+  async function refreshWorkers(authToken = token, projectSlug = selectedProjectSlug, rethrowErrors = false) {
+    if (!projectSlug) {
       setWorkers([]);
       setSelectedWorkerID("");
       return;
     }
     try {
-      const data = await api<WorkerInfo[]>(workersPath(selectedProjectSlug), {}, authToken);
+      const data = await api<WorkerInfo[]>(workersPath(projectSlug), {}, authToken);
       setWorkers(data);
       setSelectedWorkerID((current) =>
         data.some((worker) => worker.worker_id === current) ? current : data[0]?.worker_id || ""
       );
     } catch (err) {
       setError(errorMessage(err));
+      if (rethrowErrors) {
+        throw err;
+      }
     }
   }
 
   async function refreshAll(showLoading = true, authToken = token, replaceSettingsDraft = false) {
-    await refreshSettings(authToken, replaceSettingsDraft);
-    await refreshProjectData(showLoading, authToken);
+    const projectSlug = await refreshSettings(authToken, replaceSettingsDraft);
+    await refreshProjectData(showLoading, authToken, projectSlug);
   }
 
-  async function refreshProjectData(showLoading = true, authToken = token) {
-    await Promise.all([refreshTasks(showLoading, authToken), refreshWorkers(authToken)]);
+  async function refreshProjectData(
+    showLoading = true,
+    authToken = token,
+    projectSlug = selectedProjectSlug,
+    rethrowErrors = false
+  ) {
+    await Promise.all([
+      refreshTasks(showLoading, authToken, projectSlug, rethrowErrors),
+      refreshWorkers(authToken, projectSlug, rethrowErrors)
+    ]);
   }
 
-  async function refreshSettings(authToken = token, replaceDraft = false) {
+  async function refreshSettings(
+    authToken = token,
+    replaceDraft = false,
+    preferredProjectSlug = "",
+    rethrowErrors = false
+  ) {
     setSettingsLoading(true);
     try {
       const [configData, harnessData, projectData] = await Promise.all([
@@ -400,11 +450,9 @@ function App() {
       ]);
       setConfig(configData);
       setProjects(projectData);
+      const normalizedProjectSlug = normalizedProjectSelection(projectData, selectedProjectSlug, preferredProjectSlug);
       setSelectedProjectSlug((current) => {
-        if (projectData.some((project) => project.slug === current)) {
-          return current;
-        }
-        return projectData[0]?.slug || "";
+        return normalizedProjectSelection(projectData, current, preferredProjectSlug);
       });
       if (replaceDraft || !settingsDirtyRef.current) {
         setConfigDraft(configToDraft(configData));
@@ -412,8 +460,13 @@ function App() {
         setSettingsDirty(false);
       }
       setHarnesses(harnessData);
+      return normalizedProjectSlug;
     } catch (err) {
       setError(errorMessage(err));
+      if (rethrowErrors) {
+        throw err;
+      }
+      return selectedProjectSlug;
     } finally {
       setSettingsLoading(false);
     }
@@ -428,6 +481,7 @@ function App() {
     setSaving(true);
     setError("");
     setMessage("");
+    setWarning("");
     try {
       const response = await api<TaskCreateResponse>(
         tasksPath(selectedProjectSlug),
@@ -440,11 +494,13 @@ function App() {
         token
       );
       setNewRequest("");
-      setMessage(
-        response.trigger_error
-          ? "Task created; orchestrator trigger failed."
-          : "Task created and orchestrator notified."
-      );
+      if (response.trigger_error) {
+        setWarning(`Task created; orchestrator trigger failed: ${response.trigger_error}`);
+      } else if (!response.orchestrator_triggered) {
+        setWarning("Task created; orchestrator was not triggered.");
+      } else {
+        setMessage("Task created and orchestrator notified.");
+      }
       await refreshAll(false);
       setSelectedID(response.task.id);
     } catch (err) {
@@ -462,6 +518,7 @@ function App() {
     setSaving(true);
     setError("");
     setMessage("");
+    setWarning("");
     try {
       await api<Task>(
         taskPath(selectedProjectSlug, selectedTask.id),
@@ -472,6 +529,7 @@ function App() {
         token
       );
       setMessage("Task updated.");
+      clearTaskEditorDirty();
       await refreshTasks(false);
     } catch (err) {
       setError(errorMessage(err));
@@ -487,6 +545,7 @@ function App() {
     setSaving(true);
     setError("");
     setMessage("");
+    setWarning("");
     try {
       const response = await api<TaskDeleteResponse>(
         taskPath(selectedProjectSlug, selectedTask.id),
@@ -494,9 +553,9 @@ function App() {
         token
       );
       if (response.cleanup_error) {
-        setMessage("Delete requested; worker cleanup needs retry.");
+        setWarning(`Delete requested; worker cleanup needs retry: ${response.cleanup_error}`);
       } else if (response.delete_pending) {
-        setMessage("Delete is already in progress.");
+        setWarning("Delete is already in progress.");
       } else {
         setMessage("Task deleted.");
       }
@@ -517,6 +576,7 @@ function App() {
     setFollowupSending(true);
     setError("");
     setMessage("");
+    setWarning("");
     try {
       const response = await api<WorkerFollowupResponse>(
         workerFollowupPath(selectedProjectSlug, selectedWorker.worker_id),
@@ -540,6 +600,7 @@ function App() {
     setSaving(true);
     setError("");
     setMessage("");
+    setWarning("");
     try {
       const updated = await api<ConfigResponse>(
         "/api/config",
@@ -549,12 +610,10 @@ function App() {
         },
         token
       );
-      const harnessData = await api<HarnessInfo[]>("/api/harnesses", {}, token);
-      setConfig(updated);
-      setConfigDraft(configToDraft(updated));
       settingsDirtyRef.current = false;
       setSettingsDirty(false);
-      setHarnesses(harnessData);
+      const projectSlug = await refreshSettings(token, true, updated.project.slug, true);
+      await refreshProjectData(false, token, projectSlug, true);
       setMessage("Settings updated.");
     } catch (err) {
       setError(errorMessage(err));
@@ -568,11 +627,13 @@ function App() {
     const repoPath = newProjectRepoPath.trim();
     if (!slug || !repoPath) {
       setError("Project slug and repository path are required.");
+      setWarning("");
       return;
     }
     setSaving(true);
     setError("");
     setMessage("");
+    setWarning("");
     try {
       await api<ProjectInfo>(
         "/api/projects",
@@ -605,6 +666,7 @@ function App() {
     setSaving(true);
     setError("");
     setMessage("");
+    setWarning("");
     try {
       await api<{ status: string }>(`/api/projects/${encodeURIComponent(slug)}`, { method: "DELETE" }, token);
       setTasks([]);
@@ -637,6 +699,21 @@ function App() {
     setConfigDraft((current) => ({ ...current, ...patch }));
   }
 
+  function updateTaskTitle(value: string) {
+    setTitle(value);
+    markTaskEditorDirty("title");
+  }
+
+  function updateTaskBody(value: string) {
+    setBody(value);
+    markTaskEditorDirty("body");
+  }
+
+  function updateTaskStatus(value: string) {
+    setStatus(value);
+    markTaskEditorDirty("status");
+  }
+
   function updateHarnessCommand(name: string, command: string) {
     markSettingsDirty();
     setConfigDraft((current) => ({
@@ -651,6 +728,17 @@ function App() {
   function markSettingsDirty() {
     settingsDirtyRef.current = true;
     setSettingsDirty(true);
+  }
+
+  function markTaskEditorDirty(field: keyof TaskEditorDirty) {
+    taskEditorDirtyRef.current = {
+      ...taskEditorDirtyRef.current,
+      [field]: true
+    };
+  }
+
+  function clearTaskEditorDirty() {
+    taskEditorDirtyRef.current = emptyTaskEditorDirty();
   }
 
   return (
@@ -669,6 +757,7 @@ function App() {
 
       <section className="notice-row" aria-live="polite">
         {error && <div className="notice error">{error}</div>}
+        {warning && <div className="notice warning">{warning}</div>}
         {message && <div className="notice success">{message}</div>}
       </section>
 
@@ -762,11 +851,11 @@ function App() {
           <form onSubmit={saveTask} className="form-grid">
             <label>
               Title
-              <input value={title} onChange={(event) => setTitle(event.target.value)} disabled={!selectedTask} />
+              <input value={title} onChange={(event) => updateTaskTitle(event.target.value)} disabled={!selectedTask} />
             </label>
             <label>
               Status
-              <select value={status} onChange={(event) => setStatus(event.target.value)} disabled={!selectedTask}>
+              <select value={status} onChange={(event) => updateTaskStatus(event.target.value)} disabled={!selectedTask}>
                 {statusOptions.map((option) => (
                   <option key={option} value={option}>
                     {option}
@@ -776,7 +865,7 @@ function App() {
             </label>
             <label className="wide">
               Body
-              <textarea value={body} onChange={(event) => setBody(event.target.value)} disabled={!selectedTask} />
+              <textarea value={body} onChange={(event) => updateTaskBody(event.target.value)} disabled={!selectedTask} />
             </label>
             {selectedTask?.branch && <div className="metadata">Branch: {selectedTask.branch}</div>}
             {selectedTask?.reason && <div className="metadata">Reason: {selectedTask.reason}</div>}
@@ -1082,6 +1171,14 @@ function emptyConfigDraft(): ConfigDraft {
   };
 }
 
+function emptyTaskEditorDirty(): TaskEditorDirty {
+  return {
+    title: false,
+    body: false,
+    status: false
+  };
+}
+
 function configToDraft(config: ConfigResponse): ConfigDraft {
   return {
     projectSlug: config.project.slug,
@@ -1135,6 +1232,16 @@ function configPatchFromDraft(draft: ConfigDraft) {
       repo: draft.githubRepo
     }
   };
+}
+
+function normalizedProjectSelection(projects: ProjectInfo[], currentSlug: string, preferredSlug = "") {
+  if (preferredSlug && projects.some((project) => project.slug === preferredSlug)) {
+    return preferredSlug;
+  }
+  if (projects.some((project) => project.slug === currentSlug)) {
+    return currentSlug;
+  }
+  return projects[0]?.slug || "";
 }
 
 function tasksPath(projectSlug: string) {
