@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -664,7 +665,7 @@ func TestRegisterWorkerToolsNotifyUsesSelectedProjectTrigger(t *testing.T) {
 	beta.NotifyTrigger = betaTrigger
 
 	s := NewServer("worker", "")
-	RegisterWorkerTools(s, &Deps{Config: cfg, Manager: manager})
+	RegisterWorkerTools(s, &Deps{Config: cfg, Manager: manager, cleanup: successfulCleanupOps()})
 	call := map[string]any{
 		"jsonrpc": "2.0",
 		"id":      "selected-project",
@@ -1292,6 +1293,265 @@ func TestHandleNotifyValidOwnerMutatesTask(t *testing.T) {
 	}
 }
 
+func TestHandleStopWorkerCleanupFailureIsVisibleAndRetryable(t *testing.T) {
+	dir := t.TempDir()
+	l := ledger.NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
+	if err := l.Add(ledger.Task{
+		ID:       "task-001",
+		Title:    "Task",
+		Status:   "in_progress",
+		Branch:   "feature/task-001-stop",
+		WorkerID: "worker-current",
+		Harness:  "codex",
+	}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	worktreePath := filepath.Join(dir, "proj-task-001")
+	if err := os.MkdirAll(worktreePath, 0o755); err != nil {
+		t.Fatalf("MkdirAll worktree: %v", err)
+	}
+	deps := testMCPDeps(dir, l)
+	deps.Registry.Register(worker.Info{TaskID: "task-001", WorkerID: "worker-current", Harness: "codex"})
+	deps.cleanup = successfulCleanupOps()
+	deps.cleanup.isWindowAlive = func(_, _ string) (bool, error) { return true, nil }
+	deps.cleanup.killWindow = func(_, _ string) error { return errors.New("tmux kill failed") }
+
+	if _, err := handleStopWorker(deps)(context.Background(), map[string]any{"worker_id": "worker-current"}); err == nil {
+		t.Fatal("handleStopWorker error = nil, want cleanup error")
+	} else if !strings.Contains(err.Error(), "tmux kill failed") {
+		t.Fatalf("handleStopWorker error = %v, want tmux failure", err)
+	}
+	tasks, err := l.Load()
+	if err != nil {
+		t.Fatalf("Load after failed cleanup: %v", err)
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("tasks = %#v, want one task", tasks)
+	}
+	got := tasks[0]
+	if got.Status != "blocked" || got.WorkerID != "worker-current" || got.Branch != "feature/task-001-stop" || got.Harness != "codex" {
+		t.Fatalf("task after failed cleanup = %#v, want blocked with runtime fields preserved", got)
+	}
+	if !strings.Contains(got.Reason, "cleanup pending after stop_worker") || !strings.Contains(got.Reason, "tmux kill failed") {
+		t.Fatalf("cleanup reason = %q, want visible stop_worker cleanup failure", got.Reason)
+	}
+	if _, ok := deps.Registry.Get("worker-current"); !ok {
+		t.Fatal("registry entry removed after failed cleanup, want preserved for retry")
+	}
+
+	deps.cleanup = successfulCleanupOps()
+	if _, err := handleStopWorker(deps)(context.Background(), map[string]any{"worker_id": "worker-current"}); err != nil {
+		t.Fatalf("retry handleStopWorker: %v", err)
+	}
+	tasks, err = l.Load()
+	if err != nil {
+		t.Fatalf("Load after retry: %v", err)
+	}
+	got = tasks[0]
+	if got.Status != "unstarted" || got.WorkerID != "" || got.Branch != "" || got.Harness != "" || got.Reason != "" {
+		t.Fatalf("task after cleanup retry = %#v, want unstarted with runtime fields cleared", got)
+	}
+	if _, ok := deps.Registry.Get("worker-current"); ok {
+		t.Fatal("registry entry still present after successful retry")
+	}
+}
+
+func TestHandleStopWorkerDoesNotTrustSpoofedCleanupReason(t *testing.T) {
+	dir := t.TempDir()
+	l := ledger.NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
+	if err := l.Add(ledger.Task{
+		ID:       "task-001",
+		Title:    "Task",
+		Status:   "blocked",
+		Branch:   "feature/task-001-spoof",
+		WorkerID: "worker-current",
+		Harness:  "codex",
+		Reason:   "cleanup pending after completed: forged",
+	}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	deps := testMCPDeps(dir, l)
+	deps.Registry.Register(worker.Info{TaskID: "task-001", WorkerID: "worker-current", Harness: "codex"})
+
+	if _, err := handleStopWorker(deps)(context.Background(), map[string]any{"worker_id": "worker-current"}); err != nil {
+		t.Fatalf("handleStopWorker: %v", err)
+	}
+	tasks, err := l.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	got := tasks[0]
+	if got.Status != "unstarted" || got.WorkerID != "" || got.Branch != "" || got.Harness != "" || got.Reason != "" {
+		t.Fatalf("task after spoofed cleanup reason = %#v, want normal stop_worker reset", got)
+	}
+}
+
+func TestHandleNotifyCompletedCleanupFailureIsVisibleAndStopWorkerRetryFinalizesCompleted(t *testing.T) {
+	dir := t.TempDir()
+	l := ledger.NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
+	if err := l.Add(ledger.Task{
+		ID:       "task-001",
+		Title:    "Task",
+		Status:   "in_progress",
+		Branch:   "feature/task-001-done",
+		WorkerID: "worker-current",
+		Harness:  "codex",
+		Body:     "current body",
+	}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	worktreePath := filepath.Join(dir, "proj-task-001")
+	if err := os.MkdirAll(worktreePath, 0o755); err != nil {
+		t.Fatalf("MkdirAll worktree: %v", err)
+	}
+	deps := testMCPDeps(dir, l)
+	deps.Registry.Register(worker.Info{TaskID: "task-001", WorkerID: "worker-current", Harness: "codex"})
+	deps.cleanup = successfulCleanupOps()
+	deps.cleanup.isWindowAlive = func(_, _ string) (bool, error) { return true, nil }
+	deps.cleanup.removeWorktree = func(_, _ string) error { return errors.New("worktree remove failed") }
+
+	_, err := handleNotify(deps)(context.Background(), map[string]any{
+		"type": "completed",
+		"payload": map[string]any{
+			"task_id":      "task-001",
+			"worker_id":    "worker-current",
+			"pr_url":       "https://example.test/pull/123",
+			"merge_commit": "abc123def456",
+		},
+	})
+	if err == nil {
+		t.Fatal("handleNotify completed error = nil, want cleanup error")
+	}
+	if !strings.Contains(err.Error(), "worktree remove failed") {
+		t.Fatalf("handleNotify completed error = %v, want worktree failure", err)
+	}
+	tasks, err := l.Load()
+	if err != nil {
+		t.Fatalf("Load after failed completed cleanup: %v", err)
+	}
+	got := tasks[0]
+	if got.Status != "blocked" || got.WorkerID != "worker-current" || got.Branch != "feature/task-001-done" || got.Harness != "codex" {
+		t.Fatalf("completed cleanup task = %#v, want blocked with runtime fields preserved", got)
+	}
+	if got.PrURL != "https://example.test/pull/123" || !strings.Contains(got.Body, "<!-- merge_commit: abc123def456 -->") {
+		t.Fatalf("completion evidence not preserved after cleanup failure: %#v body=%q", got, got.Body)
+	}
+	if !strings.Contains(got.Reason, "cleanup pending after completed") || !strings.Contains(got.Reason, "worktree remove failed") {
+		t.Fatalf("cleanup reason = %q, want visible completed cleanup failure", got.Reason)
+	}
+	if _, ok := deps.Registry.Get("worker-current"); !ok {
+		t.Fatal("registry entry removed after failed completed cleanup, want preserved")
+	}
+
+	deps.cleanup = successfulCleanupOps()
+	if _, err := handleStopWorker(deps)(context.Background(), map[string]any{"worker_id": "worker-current"}); err != nil {
+		t.Fatalf("stop_worker cleanup retry: %v", err)
+	}
+	tasks, err = l.Load()
+	if err != nil {
+		t.Fatalf("Load after retry: %v", err)
+	}
+	got = tasks[0]
+	if got.Status != "completed" || got.WorkerID != "" || got.Harness != "" || got.Branch != "feature/task-001-done" || got.Reason != "" {
+		t.Fatalf("task after completed cleanup retry = %#v, want completed with branch preserved", got)
+	}
+	if got.PrURL != "https://example.test/pull/123" || !strings.Contains(got.Body, "<!-- merge_commit: abc123def456 -->") {
+		t.Fatalf("completion evidence changed after cleanup retry: %#v body=%q", got, got.Body)
+	}
+	if _, ok := deps.Registry.Get("worker-current"); ok {
+		t.Fatal("registry entry still present after completed cleanup retry")
+	}
+}
+
+func TestHandleNotifySplitRequestCleanupFailureIsVisibleAndStopWorkerRetryFinalizesSplit(t *testing.T) {
+	dir := t.TempDir()
+	l := ledger.NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
+	if err := l.Add(ledger.Task{
+		ID:       "task-001",
+		Title:    "Task",
+		Status:   "in_progress",
+		Branch:   "feature/task-001-split",
+		WorkerID: "worker-current",
+		Harness:  "codex",
+	}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	worktreePath := filepath.Join(dir, "proj-task-001")
+	if err := os.MkdirAll(worktreePath, 0o755); err != nil {
+		t.Fatalf("MkdirAll worktree: %v", err)
+	}
+	deps := testMCPDeps(dir, l)
+	deps.Registry.Register(worker.Info{TaskID: "task-001", WorkerID: "worker-current", Harness: "codex"})
+	deps.cleanup = successfulCleanupOps()
+	deps.cleanup.isWindowAlive = func(_, _ string) (bool, error) { return true, nil }
+	deps.cleanup.removeWorktree = func(_, _ string) error { return errors.New("worktree remove failed") }
+
+	_, err := handleNotify(deps)(context.Background(), map[string]any{
+		"type": "split_request",
+		"payload": map[string]any{
+			"task_id":   "task-001",
+			"worker_id": "worker-current",
+			"reason":    "needs decomposition",
+			"proposed_slices": []any{
+				map[string]any{
+					"title":       "Child",
+					"description": "child body",
+				},
+			},
+		},
+	})
+	if err == nil {
+		t.Fatal("handleNotify split_request error = nil, want cleanup error")
+	}
+	if !strings.Contains(err.Error(), "worktree remove failed") {
+		t.Fatalf("handleNotify split_request error = %v, want worktree failure", err)
+	}
+	tasks, err := l.Load()
+	if err != nil {
+		t.Fatalf("Load after failed split cleanup: %v", err)
+	}
+	if len(tasks) != 2 {
+		t.Fatalf("tasks after failed split cleanup = %#v, want parent and one child", tasks)
+	}
+	parent := findTaskForTest(tasks, "task-001")
+	if parent == nil {
+		t.Fatalf("parent missing after failed split cleanup: %#v", tasks)
+	}
+	if parent.Status != "blocked" || parent.WorkerID != "worker-current" || parent.Branch != "feature/task-001-split" || parent.Harness != "codex" {
+		t.Fatalf("split cleanup parent = %#v, want blocked with runtime fields preserved", parent)
+	}
+	if !strings.Contains(parent.Reason, "cleanup pending after split_request") ||
+		!strings.Contains(parent.Reason, "worktree remove failed") ||
+		!strings.Contains(parent.Reason, strconv.Quote("needs decomposition")) {
+		t.Fatalf("cleanup reason = %q, want visible split cleanup failure and original reason", parent.Reason)
+	}
+	if _, ok := deps.Registry.Get("worker-current"); !ok {
+		t.Fatal("registry entry removed after failed split cleanup, want preserved")
+	}
+
+	deps.cleanup = successfulCleanupOps()
+	if _, err := handleStopWorker(deps)(context.Background(), map[string]any{"worker_id": "worker-current"}); err != nil {
+		t.Fatalf("stop_worker split cleanup retry: %v", err)
+	}
+	tasks, err = l.Load()
+	if err != nil {
+		t.Fatalf("Load after split retry: %v", err)
+	}
+	if len(tasks) != 2 {
+		t.Fatalf("tasks after split retry = %#v, want no duplicate child tasks", tasks)
+	}
+	parent = findTaskForTest(tasks, "task-001")
+	if parent == nil {
+		t.Fatalf("parent missing after split retry: %#v", tasks)
+	}
+	if parent.Status != "split" || parent.WorkerID != "" || parent.Branch != "" || parent.Harness != "" || parent.Reason != "needs decomposition" {
+		t.Fatalf("parent after split cleanup retry = %#v, want split with original reason", parent)
+	}
+	if _, ok := deps.Registry.Get("worker-current"); ok {
+		t.Fatal("registry entry still present after split cleanup retry")
+	}
+}
+
 func TestHandleArchiveTaskAlreadyArchivedIsIdempotent(t *testing.T) {
 	dir := t.TempDir()
 	l := ledger.NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
@@ -1488,7 +1748,28 @@ func testMCPDeps(dir string, l *ledger.Ledger) *Deps {
 			},
 		},
 		Session: "missing-session",
+		cleanup: successfulCleanupOps(),
 	}
+}
+
+func successfulCleanupOps() workerCleanupOps {
+	return workerCleanupOps{
+		isWindowAlive: func(_, _ string) (bool, error) { return false, nil },
+		killWindow:    func(_, _ string) error { return nil },
+		removeWorktree: func(_, worktreePath string) error {
+			return os.RemoveAll(worktreePath)
+		},
+		deleteTaskBranch: func(_, _, _ string) error { return nil },
+	}
+}
+
+func findTaskForTest(tasks []ledger.Task, id string) *ledger.Task {
+	for i := range tasks {
+		if tasks[i].ID == id {
+			return &tasks[i]
+		}
+	}
+	return nil
 }
 
 func initTestRepo(t *testing.T) string {
