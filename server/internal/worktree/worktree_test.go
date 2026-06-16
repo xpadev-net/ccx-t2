@@ -116,6 +116,19 @@ func TestEnsureBranchCreationSafeRejectsRemoteBranchAsPullRequestRisk(t *testing
 	}
 }
 
+func TestEnsureBranchCreationSafeReportsOriginUnavailable(t *testing.T) {
+	repoPath := initRepo(t)
+	runGit(t, repoPath, "remote", "add", "origin", filepath.Join(t.TempDir(), "missing.git"))
+
+	err := EnsureBranchCreationSafe(repoPath, "feature/task-001")
+	if !errors.Is(err, ErrOriginUnavailable) {
+		t.Fatalf("EnsureBranchCreationSafe(missing origin) error = %v, want ErrOriginUnavailable", err)
+	}
+	if branchExists(t, repoPath, "feature/task-001") {
+		t.Fatal("feature/task-001 was created, want only preflight validation")
+	}
+}
+
 func TestDeleteTaskBranchIfSafeDeletesLocalOnlyWorkerBranch(t *testing.T) {
 	repoPath := initRepo(t)
 	runGit(t, repoPath, "branch", "feature/task-001")
