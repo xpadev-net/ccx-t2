@@ -34,6 +34,8 @@ type Deps struct {
 	BaseURL     string            // e.g. "http://localhost:8080"
 	Manager     *runtimepkg.Manager
 	ProjectSlug string
+
+	notifyAfterOwnershipPreflight func()
 }
 
 // RegisterOrchestratorTools registers the Orchestrator tools on s.
@@ -173,10 +175,6 @@ func RegisterWorkerTools(s *Server, deps *Deps) {
 		}, []string{"type", "payload"}),
 	}, handleNotify(deps))
 }
-
-// notifyAfterOwnershipPreflightForTest lets tests exercise races between the
-// initial ownership preflight and the ledger-locked update.
-var notifyAfterOwnershipPreflightForTest func()
 
 // ---- handler implementations ----
 
@@ -892,8 +890,8 @@ func handleNotify(deps *Deps) ToolHandler {
 			return nil, fmt.Errorf("worker %q is not assigned to task %s (assigned to %q)",
 				callerWorkerID, taskID, task.WorkerID)
 		}
-		if notifyAfterOwnershipPreflightForTest != nil {
-			notifyAfterOwnershipPreflightForTest()
+		if toolDeps.notifyAfterOwnershipPreflight != nil {
+			toolDeps.notifyAfterOwnershipPreflight()
 		}
 		// Validate the notify type before the status early-return so an unknown
 		// type always returns an error, even for non-active tasks.
@@ -1081,13 +1079,15 @@ func handleNotify(deps *Deps) ToolHandler {
 				}
 			}
 			if err := toolDeps.Ledger.AddAll(childTasks); err != nil {
-				_, _ = toolDeps.Ledger.UpdateIfStatusesReturnPrev(taskID, []string{"split"}, map[string]any{
+				if _, rollbackErr := toolDeps.Ledger.UpdateIfStatusesReturnPrev(taskID, []string{"split"}, map[string]any{
 					"status":    prevTask.Status,
 					"worker_id": prevTask.WorkerID,
 					"branch":    prevTask.Branch,
 					"harness":   prevTask.Harness,
 					"reason":    prevTask.Reason,
-				})
+				}); rollbackErr != nil {
+					log.Printf("warn: split_request rollback failed for task %s after child creation error: %v", taskID, rollbackErr)
+				}
 				return nil, err
 			}
 

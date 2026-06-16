@@ -830,16 +830,13 @@ func testHandleNotifyRejectsStaleWorkerID(t *testing.T, notifyType string, extra
 		Session: "missing-session",
 	}
 
-	notifyAfterOwnershipPreflightForTest = func() {
+	deps.notifyAfterOwnershipPreflight = func() {
 		if _, err := l.UpdateIfStatusesReturnPrev("task-001", []string{"in_progress", "blocked"}, map[string]any{
 			"worker_id": "worker-new",
 		}); err != nil {
 			t.Fatalf("stale worker setup update: %v", err)
 		}
 	}
-	defer func() {
-		notifyAfterOwnershipPreflightForTest = nil
-	}()
 
 	payload := map[string]any{
 		"task_id":   "task-001",
