@@ -326,10 +326,13 @@ function App() {
       }
       return;
     }
-    if (showLoading && isCurrentRefresh(projectSlug, authToken)) {
+    const currentRefresh = isCurrentRefresh(projectSlug, authToken);
+    if (showLoading && currentRefresh) {
       setLoading(true);
     }
-    setError("");
+    if (currentRefresh) {
+      setError("");
+    }
     try {
       const data = await api<Task[]>(tasksPath(projectSlug), {}, authToken);
       if (!isCurrentRefresh(projectSlug, authToken)) {
@@ -1338,7 +1341,7 @@ async function diagnoseWebSocketFailure(path: string, token: string): Promise<We
       return {
         phase: "failed",
         detail: "WebSocket handshake did not complete.",
-        retryable: true
+        retryable: false
       };
     }
     return {
