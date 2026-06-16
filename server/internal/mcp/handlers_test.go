@@ -447,6 +447,54 @@ func TestHandleSpawnWorkerRejectsRemoteBranchCollision(t *testing.T) {
 	}
 }
 
+func TestHandleSpawnWorkerRejectsInvalidProjectSlugForWorktreePath(t *testing.T) {
+	dir := t.TempDir()
+	repoPath := initTestRepo(t)
+	worktreeBase := filepath.Join(dir, "worktrees")
+	if err := os.MkdirAll(worktreeBase, 0o755); err != nil {
+		t.Fatalf("MkdirAll worktree base: %v", err)
+	}
+	l := ledger.NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
+	if err := l.Add(ledger.Task{ID: "task-001", Title: "Task", Status: "unstarted"}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	deps := &Deps{
+		Ledger:   l,
+		Registry: worker.NewRegistry(),
+		Config: &config.Config{
+			Project: config.ProjectConfig{
+				Slug:         "proj/bad",
+				RepoPath:     repoPath,
+				WorktreeBase: worktreeBase,
+			},
+			WorkerHarnesses: []string{"sh"},
+			Harnesses: map[string]config.HarnessConfig{
+				"sh": {Command: "sh", McpArgs: "--mcp-url {url}"},
+			},
+		},
+		BaseURL: "http://127.0.0.1:8080",
+	}
+
+	_, err := handleSpawnWorker(deps)(context.Background(), map[string]any{
+		"task_id":       "task-001",
+		"branch":        "feature/task-001-work",
+		"allowed_files": []any{"server/internal/mcp"},
+	})
+	if err == nil {
+		t.Fatal("handleSpawnWorker error = nil, want invalid generated worktree path")
+	}
+	if !strings.Contains(err.Error(), "resolve worktree path") || !strings.Contains(err.Error(), "project slug") {
+		t.Fatalf("handleSpawnWorker error = %v, want project slug worktree path guidance", err)
+	}
+	tasks, err := l.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(tasks) != 1 || tasks[0].Status != "unstarted" || tasks[0].Branch != "" {
+		t.Fatalf("task changed after invalid project slug rejection: %#v", tasks)
+	}
+}
+
 func TestHandleSpawnWorkerRejectsMalformedFileLists(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -492,6 +540,50 @@ func TestHandleSpawnWorkerRejectsMalformedFileLists(t *testing.T) {
 				t.Fatalf("task changed after malformed %s rejection: %#v", tc.field, tasks)
 			}
 		})
+	}
+}
+
+func TestCleanupWorkerResourcesRejectsEscapingGeneratedWorktreePath(t *testing.T) {
+	dir := t.TempDir()
+	worktreeBase := filepath.Join(dir, "worktrees")
+	if err := os.MkdirAll(worktreeBase, 0o755); err != nil {
+		t.Fatalf("MkdirAll worktree base: %v", err)
+	}
+	deps := testMCPDeps(dir, ledger.NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive")))
+	deps.Config.Project.Slug = "proj"
+	deps.Config.Project.WorktreeBase = worktreeBase
+	removeCalled := false
+	deleteBranchCalled := false
+	deps.cleanup = successfulCleanupOps()
+	deps.cleanup.removeWorktree = func(_, _ string) error {
+		removeCalled = true
+		return nil
+	}
+	deps.cleanup.deleteTaskBranch = func(_, branch, taskID string) error {
+		deleteBranchCalled = true
+		if branch != "feature/task-001-cleanup" {
+			t.Fatalf("delete branch = %q, want feature/task-001-cleanup", branch)
+		}
+		if taskID != "task-001/../../escape" {
+			t.Fatalf("delete branch taskID = %q, want escaping task ID", taskID)
+		}
+		return nil
+	}
+
+	result := cleanupWorkerResources(deps, "worker-current", "feature/task-001-cleanup", "task-001/../../escape", true)
+	if !result.Failed() {
+		t.Fatalf("cleanup result = %#v, want failed generated path validation", result)
+	}
+	if result.WorktreeErr == nil ||
+		!strings.Contains(result.WorktreeErr.Error(), "generated worktree path") ||
+		!strings.Contains(result.WorktreeErr.Error(), "worktree_base") {
+		t.Fatalf("WorktreeErr = %v, want generated worktree containment guidance", result.WorktreeErr)
+	}
+	if removeCalled {
+		t.Fatal("removeWorktree called for escaping generated worktree path")
+	}
+	if !deleteBranchCalled {
+		t.Fatal("deleteTaskBranch was not called after generated worktree path rejection")
 	}
 }
 

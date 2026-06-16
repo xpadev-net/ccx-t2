@@ -358,6 +358,10 @@ func (s *Server) createProject(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "project slug and repository path are required")
 		return
 	}
+	if err := config.ValidateProjectSlug(slug); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("project slug %q: %v", slug, err))
+		return
+	}
 	s.configMu.Lock()
 	defer s.configMu.Unlock()
 	raw, err := config.LoadRaw(s.configPath)
@@ -1613,7 +1617,11 @@ func applyConfigPatch(cfg *config.Config, req configPatchRequest) error {
 	changed := false
 	if req.Project != nil {
 		if req.Project.Slug != nil {
-			cfg.Project.Slug = strings.TrimSpace(*req.Project.Slug)
+			slug := strings.TrimSpace(*req.Project.Slug)
+			if err := config.ValidateProjectSlug(slug); err != nil {
+				return fmt.Errorf("project.slug %q: %w", slug, err)
+			}
+			cfg.Project.Slug = slug
 			changed = true
 		}
 		if req.Project.RepoPath != nil {
@@ -1718,15 +1726,15 @@ func applyConfigPatch(cfg *config.Config, req configPatchRequest) error {
 		}
 		for slug, patch := range req.Projects {
 			slug = strings.TrimSpace(slug)
-			if slug == "" {
-				return fmt.Errorf("project slug cannot be empty")
+			if err := config.ValidateProjectSlug(slug); err != nil {
+				return fmt.Errorf("project slug %q: %w", slug, err)
 			}
 			current := cfg.Projects[slug]
 			current.Slug = slug
 			if patch.Slug != nil {
 				nextSlug := strings.TrimSpace(*patch.Slug)
-				if nextSlug == "" {
-					return fmt.Errorf("project slug cannot be empty")
+				if err := config.ValidateProjectSlug(nextSlug); err != nil {
+					return fmt.Errorf("project slug %q: %w", nextSlug, err)
 				}
 				if nextSlug != slug {
 					delete(cfg.Projects, slug)
