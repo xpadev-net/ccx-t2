@@ -111,6 +111,12 @@ button:disabled {
   color: #26614c;
 }
 
+.notice.warning {
+  border: 1px solid #e2bd73;
+  background: #fff8e7;
+  color: #78531b;
+}
+
 .workspace {
   display: grid;
   grid-template-columns: minmax(230px, 290px) minmax(280px, 360px) minmax(420px, 1fr);
