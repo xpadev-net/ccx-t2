@@ -34,6 +34,8 @@ type Deps struct {
 	BaseURL     string            // e.g. "http://localhost:8080"
 	Manager     *runtimepkg.Manager
 	ProjectSlug string
+
+	notifyAfterOwnershipPreflight func()
 }
 
 // RegisterOrchestratorTools registers the Orchestrator tools on s.
@@ -162,13 +164,13 @@ func RegisterWorkerTools(s *Server, deps *Deps) {
 				"properties": map[string]any{
 					"project_slug":    prop("string", "Project slug"),
 					"task_id":         prop("string", "Task ID"),
-					"worker_id":       prop("string", "Caller's worker_id for ownership verification (optional but recommended)"),
+					"worker_id":       prop("string", "Caller's worker_id for ownership verification"),
 					"pr_url":          prop("string", "PR URL (completed)"),
 					"merge_commit":    prop("string", "Merge commit hash (completed)"),
 					"reason":          prop("string", "Reason (blocked/split_request)"),
 					"proposed_slices": arrayProp("object", "Child task specs (split_request)"),
 				},
-				"required": []string{"task_id"},
+				"required": []string{"task_id", "worker_id"},
 			},
 		}, []string{"type", "payload"}),
 	}, handleNotify(deps))
@@ -231,8 +233,14 @@ func handleCreateTask(deps *Deps) ToolHandler {
 		if strings.TrimSpace(title) == "" {
 			title = "Natural language intake"
 		}
-		allowedFiles, _ := stringSliceArg(args, "allowed_files")
-		forbiddenFiles, _ := stringSliceArg(args, "forbidden_files")
+		allowedFiles, err := fileListArg(args, "allowed_files")
+		if err != nil {
+			return nil, fmt.Errorf("allowed_files: %w", err)
+		}
+		forbiddenFiles, err := fileListArg(args, "forbidden_files")
+		if err != nil {
+			return nil, fmt.Errorf("forbidden_files: %w", err)
+		}
 
 		if err := ledger.ValidatePaths(allowedFiles); err != nil {
 			return nil, fmt.Errorf("allowed_files: %w", err)
@@ -286,7 +294,7 @@ func handleUpdateTask(deps *Deps) ToolHandler {
 		}
 		for _, key := range []string{"allowed_files", "forbidden_files"} {
 			if _, ok := args[key]; ok {
-				sl, err := stringSliceArg(args, key)
+				sl, err := fileListArg(args, key)
 				if err != nil {
 					return nil, err
 				}
@@ -365,13 +373,19 @@ func handleSplitTask(deps *Deps) ToolHandler {
 			allowed, forbidden []string
 		}
 		pending := make([]pendingSlice, 0, len(slicesAny))
-		for _, s := range slicesAny {
+		for i, s := range slicesAny {
 			sliceMap, ok := s.(map[string]any)
 			if !ok {
 				return nil, fmt.Errorf("each slice must be an object")
 			}
-			childAllowed, _ := stringSliceArg(sliceMap, "allowed_files")
-			childForbidden, _ := stringSliceArg(sliceMap, "forbidden_files")
+			childAllowed, err := fileListArg(sliceMap, "allowed_files")
+			if err != nil {
+				return nil, fmt.Errorf("slice %d allowed_files: %w", i, err)
+			}
+			childForbidden, err := fileListArg(sliceMap, "forbidden_files")
+			if err != nil {
+				return nil, fmt.Errorf("slice %d forbidden_files: %w", i, err)
+			}
 			if err := ledger.ValidatePaths(childAllowed); err != nil {
 				return nil, fmt.Errorf("slice allowed_files: %w", err)
 			}
@@ -556,14 +570,17 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 		if strings.TrimSpace(branch) == "" {
 			return nil, fmt.Errorf("branch must be a non-empty string")
 		}
-		allowedFiles, err := stringSliceArg(args, "allowed_files")
+		allowedFiles, err := fileListArg(args, "allowed_files")
 		if err != nil {
 			return nil, err
 		}
 		if len(allowedFiles) == 0 {
 			return nil, fmt.Errorf("allowed_files must have at least one entry")
 		}
-		forbiddenFiles, _ := stringSliceArg(args, "forbidden_files")
+		forbiddenFiles, err := fileListArg(args, "forbidden_files")
+		if err != nil {
+			return nil, fmt.Errorf("forbidden_files: %w", err)
+		}
 		harnessName := optionalStringArg(args, "harness")
 
 		// Preflight checks.
@@ -860,10 +877,15 @@ func handleNotify(deps *Deps) ToolHandler {
 			return nil, err
 		}
 
-		// Optional worker_id field: if provided, verify the caller owns the task.
-		// All workers share the same bearer token, so this provides a best-effort
-		// ownership check preventing a buggy worker from notifying sibling tasks.
-		callerWorkerID := optionalStringArg(payload, "worker_id")
+		// All workers share the same bearer token, so require the caller's
+		// worker_id and verify it again inside each ledger update lock.
+		callerWorkerID, err := stringArg(payload, "worker_id")
+		if err != nil {
+			return nil, err
+		}
+		if strings.TrimSpace(callerWorkerID) == "" {
+			return nil, fmt.Errorf("worker_id is required")
+		}
 
 		tasks, err := toolDeps.Ledger.Load()
 		if err != nil {
@@ -879,9 +901,12 @@ func handleNotify(deps *Deps) ToolHandler {
 		if task == nil {
 			return nil, fmt.Errorf("task not found: %s", taskID)
 		}
-		if callerWorkerID != "" && task.WorkerID != callerWorkerID {
+		if task.WorkerID != callerWorkerID {
 			return nil, fmt.Errorf("worker %q is not assigned to task %s (assigned to %q)",
 				callerWorkerID, taskID, task.WorkerID)
+		}
+		if toolDeps.notifyAfterOwnershipPreflight != nil {
+			toolDeps.notifyAfterOwnershipPreflight()
 		}
 		// Validate the notify type before the status early-return so an unknown
 		// type always returns an error, even for non-active tasks.
@@ -922,7 +947,7 @@ func handleNotify(deps *Deps) ToolHandler {
 
 			prevTask, err := toolDeps.Ledger.UpdateIfStatusesReturnPrevWith(taskID, []string{"in_progress", "blocked"},
 				func(current ledger.Task) (map[string]any, error) {
-					if callerWorkerID != "" && current.WorkerID != callerWorkerID {
+					if current.WorkerID != callerWorkerID {
 						return nil, fmt.Errorf("worker %q is not assigned to task %s (assigned to %q)",
 							callerWorkerID, taskID, current.WorkerID)
 					}
@@ -967,7 +992,7 @@ func handleNotify(deps *Deps) ToolHandler {
 			reason, _ := payload["reason"].(string)
 			if _, err := toolDeps.Ledger.UpdateIfStatusesReturnPrevWith(taskID, []string{"in_progress", "blocked"},
 				func(current ledger.Task) (map[string]any, error) {
-					if callerWorkerID != "" && current.WorkerID != callerWorkerID {
+					if current.WorkerID != callerWorkerID {
 						return nil, fmt.Errorf("worker %q is not assigned to task %s (assigned to %q)",
 							callerWorkerID, taskID, current.WorkerID)
 					}
@@ -1003,8 +1028,14 @@ func handleNotify(deps *Deps) ToolHandler {
 				if !ok {
 					return nil, fmt.Errorf("proposed_slices[%d] must be an object", i)
 				}
-				childAllowed, _ := stringSliceArg(sliceMap, "allowed_files")
-				childForbidden, _ := stringSliceArg(sliceMap, "forbidden_files")
+				childAllowed, err := fileListArg(sliceMap, "allowed_files")
+				if err != nil {
+					return nil, fmt.Errorf("proposed_slices[%d] allowed_files: %w", i, err)
+				}
+				childForbidden, err := fileListArg(sliceMap, "forbidden_files")
+				if err != nil {
+					return nil, fmt.Errorf("proposed_slices[%d] forbidden_files: %w", i, err)
+				}
 				if err := ledger.ValidatePaths(childAllowed); err != nil {
 					return nil, fmt.Errorf("proposed_slices[%d] allowed_files: %w", i, err)
 				}
@@ -1035,32 +1066,12 @@ func handleNotify(deps *Deps) ToolHandler {
 				}
 			}
 
-			// Atomically add all children before marking parent split.
-			// AddAll writes all tasks in a single file operation, preventing
-			// partial orphans on failure — parent stays in_progress so retry works.
-			childTasks := make([]ledger.Task, len(srChildren))
-			for i, c := range srChildren {
-				childTasks[i] = ledger.Task{
-					ID:             c.id,
-					Title:          c.title,
-					Status:         "unstarted",
-					AllowedFiles:   c.allowed,
-					ForbiddenFiles: c.forbidden,
-					Body:           c.desc,
-				}
-			}
-			if err := toolDeps.Ledger.AddAll(childTasks); err != nil {
-				return nil, err
-			}
-
-			// Update parent to split after children are safely written.
-			srChildIDs := make([]string, len(srChildren))
-			for i, c := range srChildren {
-				srChildIDs[i] = c.id
-			}
+			// Verify ownership under the parent update lock before writing child
+			// tasks; a stale worker must not be able to mutate the ledger even
+			// temporarily by adding children.
 			prevTask, updateErr := toolDeps.Ledger.UpdateIfStatusesReturnPrevWith(taskID, []string{"in_progress", "blocked"},
 				func(current ledger.Task) (map[string]any, error) {
-					if callerWorkerID != "" && current.WorkerID != callerWorkerID {
+					if current.WorkerID != callerWorkerID {
 						return nil, fmt.Errorf("worker %q is not assigned to task %s (assigned to %q)",
 							callerWorkerID, taskID, current.WorkerID)
 					}
@@ -1074,8 +1085,31 @@ func handleNotify(deps *Deps) ToolHandler {
 				},
 			)
 			if updateErr != nil {
-				_ = toolDeps.Ledger.DeleteTasks(srChildIDs)
 				return nil, updateErr
+			}
+
+			childTasks := make([]ledger.Task, len(srChildren))
+			for i, c := range srChildren {
+				childTasks[i] = ledger.Task{
+					ID:             c.id,
+					Title:          c.title,
+					Status:         "unstarted",
+					AllowedFiles:   c.allowed,
+					ForbiddenFiles: c.forbidden,
+					Body:           c.desc,
+				}
+			}
+			if err := toolDeps.Ledger.AddAll(childTasks); err != nil {
+				if _, rollbackErr := toolDeps.Ledger.UpdateIfStatusesReturnPrev(taskID, []string{"split"}, map[string]any{
+					"status":    prevTask.Status,
+					"worker_id": prevTask.WorkerID,
+					"branch":    prevTask.Branch,
+					"harness":   prevTask.Harness,
+					"reason":    prevTask.Reason,
+				}); rollbackErr != nil {
+					log.Printf("warn: split_request rollback failed for task %s after child creation error: %v", taskID, rollbackErr)
+				}
+				return nil, err
 			}
 
 			// Cleanup resources using prevTask snapshot (not stale task load) so that
@@ -1147,6 +1181,13 @@ func depsForProject(deps *Deps, slug string) (*Deps, error) {
 		Manager:     deps.Manager,
 		ProjectSlug: project.Slug,
 	}, nil
+}
+
+func fileListArg(args map[string]any, key string) ([]string, error) {
+	if v, ok := args[key]; ok && v == nil {
+		return nil, fmt.Errorf("argument %q must be an array of strings", key)
+	}
+	return stringSliceArg(args, key)
 }
 
 func workerIDFor(deps *Deps, taskID string) string {
