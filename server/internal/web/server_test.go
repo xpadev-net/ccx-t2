@@ -1644,8 +1644,11 @@ func TestWorkerLogWebSocketStreamsLines(t *testing.T) {
 	lines <- "world"
 	close(lines)
 	cleanupCalled := make(chan struct{})
+	registry := worker.NewRegistry()
+	registry.Register(worker.Info{WorkerID: "worker-task-001", TaskID: "task-001"})
 	server := httptest.NewServer(New(Deps{
-		Config: testConfig(),
+		Config:   testConfig(),
+		Registry: registry,
 		PipeOutput: func(session, window string) (<-chan string, func(), error) {
 			if session != "ccx-t2" || window != "worker-task-001" {
 				t.Fatalf("pipe args = %q %q, want ccx-t2 worker-task-001", session, window)
@@ -1687,8 +1690,11 @@ func TestWorkerLogWebSocketStreamsLines(t *testing.T) {
 func TestWorkerLogWebSocketAcceptsTokenQueryAuth(t *testing.T) {
 	lines := make(chan string)
 	close(lines)
+	registry := worker.NewRegistry()
+	registry.Register(worker.Info{WorkerID: "worker-task-001", TaskID: "task-001"})
 	server := httptest.NewServer(New(Deps{
-		Config: testConfig(),
+		Config:   testConfig(),
+		Registry: registry,
 		PipeOutput: func(session, window string) (<-chan string, func(), error) {
 			return lines, func() {}, nil
 		},
@@ -1706,6 +1712,242 @@ func TestWorkerLogWebSocketAcceptsTokenQueryAuth(t *testing.T) {
 	}
 	if msg.Type != "closed" {
 		t.Fatalf("message = %#v, want closed", msg)
+	}
+}
+
+func TestProjectWorkerLogWebSocketStreamsProjectWorker(t *testing.T) {
+	cfg, manager := newTestProjectManager(t, "alpha")
+	alpha, err := manager.Project("alpha")
+	if err != nil {
+		t.Fatalf("Project alpha: %v", err)
+	}
+	if err := alpha.Ledger.Add(ledger.Task{
+		ID:       "task-20260101-0001",
+		Title:    "Active worker",
+		Status:   "in_progress",
+		WorkerID: "alpha-worker-task-20260101-0001",
+	}); err != nil {
+		t.Fatalf("Add alpha task: %v", err)
+	}
+	lines := make(chan string, 1)
+	lines <- "alpha ready"
+	close(lines)
+	server := httptest.NewServer(New(Deps{
+		Config:  cfg,
+		Manager: manager,
+		PipeOutput: func(session, window string) (<-chan string, func(), error) {
+			if session != "ccx-test" || window != "alpha-worker-task-20260101-0001" {
+				t.Fatalf("pipe args = %q %q, want ccx-test alpha-worker-task-20260101-0001", session, window)
+			}
+			return lines, func() {}, nil
+		},
+		AuthDisabled: true,
+	}))
+	defer server.Close()
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(server.URL, "/ws/projects/alpha/worker/alpha-worker-task-20260101-0001"), nil)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer conn.Close()
+
+	var msg wsMessage
+	if err := conn.ReadJSON(&msg); err != nil {
+		t.Fatalf("ReadJSON: %v", err)
+	}
+	if msg.Type != "line" || msg.Data != "alpha ready" {
+		t.Fatalf("message = %#v, want alpha worker line", msg)
+	}
+}
+
+func TestWorkerLogWebSocketStreamsSelectedProjectWorker(t *testing.T) {
+	cfg, manager := newTestProjectManager(t, "alpha")
+	alpha, err := manager.Project("alpha")
+	if err != nil {
+		t.Fatalf("Project alpha: %v", err)
+	}
+	if err := alpha.Ledger.Add(ledger.Task{
+		ID:       "task-20260101-0001",
+		Title:    "Active worker",
+		Status:   "in_progress",
+		WorkerID: "alpha-worker-task-20260101-0001",
+	}); err != nil {
+		t.Fatalf("Add alpha task: %v", err)
+	}
+	lines := make(chan string, 1)
+	lines <- "alpha root ready"
+	close(lines)
+	server := httptest.NewServer(New(Deps{
+		Config:  cfg,
+		Manager: manager,
+		PipeOutput: func(session, window string) (<-chan string, func(), error) {
+			if session != "ccx-test" || window != "alpha-worker-task-20260101-0001" {
+				t.Fatalf("pipe args = %q %q, want ccx-test alpha-worker-task-20260101-0001", session, window)
+			}
+			return lines, func() {}, nil
+		},
+		AuthDisabled: true,
+	}))
+	defer server.Close()
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(server.URL, "/ws/worker/alpha-worker-task-20260101-0001"), nil)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer conn.Close()
+
+	var msg wsMessage
+	if err := conn.ReadJSON(&msg); err != nil {
+		t.Fatalf("ReadJSON: %v", err)
+	}
+	if msg.Type != "line" || msg.Data != "alpha root ready" {
+		t.Fatalf("message = %#v, want selected project worker line", msg)
+	}
+}
+
+func TestWorkerLogWebSocketReportsSelectedProjectResolutionFailure(t *testing.T) {
+	cfg, _ := newTestProjectManager(t, "alpha")
+	_, manager := newTestProjectManager(t, "beta")
+	server := httptest.NewServer(New(Deps{
+		Config:  cfg,
+		Manager: manager,
+		PipeOutput: func(session, window string) (<-chan string, func(), error) {
+			t.Fatalf("PipeOutput called when selected project could not be resolved")
+			return nil, nil, nil
+		},
+		AuthDisabled: true,
+	}))
+	defer server.Close()
+
+	_, resp, err := websocket.DefaultDialer.Dial(wsURL(server.URL, "/ws/worker/alpha-worker-task-20260101-0001"), nil)
+	if err == nil {
+		t.Fatal("Dial error = nil, want selected project failure")
+	}
+	if resp == nil || resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("response = %#v, want 500", resp)
+	}
+}
+
+func TestAuthorizeWorkerLogWindowFailsClosedWithoutProjectPrefix(t *testing.T) {
+	registry := worker.NewRegistry()
+	registry.Register(worker.Info{WorkerID: "worker-task-001", TaskID: "task-001"})
+	server := &Server{projectScoped: true, registry: registry}
+
+	status, message := server.authorizeWorkerLogWindow("worker-task-001")
+	if status != http.StatusForbidden {
+		t.Fatalf("status = %d message = %q, want 403", status, message)
+	}
+}
+
+func TestProjectWorkerLogWebSocketRejectsCrossProjectWorker(t *testing.T) {
+	cfg, manager := newTestProjectManager(t, "alpha", "beta")
+	beta, err := manager.Project("beta")
+	if err != nil {
+		t.Fatalf("Project beta: %v", err)
+	}
+	if err := beta.Ledger.Add(ledger.Task{
+		ID:       "task-20260101-0002",
+		Title:    "Beta worker",
+		Status:   "in_progress",
+		WorkerID: "beta-worker-task-20260101-0002",
+	}); err != nil {
+		t.Fatalf("Add beta task: %v", err)
+	}
+	server := httptest.NewServer(New(Deps{
+		Config:  cfg,
+		Manager: manager,
+		PipeOutput: func(session, window string) (<-chan string, func(), error) {
+			t.Fatalf("PipeOutput called for unauthorized worker %q in session %q", window, session)
+			return nil, nil, nil
+		},
+		AuthDisabled: true,
+	}))
+	defer server.Close()
+
+	_, resp, err := websocket.DefaultDialer.Dial(wsURL(server.URL, "/ws/projects/alpha/worker/beta-worker-task-20260101-0002"), nil)
+	if err == nil {
+		t.Fatal("Dial error = nil, want forbidden")
+	}
+	if resp == nil || resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("response = %#v, want 403", resp)
+	}
+}
+
+func TestProjectWorkerLogWebSocketRejectsArbitraryTmuxWindow(t *testing.T) {
+	cfg, manager := newTestProjectManager(t, "alpha")
+	server := httptest.NewServer(New(Deps{
+		Config:  cfg,
+		Manager: manager,
+		PipeOutput: func(session, window string) (<-chan string, func(), error) {
+			t.Fatalf("PipeOutput called for unauthorized window %q in session %q", window, session)
+			return nil, nil, nil
+		},
+		AuthDisabled: true,
+	}))
+	defer server.Close()
+
+	_, resp, err := websocket.DefaultDialer.Dial(wsURL(server.URL, "/ws/projects/alpha/worker/shell"), nil)
+	if err == nil {
+		t.Fatal("Dial error = nil, want forbidden")
+	}
+	if resp == nil || resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("response = %#v, want 403", resp)
+	}
+}
+
+func TestProjectWorkerLogWebSocketRejectsLedgerOwnedWindowWithoutProjectPrefix(t *testing.T) {
+	cfg, manager := newTestProjectManager(t, "alpha")
+	alpha, err := manager.Project("alpha")
+	if err != nil {
+		t.Fatalf("Project alpha: %v", err)
+	}
+	if err := alpha.Ledger.Add(ledger.Task{
+		ID:       "task-20260101-0001",
+		Title:    "Unsafe worker",
+		Status:   "in_progress",
+		WorkerID: "shell",
+	}); err != nil {
+		t.Fatalf("Add alpha task: %v", err)
+	}
+	server := httptest.NewServer(New(Deps{
+		Config:  cfg,
+		Manager: manager,
+		PipeOutput: func(session, window string) (<-chan string, func(), error) {
+			t.Fatalf("PipeOutput called for ledger-owned non-project window %q in session %q", window, session)
+			return nil, nil, nil
+		},
+		AuthDisabled: true,
+	}))
+	defer server.Close()
+
+	_, resp, err := websocket.DefaultDialer.Dial(wsURL(server.URL, "/ws/projects/alpha/worker/shell"), nil)
+	if err == nil {
+		t.Fatal("Dial error = nil, want forbidden")
+	}
+	if resp == nil || resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("response = %#v, want 403", resp)
+	}
+}
+
+func TestProjectWorkerLogWebSocketRejectsMissingWorker(t *testing.T) {
+	cfg, manager := newTestProjectManager(t, "alpha")
+	server := httptest.NewServer(New(Deps{
+		Config:  cfg,
+		Manager: manager,
+		PipeOutput: func(session, window string) (<-chan string, func(), error) {
+			t.Fatalf("PipeOutput called for missing worker %q in session %q", window, session)
+			return nil, nil, nil
+		},
+		AuthDisabled: true,
+	}))
+	defer server.Close()
+
+	_, resp, err := websocket.DefaultDialer.Dial(wsURL(server.URL, "/ws/projects/alpha/worker/alpha-worker-task-404"), nil)
+	if err == nil {
+		t.Fatal("Dial error = nil, want not found")
+	}
+	if resp == nil || resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("response = %#v, want 404", resp)
 	}
 }
 
@@ -1885,8 +2127,11 @@ func TestWebSocketAllowsConfiguredOrigin(t *testing.T) {
 
 func TestWorkerLogWebSocketRejectsSecondSubscriber(t *testing.T) {
 	lines := make(chan string)
+	registry := worker.NewRegistry()
+	registry.Register(worker.Info{WorkerID: "worker-task-001", TaskID: "task-001"})
 	server := httptest.NewServer(New(Deps{
-		Config: testConfig(),
+		Config:   testConfig(),
+		Registry: registry,
 		PipeOutput: func(session, window string) (<-chan string, func(), error) {
 			return lines, func() {}, nil
 		},
@@ -2131,6 +2376,32 @@ func newTestLedger(t *testing.T) *ledger.Ledger {
 		t.Fatalf("write ledger: %v", err)
 	}
 	return ledger.NewLedger(ledgerPath, filepath.Join(dir, "archive"))
+}
+
+func newTestProjectManager(t *testing.T, slugs ...string) (*config.Config, *runtimepkg.Manager) {
+	t.Helper()
+	dir := t.TempDir()
+	cfg := testConfig()
+	cfg.Runtime = config.RuntimeConfig{TmuxSession: "ccx-test", WorktreeBase: filepath.Join(dir, "worktrees")}
+	cfg.Projects = make(map[string]config.ProjectConfig, len(slugs))
+	for _, slug := range slugs {
+		cfg.Projects[slug] = config.ProjectConfig{
+			Slug:         slug,
+			RepoPath:     filepath.Join(dir, slug),
+			LedgerPath:   filepath.Join(dir, slug, "tasks", "ledger.md"),
+			WorktreeBase: cfg.Runtime.WorktreeBase,
+			Orchestrator: cfg.Orchestrator,
+			GitHub:       cfg.GitHub,
+		}
+	}
+	if len(slugs) > 0 {
+		cfg.Project = cfg.Projects[slugs[0]]
+	}
+	manager, err := runtimepkg.NewManager(cfg, "http://127.0.0.1:8080")
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	return cfg, manager
 }
 
 func initWebTestRepo(t *testing.T) string {

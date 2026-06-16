@@ -49,7 +49,92 @@ func (s *Server) handleWorkerLogWS(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "worker window is required")
 		return
 	}
+	projectServer, ok, err := s.selectedProjectWorkerLogServer()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "selected project is not configured")
+		return
+	}
+	if ok {
+		r2 := r.Clone(r.Context())
+		r2.URL.Path = "/ws/worker/" + window
+		projectServer.handleWorkerLogWS(w, r2)
+		return
+	}
+	status, message := s.authorizeWorkerLogWindow(window)
+	if status != 0 {
+		writeError(w, status, message)
+		return
+	}
 	s.handleTmuxLogWS(w, r, window, "worker")
+}
+
+func (s *Server) selectedProjectWorkerLogServer() (*Server, bool, error) {
+	if s.projectScoped || s.manager == nil {
+		return nil, false, nil
+	}
+	cfg, ok := s.configSnapshot()
+	if !ok {
+		return nil, false, nil
+	}
+	slug := strings.TrimSpace(cfg.Project.Slug)
+	if slug == "" {
+		return nil, false, nil
+	}
+	projectServer, err := s.projectServer(slug)
+	if err != nil {
+		return nil, false, err
+	}
+	return projectServer, true, nil
+}
+
+func (s *Server) authorizeWorkerLogWindow(window string) (int, string) {
+	if ok, err := s.hasActiveLedgerWorker(window); err != nil {
+		return http.StatusInternalServerError, "load worker task"
+	} else if ok {
+		if s.projectScoped && !s.hasProjectWorkerPrefix(window) {
+			return http.StatusForbidden, "worker window is outside project"
+		}
+		return 0, ""
+	}
+	if s.projectScoped && !s.hasProjectWorkerPrefix(window) {
+		return http.StatusForbidden, "worker window is outside project"
+	}
+	if s.registry != nil {
+		if _, ok := s.registry.Get(window); ok {
+			return 0, ""
+		}
+	}
+	return http.StatusNotFound, "worker not found"
+}
+
+func (s *Server) hasActiveLedgerWorker(workerID string) (bool, error) {
+	if s.ledger == nil {
+		return false, nil
+	}
+	if _, err := s.activeTaskForWorker(workerID); err != nil {
+		if errors.Is(err, errWorkerNotActive) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+func (s *Server) hasProjectWorkerPrefix(window string) bool {
+	prefix := s.projectWorkerPrefix()
+	return prefix != "" && strings.HasPrefix(window, prefix)
+}
+
+func (s *Server) projectWorkerPrefix() string {
+	cfg, ok := s.configSnapshot()
+	if !ok {
+		return ""
+	}
+	slug := strings.TrimSpace(cfg.Project.Slug)
+	if slug == "" {
+		return ""
+	}
+	return slug + "-"
 }
 
 func (s *Server) handleOrchestratorLogWS(w http.ResponseWriter, r *http.Request) {
