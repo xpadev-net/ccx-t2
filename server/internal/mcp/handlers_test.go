@@ -518,7 +518,9 @@ func TestCleanupTaskBranchNormalizesRelativeRepoPath(t *testing.T) {
 		}
 	})
 
-	cleanupTaskBranch("repo", "feature/task-001", "task-001")
+	if err := cleanupTaskBranch("repo", "feature/task-001", "task-001"); err != nil {
+		t.Fatalf("cleanupTaskBranch: %v", err)
+	}
 
 	exists, err := gitBranchExists(repoPath, "feature/task-001")
 	if err != nil {
