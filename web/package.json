@@ -1,6 +1,8 @@
 {
   "scripts": {
     "build": "tsc -b && vite build",
+    "embedded:sync": "node scripts/embedded-assets.mjs sync",
+    "embedded:check": "node scripts/embedded-assets.mjs check",
     "dev": "vite --host 127.0.0.1",
     "preview": "vite preview --host 127.0.0.1"
   },

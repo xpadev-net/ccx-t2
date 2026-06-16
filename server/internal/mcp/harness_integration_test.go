@@ -20,15 +20,10 @@ import (
 
 const fakeHarnessWait = 30 * time.Second
 const fakeSplitHarnessChildren = 2
+const requireHarnessIntegrationEnv = "CCX_REQUIRE_HARNESS_INTEGRATION"
 
 func TestWorkerHarnessesCompleteThroughMCPIntegration(t *testing.T) {
-	if _, err := exec.LookPath("tmux"); err != nil {
-		t.Skipf("tmux not available: %v", err)
-	}
-	pythonPath, err := exec.LookPath("python3")
-	if err != nil {
-		t.Skipf("python3 not available: %v", err)
-	}
+	pythonPath := requireHarnessIntegrationPrereqs(t)
 
 	root := t.TempDir()
 	harnessCommand := writeFakeHarness(t, root, pythonPath)
@@ -116,13 +111,7 @@ func TestWorkerHarnessesCompleteThroughMCPIntegration(t *testing.T) {
 }
 
 func TestWorkerSplitRequestThroughMCPIntegration(t *testing.T) {
-	if _, err := exec.LookPath("tmux"); err != nil {
-		t.Skipf("tmux not available: %v", err)
-	}
-	pythonPath, err := exec.LookPath("python3")
-	if err != nil {
-		t.Skipf("python3 not available: %v", err)
-	}
+	pythonPath := requireHarnessIntegrationPrereqs(t)
 
 	repoPath := initTestRepo(t)
 	worktreeBase := filepath.Join(t.TempDir(), "worktrees")
@@ -215,6 +204,26 @@ func TestWorkerSplitRequestThroughMCPIntegration(t *testing.T) {
 	assertPromptSent(t, got, "spawn child worker")
 	waitForCompletedTask(t, l, childID, harnessName, session, "worker-"+childID)
 	waitForWorkerCleanup(t, registry, session, "worker-"+childID, childWorktreePath)
+}
+
+func requireHarnessIntegrationPrereqs(t *testing.T) string {
+	t.Helper()
+	if _, err := exec.LookPath("tmux"); err != nil {
+		missingHarnessIntegrationPrereq(t, "tmux", err)
+	}
+	pythonPath, err := exec.LookPath("python3")
+	if err != nil {
+		missingHarnessIntegrationPrereq(t, "python3", err)
+	}
+	return pythonPath
+}
+
+func missingHarnessIntegrationPrereq(t *testing.T, name string, err error) {
+	t.Helper()
+	if os.Getenv(requireHarnessIntegrationEnv) == "1" {
+		t.Fatalf("%s not available with %s=1: %v", name, requireHarnessIntegrationEnv, err)
+	}
+	t.Skipf("%s not available: %v", name, err)
 }
 
 func integrationConfig(repoPath, worktreeBase, harnessName, harnessCommand string) *config.Config {
