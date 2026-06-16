@@ -1238,13 +1238,35 @@ func handleNotify(deps *Deps) ToolHandler {
 		case "split_request":
 			reason, _ := payload["reason"].(string)
 			if pendingIntent, originalReason, ok := cleanupIntentFromTask(*task); ok && pendingIntent == cleanupIntentSplitRequest {
-				wid := task.WorkerID
+				pendingTask, err := toolDeps.Ledger.UpdateIfStatusesReturnPrevWith(taskID, []string{"blocked"},
+					func(current ledger.Task) (map[string]any, error) {
+						if current.WorkerID != callerWorkerID {
+							return nil, fmt.Errorf("worker %q is not assigned to task %s (assigned to %q)",
+								callerWorkerID, taskID, current.WorkerID)
+						}
+						currentIntent, currentOriginalReason, ok := cleanupIntentFromTask(current)
+						if !ok {
+							return nil, fmt.Errorf("task %s is missing cleanup marker", taskID)
+						}
+						if currentIntent != cleanupIntentSplitRequest {
+							return nil, fmt.Errorf("task %s has %s cleanup pending, not %s",
+								taskID, currentIntent, cleanupIntentSplitRequest)
+						}
+						originalReason = currentOriginalReason
+						return map[string]any{
+							"reason": cleanupPendingReason(cleanupIntentSplitRequest, nil, originalReason),
+						}, nil
+					})
+				if err != nil {
+					return nil, err
+				}
+				wid := pendingTask.WorkerID
 				if wid == "" {
 					wid = workerIDFor(toolDeps, taskID)
 				}
-				result := cleanupWorkerResources(toolDeps, wid, task.Branch, taskID, true)
+				result := cleanupWorkerResources(toolDeps, wid, pendingTask.Branch, taskID, true)
 				if cleanupErr := result.Err(); cleanupErr != nil {
-					if err := markCleanupPending(toolDeps, taskID, wid, *task, cleanupIntentSplitRequest, originalReason, cleanupErr); err != nil {
+					if err := markCleanupPending(toolDeps, taskID, wid, pendingTask, cleanupIntentSplitRequest, originalReason, cleanupErr); err != nil {
 						return nil, fmt.Errorf("%w; additionally failed to record cleanup state: %v", cleanupErr, err)
 					}
 					return nil, cleanupErr
