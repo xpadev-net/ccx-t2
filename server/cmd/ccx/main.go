@@ -64,10 +64,11 @@ func serve(args []string) error {
 		return err
 	}
 
-	orchestratorMCP := mcp.NewServer("orchestrator", cfg.Server.McpSecret)
-	workerMCP := mcp.NewServer("worker", cfg.Server.McpSecret)
+	webAdminSecret := cfg.Server.EffectiveWebAdminSecret()
+	orchestratorMCP := mcp.NewServer("orchestrator", cfg.Server.EffectiveOrchestratorSecret())
+	workerMCP := mcp.NewServer("worker", cfg.Server.EffectiveWorkerSecret())
 	mcpDeps := &mcp.Deps{
-		Config:  cfg,
+		Config:  workerRuntimeConfig(cfg),
 		Session: cfg.Runtime.TmuxSession,
 		BaseURL: baseURL,
 		Manager: manager,
@@ -80,8 +81,8 @@ func serve(args []string) error {
 		ConfigPath:   *configPath,
 		Manager:      manager,
 		Session:      cfg.Runtime.TmuxSession,
-		Secret:       cfg.Server.McpSecret,
-		AuthDisabled: cfg.Server.McpSecret == "",
+		Secret:       webAdminSecret,
+		AuthDisabled: webAdminSecret == "",
 	})
 
 	mux := http.NewServeMux()
@@ -145,6 +146,12 @@ func baseURLHost(host string) string {
 	default:
 		return strings.Trim(host, "[]")
 	}
+}
+
+func workerRuntimeConfig(cfg *config.Config) *config.Config {
+	out := config.Clone(cfg)
+	out.Server.McpSecret = cfg.Server.EffectiveWorkerSecret()
+	return out
 }
 
 func ensureConfig(path string) error {
