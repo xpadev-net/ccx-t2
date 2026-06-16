@@ -108,14 +108,20 @@ type TaskEditorDirty = {
 };
 
 type ConnectionPhase = "idle" | "connecting" | "open" | "retrying" | "unauthorized" | "forbidden" | "blocked" | "failed";
+type FailureConnectionPhase = "unauthorized" | "forbidden" | "blocked" | "failed";
 
-type ConnectionState = {
-  phase: ConnectionPhase;
-  detail?: string;
-  attempt?: number;
-  maxAttempts?: number;
-  retryInMs?: number;
-};
+type ConnectionState =
+  | {
+      phase: Exclude<ConnectionPhase, "retrying">;
+      detail?: string;
+    }
+  | {
+      phase: "retrying";
+      detail?: string;
+      attempt: number;
+      maxAttempts: number;
+      retryInMs: number;
+    };
 
 type HarnessInfo = {
   name: string;
@@ -127,7 +133,7 @@ type HarnessInfo = {
 };
 
 type WebSocketDiagnosis = {
-  phase: ConnectionPhase;
+  phase: FailureConnectionPhase;
   detail: string;
   retryable: boolean;
 };
@@ -1256,7 +1262,7 @@ function openReconnectingWebSocket(options: ReconnectingWebSocketOptions) {
     });
   };
 
-  const scheduleReconnect = (detail: string, exhaustedPhase: ConnectionPhase = "failed") => {
+  const scheduleReconnect = (detail: string, exhaustedPhase: FailureConnectionPhase = "failed") => {
     if (attempts >= reconnectDelaysMs.length) {
       options.setState({ phase: exhaustedPhase, detail: `${detail} Reconnect attempts exhausted.` });
       return;
