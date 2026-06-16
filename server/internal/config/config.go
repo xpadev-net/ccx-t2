@@ -403,7 +403,10 @@ func allServerSecretsConfigured(s ServerConfig) bool {
 
 func isLoopbackListenHost(host string) bool {
 	host = strings.TrimSpace(host)
-	if host == "" || strings.EqualFold(host, "localhost") {
+	if host == "" {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
 		return true
 	}
 	if strings.HasPrefix(host, "[") || strings.HasSuffix(host, "]") {

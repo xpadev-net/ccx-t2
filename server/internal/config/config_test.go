@@ -117,6 +117,25 @@ func TestPrepareRejectsBareBracketListenAddressWithoutAuth(t *testing.T) {
 	}
 }
 
+func TestPrepareDefaultsEmptyListenAddressToLoopback(t *testing.T) {
+	cfg := &Config{
+		Runtime: RuntimeConfig{TmuxSession: "ccx-t2-test"},
+	}
+
+	if err := Prepare(cfg); err != nil {
+		t.Fatalf("Prepare() error = %v, want nil", err)
+	}
+	if cfg.Server.Host != "127.0.0.1" {
+		t.Fatalf("server.host = %q, want 127.0.0.1", cfg.Server.Host)
+	}
+}
+
+func TestIsLoopbackListenHostTreatsEmptyAsUnsafe(t *testing.T) {
+	if isLoopbackListenHost("") {
+		t.Fatal("isLoopbackListenHost(\"\") = true, want false")
+	}
+}
+
 func TestPrepareAllowsNonLoopbackListenAddressWithRoleSecrets(t *testing.T) {
 	cfg := &Config{
 		Server: ServerConfig{
