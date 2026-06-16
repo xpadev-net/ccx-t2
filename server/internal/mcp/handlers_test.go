@@ -18,8 +18,10 @@ import (
 
 	shellquote "github.com/kballard/go-shellquote"
 	"github.com/xpadev/ccx-t2/internal/config"
+	githubpkg "github.com/xpadev/ccx-t2/internal/github"
 	"github.com/xpadev/ccx-t2/internal/ledger"
 	runtimepkg "github.com/xpadev/ccx-t2/internal/runtime"
+	"github.com/xpadev/ccx-t2/internal/testutil"
 	"github.com/xpadev/ccx-t2/internal/worker"
 )
 
@@ -95,6 +97,87 @@ func TestRegisterWorkerToolsNotifySchemaRequiresWorkerID(t *testing.T) {
 	want := []string{"task_id", "worker_id"}
 	if !reflect.DeepEqual(required, want) {
 		t.Fatalf("notify payload required = %#v, want %#v", required, want)
+	}
+}
+
+func TestRegisterOrchestratorToolsGetPRStatusUsesConfiguredGitHubClient(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer test-token" {
+			t.Errorf("Authorization = %q, want Bearer test-token", got)
+			http.Error(w, "bad auth", http.StatusUnauthorized)
+			return
+		}
+		switch r.URL.Path {
+		case "/repos/octo/hello/pulls/5":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{
+				"number": 5,
+				"title": "MCP status",
+				"state": "open",
+				"merged": false,
+				"mergeable": false,
+				"head": {"sha": "mcp-sha"}
+			}`))
+		case "/repos/octo/hello/commits/mcp-sha/check-runs":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{
+				"total_count": 1,
+				"check_runs": [
+					{"name": "ci", "status": "completed", "conclusion": "success"}
+				]
+			}`))
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	ghClient, err := githubpkg.NewClient(
+		"test-token",
+		"octo",
+		"hello",
+		githubpkg.WithBaseURL(srv.URL),
+		githubpkg.WithHTTPClient(testutil.LocalOnlyHTTPClient(t, srv)),
+	)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	s := NewServer("orchestrator", "")
+	RegisterOrchestratorTools(s, &Deps{GitHub: ghClient})
+
+	resp := callMCPToolForTest(t, s, "get_pr_status", map[string]any{"pr_number": 5})
+	if errPayload, ok := resp["error"]; ok {
+		t.Fatalf("get_pr_status returned error: %#v", errPayload)
+	}
+	var status githubpkg.PRStatus
+	if err := json.Unmarshal([]byte(mcpToolTextForTest(t, resp)), &status); err != nil {
+		t.Fatalf("result text is not PRStatus JSON: %v", err)
+	}
+	if status.Number != 5 || status.Title != "MCP status" || status.State != "open" {
+		t.Fatalf("status = %#v, want configured GitHub PR status", status)
+	}
+	if status.Mergeable == nil || *status.Mergeable {
+		t.Fatalf("Mergeable = %#v, want false pointer", status.Mergeable)
+	}
+	wantChecks := []githubpkg.Check{{Name: "ci", Status: githubpkg.CheckSuccess}}
+	if !reflect.DeepEqual(status.Checks, wantChecks) {
+		t.Fatalf("Checks = %#v, want %#v", status.Checks, wantChecks)
+	}
+}
+
+func TestRegisterOrchestratorToolsGetPRStatusRejectsUnconfiguredGitHubClient(t *testing.T) {
+	s := NewServer("orchestrator", "")
+	RegisterOrchestratorTools(s, &Deps{})
+
+	resp := callMCPToolForTest(t, s, "get_pr_status", map[string]any{"pr_number": 5})
+	errPayload, ok := resp["error"].(map[string]any)
+	if !ok {
+		t.Fatalf("response = %#v, want JSON-RPC error", resp)
+	}
+	msg, _ := errPayload["message"].(string)
+	if !strings.Contains(msg, "github.token, github.owner, and github.repo must be configured") {
+		t.Fatalf("error message = %q, want unconfigured GitHub guidance", msg)
 	}
 }
 
@@ -2083,6 +2166,57 @@ func testMCPDeps(dir string, l *ledger.Ledger) *Deps {
 		Session: "missing-session",
 		cleanup: successfulCleanupOps(),
 	}
+}
+
+func callMCPToolForTest(t *testing.T, s *Server, name string, args map[string]any) map[string]any {
+	t.Helper()
+	call := map[string]any{
+		"jsonrpc": "2.0",
+		"id":      name,
+		"method":  "tools/call",
+		"params": map[string]any{
+			"name":      name,
+			"arguments": args,
+		},
+	}
+	body, err := json.Marshal(call)
+	if err != nil {
+		t.Fatalf("Marshal call: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/mcp/orchestrator", bytes.NewReader(body))
+	rr := httptest.NewRecorder()
+
+	s.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("response is not JSON: %v\n%s", err, rr.Body.String())
+	}
+	return resp
+}
+
+func mcpToolTextForTest(t *testing.T, resp map[string]any) string {
+	t.Helper()
+	result, ok := resp["result"].(map[string]any)
+	if !ok {
+		t.Fatalf("response missing result object: %#v", resp)
+	}
+	content, ok := result["content"].([]any)
+	if !ok || len(content) != 1 {
+		t.Fatalf("result content = %#v, want one content item", result["content"])
+	}
+	item, ok := content[0].(map[string]any)
+	if !ok {
+		t.Fatalf("content[0] = %#v, want object", content[0])
+	}
+	text, ok := item["text"].(string)
+	if !ok {
+		t.Fatalf("content[0].text = %#v, want string", item["text"])
+	}
+	return text
 }
 
 func successfulCleanupOps() workerCleanupOps {

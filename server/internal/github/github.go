@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/url"
 	"time"
 
 	gh "github.com/google/go-github/v60/github"
@@ -36,12 +37,17 @@ type PRStatus struct {
 // tokenTransport adds an Authorization: Bearer header to every request.
 type tokenTransport struct {
 	token string
+	base  http.RoundTripper
 }
 
 func (t *tokenTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	req = req.Clone(req.Context())
 	req.Header.Set("Authorization", "Bearer "+t.token)
-	return http.DefaultTransport.RoundTrip(req)
+	base := t.base
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	return base.RoundTrip(req)
 }
 
 // Client wraps the GitHub API.
@@ -51,19 +57,64 @@ type Client struct {
 	client *gh.Client
 }
 
+type clientOptions struct {
+	httpClient *http.Client
+	baseURL    string
+}
+
+// ClientOption customizes a GitHub API client.
+type ClientOption func(*clientOptions)
+
+// WithHTTPClient configures the HTTP client used for GitHub API requests.
+func WithHTTPClient(httpClient *http.Client) ClientOption {
+	return func(opts *clientOptions) {
+		opts.httpClient = httpClient
+	}
+}
+
+// WithBaseURL configures the GitHub API base URL.
+func WithBaseURL(baseURL string) ClientOption {
+	return func(opts *clientOptions) {
+		opts.baseURL = baseURL
+	}
+}
+
 // NewClient creates a GitHub API client using the provided token.
-func NewClient(token, owner, repo string) (*Client, error) {
+func NewClient(token, owner, repo string, options ...ClientOption) (*Client, error) {
 	if token == "" || owner == "" || repo == "" {
 		return nil, fmt.Errorf("github: token, owner, and repo are required")
 	}
-	httpClient := &http.Client{
-		Transport: &tokenTransport{token: token},
-		Timeout:   30 * time.Second,
+	var opts clientOptions
+	for _, option := range options {
+		option(&opts)
 	}
+
+	httpClient := &http.Client{Timeout: 30 * time.Second}
+	if opts.httpClient != nil {
+		clientCopy := *opts.httpClient
+		httpClient = &clientCopy
+	}
+	httpClient.Transport = &tokenTransport{token: token, base: httpClient.Transport}
+
+	ghClient := gh.NewClient(httpClient)
+	if opts.baseURL != "" {
+		baseURL, err := url.Parse(opts.baseURL)
+		if err != nil {
+			return nil, fmt.Errorf("github: parse base URL: %w", err)
+		}
+		if baseURL.Scheme == "" || baseURL.Host == "" {
+			return nil, fmt.Errorf("github: base URL must be absolute")
+		}
+		if baseURL.Path == "" || baseURL.Path[len(baseURL.Path)-1] != '/' {
+			baseURL.Path += "/"
+		}
+		ghClient.BaseURL = baseURL
+	}
+
 	return &Client{
 		owner:  owner,
 		repo:   repo,
-		client: gh.NewClient(httpClient),
+		client: ghClient,
 	}, nil
 }
 
