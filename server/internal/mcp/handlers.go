@@ -24,6 +24,10 @@ import (
 
 var mergeCommitRE = regexp.MustCompile(`^[0-9a-fA-F]{7,64}$`)
 
+type notifyTriggerer interface {
+	Trigger(ctx context.Context, reason string) error
+}
+
 // Deps holds the dependencies used by MCP tool handlers.
 type Deps struct {
 	Ledger      *ledger.Ledger
@@ -34,6 +38,8 @@ type Deps struct {
 	BaseURL     string            // e.g. "http://localhost:8080"
 	Manager     *runtimepkg.Manager
 	ProjectSlug string
+
+	NotifyTrigger notifyTriggerer
 
 	notifyAfterOwnershipPreflight func()
 }
@@ -1129,6 +1135,10 @@ func handleNotify(deps *Deps) ToolHandler {
 
 		}
 
+		if err := triggerAfterNotify(ctx, toolDeps, notifyType, taskID); err != nil {
+			log.Printf("warn: notify %s for task %s updated ledger but failed to trigger orchestrator: %v",
+				notifyType, taskID, err)
+		}
 		return map[string]any{"ok": true}, nil
 	}
 }
@@ -1170,16 +1180,43 @@ func depsForProject(deps *Deps, slug string) (*Deps, error) {
 	if err != nil {
 		return nil, err
 	}
+	var notifyTrigger notifyTriggerer
+	if project.NotifyTrigger != nil {
+		notifyTrigger = project.NotifyTrigger
+	} else if project.Orchestrator != nil {
+		notifyTrigger = project.Orchestrator
+	}
 	return &Deps{
-		Ledger:      project.Ledger,
-		Registry:    project.Registry,
-		Config:      project.Config,
-		GitHub:      project.GitHub,
-		Session:     project.Session,
-		BaseURL:     project.BaseURL,
-		Manager:     deps.Manager,
-		ProjectSlug: project.Slug,
+		Ledger:        project.Ledger,
+		Registry:      project.Registry,
+		Config:        project.Config,
+		GitHub:        project.GitHub,
+		Session:       project.Session,
+		BaseURL:       project.BaseURL,
+		Manager:       deps.Manager,
+		ProjectSlug:   project.Slug,
+		NotifyTrigger: notifyTrigger,
 	}, nil
+}
+
+func triggerAfterNotify(ctx context.Context, deps *Deps, notifyType, taskID string) error {
+	if deps.NotifyTrigger == nil {
+		return nil
+	}
+	return deps.NotifyTrigger.Trigger(context.WithoutCancel(ctx), notifyTriggerReason(notifyType, taskID))
+}
+
+func notifyTriggerReason(notifyType, taskID string) string {
+	switch notifyType {
+	case "completed":
+		return "worker completed: " + taskID
+	case "blocked":
+		return "worker blocked: " + taskID
+	case "split_request":
+		return "worker split_request: " + taskID
+	default:
+		return "worker notify: " + taskID
+	}
 }
 
 func fileListArg(args map[string]any, key string) ([]string, error) {
