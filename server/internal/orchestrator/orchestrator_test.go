@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -176,8 +177,8 @@ func TestTriggerStartsOrchestratorWithSnapshotAndMCPArgs(t *testing.T) {
 	if strings.Contains(command, "tok en") {
 		t.Fatalf("command exposes MCP secret: %q", command)
 	}
-	if strings.Contains(command, `"$`+secretEnvName+`"`) {
-		t.Fatalf("command expands MCP secret into argv: %q", command)
+	if strings.Contains(command, secretEnvToken) {
+		t.Fatalf("command contains unresolved MCP secret sentinel: %q", command)
 	}
 	if !strings.Contains(command, "export "+secretEnvName) {
 		t.Fatalf("command does not export MCP secret env: %q", command)
@@ -1039,6 +1040,49 @@ func TestBuildMCPTokensRejectsInvalidTemplateShellSyntax(t *testing.T) {
 	_, err := buildMCPTokens("--mcp-url '{url}", "http://localhost:8080/mcp/orchestrator", "")
 	if err == nil {
 		t.Fatal("buildMCPTokens() error = nil, want invalid shell syntax error")
+	}
+}
+
+func TestBuildHarnessLaunchCommandExpandsSecretEnvInHarnessArg(t *testing.T) {
+	dir := t.TempDir()
+	promptPath := filepath.Join(dir, "prompt")
+	secretPath := filepath.Join(dir, "secret")
+	outputPath := filepath.Join(dir, "argv")
+	secret := `tok en ' "$HOME" $(echo nope); *`
+	want := "prefix:" + secret + ":suffix"
+
+	if err := os.WriteFile(promptPath, []byte("prompt"), 0o600); err != nil {
+		t.Fatalf("write prompt: %v", err)
+	}
+	if err := os.WriteFile(secretPath, []byte(secret), 0o600); err != nil {
+		t.Fatalf("write secret: %v", err)
+	}
+
+	command := buildHarnessLaunchCommand("sh", []string{
+		"-c",
+		`printf '%s' "$1" > "$0"`,
+		outputPath,
+		"prefix:" + secretEnvToken + ":suffix",
+	}, promptPath, secretPath)
+	if strings.Contains(command, secret) {
+		t.Fatalf("command exposes MCP secret: %q", command)
+	}
+	if !strings.Contains(command, `"$`+secretEnvName+`"`) {
+		t.Fatalf("command does not expand MCP secret env: %q", command)
+	}
+
+	if out, err := exec.Command("sh", "-c", command).CombinedOutput(); err != nil {
+		t.Fatalf("run launch command: %v\n%s", err, out)
+	}
+	gotBytes, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatalf("read harness argv: %v", err)
+	}
+	if got := string(gotBytes); got != want {
+		t.Fatalf("harness arg = %q, want %q", got, want)
+	}
+	if _, err := os.Stat(secretPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("secret temp file still exists or stat failed: %v", err)
 	}
 }
 
