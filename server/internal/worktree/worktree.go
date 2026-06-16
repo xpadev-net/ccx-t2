@@ -376,10 +376,6 @@ func isLegacyCleanupBranchName(branch string) bool {
 	return strings.Contains(branch, "/")
 }
 
-func run(name string, args ...string) error {
-	return runContext(context.Background(), name, args...)
-}
-
 func runContext(ctx context.Context, name string, args ...string) error {
 	out, err := commandCombinedOutput(ctx, name, args...)
 	if err != nil {

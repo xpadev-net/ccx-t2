@@ -12,6 +12,8 @@ import (
 	"time"
 )
 
+type worktreeTestContextKey struct{}
+
 func TestCreateCreatesDedicatedBranchWorktree(t *testing.T) {
 	repoPath := initRepo(t)
 	worktreePath := filepath.Join(t.TempDir(), "worker-task-001")
@@ -80,7 +82,7 @@ func TestCreateContextRejectsCanceledContext(t *testing.T) {
 
 func TestHeadRefContextUsesCommandContext(t *testing.T) {
 	repoPath := t.TempDir()
-	ctx := context.WithValue(context.Background(), struct{}{}, "marker")
+	ctx := context.WithValue(context.Background(), worktreeTestContextKey{}, "marker")
 	var gotCtx context.Context
 	var gotName string
 	var gotArgs []string

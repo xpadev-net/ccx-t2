@@ -1922,10 +1922,6 @@ func buildHarnessCommand(command string, mcpTokens []string) string {
 	return strings.Join(parts, " ")
 }
 
-func waitForHarnessProcess(session, window string, timeout time.Duration) error {
-	return waitForHarnessProcessContext(context.Background(), session, window, timeout)
-}
-
 func waitForHarnessProcessContext(ctx context.Context, session, window string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for {

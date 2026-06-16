@@ -8,8 +8,10 @@ import (
 	"testing"
 )
 
+type tmuxTestContextKey struct{}
+
 func TestCreateWindowContextUsesCommandContext(t *testing.T) {
-	ctx := context.WithValue(context.Background(), struct{}{}, "marker")
+	ctx := context.WithValue(context.Background(), tmuxTestContextKey{}, "marker")
 	var gotCtx context.Context
 	var gotName string
 	var gotArgs []string
@@ -36,7 +38,7 @@ func TestCreateWindowContextUsesCommandContext(t *testing.T) {
 }
 
 func TestSendKeysContextUsesCommandContextForLiteralAndEnter(t *testing.T) {
-	ctx := context.WithValue(context.Background(), struct{}{}, "marker")
+	ctx := context.WithValue(context.Background(), tmuxTestContextKey{}, "marker")
 	var gotContexts []context.Context
 	var gotNames []string
 	var gotArgs [][]string
