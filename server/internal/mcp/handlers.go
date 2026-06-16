@@ -695,7 +695,7 @@ func cleanupArchivedTaskResources(deps *Deps, taskID, branch string) {
 		deps.Config.Project.Slug+"-"+taskID)
 	_ = worktree.Remove(deps.Config.Project.RepoPath, wPath)
 	if branch != "" {
-		cleanupTaskBranch(deps.Config.Project.RepoPath, branch, taskID)
+		_ = cleanupTaskBranch(deps.Config.Project.RepoPath, branch, taskID)
 	}
 }
 
@@ -823,7 +823,7 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 		// Step 2: Create tmux window.
 		if err := tmux.CreateWindow(toolDeps.Session, workerID, worktreePath); err != nil {
 			_ = worktree.Remove(repoPath, worktreePath)
-			cleanupTaskBranch(repoPath, branch, taskID)
+			_ = cleanupTaskBranch(repoPath, branch, taskID)
 			return nil, fmt.Errorf("create tmux window: %w", err)
 		}
 
@@ -841,7 +841,7 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 		if updateErr != nil {
 			_ = tmux.KillWindow(toolDeps.Session, workerID)
 			_ = worktree.Remove(repoPath, worktreePath)
-			cleanupTaskBranch(repoPath, branch, taskID)
+			_ = cleanupTaskBranch(repoPath, branch, taskID)
 			return nil, fmt.Errorf("update ledger: %w", updateErr)
 		}
 		promptTask, err := loadTaskByID(toolDeps.Ledger, taskID)
@@ -1485,14 +1485,6 @@ func cleanupTaskBranch(repoPath, branch, taskID string) error {
 		return err
 	}
 	return nil
-}
-
-// stopWorkerCleanup is best-effort cleanup: it kills the tmux window,
-// removes the worktree, deletes the git branch when safe, and evicts the registry entry.
-// The structured result is intentionally ignored by older best-effort callers,
-// but stop_worker and notify use it to leave blocked retry state on failure.
-func stopWorkerCleanup(deps *Deps, workerID, branch, taskID string) workerCleanupResult {
-	return cleanupWorkerResources(deps, workerID, branch, taskID, true)
 }
 
 func cleanupWorkerResources(deps *Deps, workerID, branch, taskID string, deleteBranch bool) workerCleanupResult {
