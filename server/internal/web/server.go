@@ -1216,8 +1216,8 @@ func taskFromCreateRequest(req taskMutationRequest) (ledger.Task, error) {
 	if strings.TrimSpace(task.Status) == "" {
 		task.Status = "unstarted"
 	}
-	if strings.TrimSpace(task.Status) == "deleting" {
-		return ledger.Task{}, fmt.Errorf("status deleting is reserved for task deletion")
+	if err := validateTaskMutation(task); err != nil {
+		return ledger.Task{}, err
 	}
 	if strings.TrimSpace(task.Title) == "" && strings.TrimSpace(task.Body) != "" {
 		task.Title = "Natural language intake"
@@ -1271,6 +1271,28 @@ var errInvalidTaskMutation = errors.New("invalid task mutation")
 var errTaskDeletingConflict = errors.New("task delete is in progress")
 var errWorkerNotActive = errors.New("worker is not active")
 
+func validateTaskMutation(task ledger.Task) error {
+	if !validTaskStatus(task.Status) {
+		return fmt.Errorf("status must be one of: unstarted, in_progress, blocked, completed, split")
+	}
+	if err := ledger.ValidatePaths(task.AllowedFiles); err != nil {
+		return fmt.Errorf("allowed_files: %w", err)
+	}
+	if err := ledger.ValidatePaths(task.ForbiddenFiles); err != nil {
+		return fmt.Errorf("forbidden_files: %w", err)
+	}
+	return nil
+}
+
+func validTaskStatus(status string) bool {
+	switch status {
+	case "unstarted", "in_progress", "blocked", "completed", "split":
+		return true
+	default:
+		return false
+	}
+}
+
 func validateTaskUpdate(current ledger.Task, fields map[string]any) error {
 	if current.Status == "deleting" {
 		return errTaskDeletingConflict
@@ -1278,10 +1300,10 @@ func validateTaskUpdate(current ledger.Task, fields map[string]any) error {
 	if status, ok := fields["status"].(string); ok && strings.TrimSpace(status) == "" {
 		return fmt.Errorf("%w: status cannot be empty", errInvalidTaskMutation)
 	}
-	if status, ok := fields["status"].(string); ok && strings.TrimSpace(status) == "deleting" {
-		return fmt.Errorf("%w: status deleting is reserved for task deletion", errInvalidTaskMutation)
-	}
 	next := taskSnapshotWithFields(current, fields)
+	if err := validateTaskMutation(next); err != nil {
+		return fmt.Errorf("%w: %w", errInvalidTaskMutation, err)
+	}
 	if strings.TrimSpace(next.Title) == "" && strings.TrimSpace(next.Body) == "" {
 		return fmt.Errorf("%w: title and body cannot both be empty", errInvalidTaskMutation)
 	}

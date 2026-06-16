@@ -442,6 +442,42 @@ func TestPostTasksRejectsDeletingStatus(t *testing.T) {
 	}
 }
 
+func TestPostTasksRejectsUnknownStatus(t *testing.T) {
+	l := newTestLedger(t)
+	resp := performJSONRequest(New(Deps{Ledger: l, AuthDisabled: true}), http.MethodPost, "/api/tasks", `{
+		"title": "New task",
+		"status": "waiting"
+	}`)
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusBadRequest, resp.Body.String())
+	}
+	tasks, err := l.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(tasks) != 0 {
+		t.Fatalf("tasks = %#v, want invalid task rejected before persistence", tasks)
+	}
+}
+
+func TestPostTasksRejectsEscapingAllowedFile(t *testing.T) {
+	l := newTestLedger(t)
+	resp := performJSONRequest(New(Deps{Ledger: l, AuthDisabled: true}), http.MethodPost, "/api/tasks", `{
+		"title": "New task",
+		"allowed_files": ["../secrets.env"]
+	}`)
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusBadRequest, resp.Body.String())
+	}
+	tasks, err := l.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(tasks) != 0 {
+		t.Fatalf("tasks = %#v, want invalid task rejected before persistence", tasks)
+	}
+}
+
 func TestPostTasksDuplicateIdempotencyKeyReturnsExistingTask(t *testing.T) {
 	l := newTestLedger(t)
 	if err := l.Add(ledger.Task{ID: "task-20260101-0001", Title: "Existing", Status: "unstarted"}); err != nil {
@@ -734,6 +770,76 @@ func TestPatchRejectsDeletingStatus(t *testing.T) {
 	}
 	if len(tasks) != 1 || tasks[0].Status != "unstarted" {
 		t.Fatalf("tasks = %#v, want status unchanged", tasks)
+	}
+}
+
+func TestPatchRejectsUnknownStatus(t *testing.T) {
+	l := newTestLedger(t)
+	if err := l.Add(ledger.Task{ID: "task-001", Title: "Old", Status: "unstarted"}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	resp := performJSONRequest(New(Deps{Ledger: l, AuthDisabled: true}), http.MethodPatch, "/api/tasks/task-001", `{"status": "waiting"}`)
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusBadRequest, resp.Body.String())
+	}
+	tasks, err := l.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(tasks) != 1 || tasks[0].Status != "unstarted" {
+		t.Fatalf("tasks = %#v, want status unchanged", tasks)
+	}
+}
+
+func TestPatchRejectsAbsoluteForbiddenFile(t *testing.T) {
+	l := newTestLedger(t)
+	if err := l.Add(ledger.Task{ID: "task-001", Title: "Old", Status: "unstarted"}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	resp := performJSONRequest(New(Deps{Ledger: l, AuthDisabled: true}), http.MethodPatch, "/api/tasks/task-001", `{"forbidden_files": ["/etc/passwd"]}`)
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusBadRequest, resp.Body.String())
+	}
+	tasks, err := l.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(tasks) != 1 || len(tasks[0].ForbiddenFiles) != 0 {
+		t.Fatalf("tasks = %#v, want forbidden_files unchanged", tasks)
+	}
+}
+
+func TestPatchAcceptsValidTaskStatusAndPaths(t *testing.T) {
+	l := newTestLedger(t)
+	if err := l.Add(ledger.Task{ID: "task-001", Title: "Old", Status: "unstarted"}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	resp := performJSONRequest(New(Deps{Ledger: l, AuthDisabled: true}), http.MethodPatch, "/api/tasks/task-001", `{
+		"status": "split",
+		"allowed_files": ["server/internal/web/server.go"],
+		"forbidden_files": ["server/internal/mcp/handlers.go"]
+	}`)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	tasks, err := l.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("len(tasks) = %d, want 1", len(tasks))
+	}
+	if tasks[0].Status != "split" {
+		t.Fatalf("task status = %q, want split", tasks[0].Status)
+	}
+	if len(tasks[0].AllowedFiles) != 1 || tasks[0].AllowedFiles[0] != "server/internal/web/server.go" {
+		t.Fatalf("allowed_files = %#v, want server/internal/web/server.go", tasks[0].AllowedFiles)
+	}
+	if len(tasks[0].ForbiddenFiles) != 1 || tasks[0].ForbiddenFiles[0] != "server/internal/mcp/handlers.go" {
+		t.Fatalf("forbidden_files = %#v, want server/internal/mcp/handlers.go", tasks[0].ForbiddenFiles)
 	}
 }
 
