@@ -480,13 +480,31 @@ func handleSplitTask(deps *Deps) ToolHandler {
 			if pendingIntent != cleanupIntentSplitRequest {
 				return nil, fmt.Errorf("task %s has %s cleanup pending; retry that cleanup before split_task", id, pendingIntent)
 			}
-			wid := original.WorkerID
+			pendingTask, err := toolDeps.Ledger.UpdateIfStatusesReturnPrevWith(id, []string{"blocked"},
+				func(current ledger.Task) (map[string]any, error) {
+					currentIntent, currentOriginalReason, ok := cleanupIntentFromTask(current)
+					if !ok {
+						return nil, fmt.Errorf("task %s is missing cleanup marker", id)
+					}
+					if currentIntent != cleanupIntentSplitRequest {
+						return nil, fmt.Errorf("task %s has %s cleanup pending, not %s",
+							id, currentIntent, cleanupIntentSplitRequest)
+					}
+					originalReason = currentOriginalReason
+					return map[string]any{
+						"reason": cleanupPendingReason(cleanupIntentSplitRequest, nil, originalReason),
+					}, nil
+				})
+			if err != nil {
+				return nil, err
+			}
+			wid := pendingTask.WorkerID
 			if wid == "" {
 				wid = workerIDFor(toolDeps, id)
 			}
-			result := cleanupWorkerResources(toolDeps, wid, original.Branch, id, true)
+			result := cleanupWorkerResources(toolDeps, wid, pendingTask.Branch, id, true)
 			if cleanupErr := result.Err(); cleanupErr != nil {
-				if err := markCleanupPending(toolDeps, id, wid, *original, cleanupIntentSplitRequest, originalReason, cleanupErr); err != nil {
+				if err := markCleanupPending(toolDeps, id, wid, pendingTask, cleanupIntentSplitRequest, originalReason, cleanupErr); err != nil {
 					return nil, fmt.Errorf("%w; additionally failed to record cleanup state: %v", cleanupErr, err)
 				}
 				return nil, cleanupErr
@@ -1336,6 +1354,7 @@ func handleNotify(deps *Deps) ToolHandler {
 					"branch":    prevTask.Branch,
 					"harness":   prevTask.Harness,
 					"reason":    prevTask.Reason,
+					"body":      prevTask.Body,
 				}); rollbackErr != nil {
 					log.Printf("warn: split_request rollback failed for task %s after child creation error: %v", taskID, rollbackErr)
 				}
