@@ -148,6 +148,7 @@ function App() {
   const [warning, setWarning] = useState("");
   const [error, setError] = useState("");
   const settingsDirtyRef = useRef(false);
+  const selectedProjectSlugRef = useRef("");
   const taskEditorDirtyRef = useRef<TaskEditorDirty>(emptyTaskEditorDirty());
   const taskEditorTaskIDRef = useRef("");
 
@@ -450,10 +451,12 @@ function App() {
       ]);
       setConfig(configData);
       setProjects(projectData);
-      const normalizedProjectSlug = normalizedProjectSelection(projectData, selectedProjectSlug, preferredProjectSlug);
-      setSelectedProjectSlug((current) => {
-        return normalizedProjectSelection(projectData, current, preferredProjectSlug);
-      });
+      const normalizedProjectSlug = normalizedProjectSelection(
+        projectData,
+        selectedProjectSlugRef.current,
+        preferredProjectSlug
+      );
+      setProjectSlug(normalizedProjectSlug);
       if (replaceDraft || !settingsDirtyRef.current) {
         setConfigDraft(configToDraft(configData));
         settingsDirtyRef.current = false;
@@ -466,7 +469,7 @@ function App() {
       if (rethrowErrors) {
         throw err;
       }
-      return selectedProjectSlug;
+      return selectedProjectSlugRef.current;
     } finally {
       setSettingsLoading(false);
     }
@@ -649,7 +652,7 @@ function App() {
       );
       setNewProjectSlug("");
       setNewProjectRepoPath("");
-      setSelectedProjectSlug(slug);
+      setProjectSlug(slug);
       await refreshSettings(token, true);
       setMessage("Project added.");
     } catch (err) {
@@ -673,7 +676,7 @@ function App() {
       setWorkers([]);
       setSelectedID("");
       setSelectedWorkerID("");
-      setSelectedProjectSlug((current) => (current === slug ? "" : current));
+      setProjectSlug(selectedProjectSlugRef.current === slug ? "" : selectedProjectSlugRef.current);
       await refreshSettings(token, true);
       setMessage("Project deleted.");
     } catch (err) {
@@ -684,7 +687,7 @@ function App() {
   }
 
   function selectProject(slug: string) {
-    setSelectedProjectSlug(slug);
+    setProjectSlug(slug);
     setTasks([]);
     setWorkers([]);
     setSelectedID("");
@@ -697,6 +700,11 @@ function App() {
   function updateConfigDraft(patch: Partial<ConfigDraft>) {
     markSettingsDirty();
     setConfigDraft((current) => ({ ...current, ...patch }));
+  }
+
+  function setProjectSlug(slug: string) {
+    selectedProjectSlugRef.current = slug;
+    setSelectedProjectSlug(slug);
   }
 
   function updateTaskTitle(value: string) {
