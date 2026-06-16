@@ -18,6 +18,7 @@ func TestEnsureConfigCreatesDefaultConfig(t *testing.T) {
 	if err := os.Chdir(dir); err != nil {
 		t.Fatalf("Chdir: %v", err)
 	}
+	t.Setenv("HOME", dir)
 	binDir := filepath.Join(dir, "bin")
 	if err := os.Mkdir(binDir, 0o755); err != nil {
 		t.Fatalf("Mkdir bin: %v", err)
@@ -114,6 +115,7 @@ func TestCloneForWorkerRuntimeUsesWorkerMCPSecret(t *testing.T) {
 func TestDefaultConfigAllowsNoDetectedHarnesses(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("PATH", dir)
+	t.Setenv("HOME", dir)
 
 	cfg, err := defaultConfig()
 	if err != nil {

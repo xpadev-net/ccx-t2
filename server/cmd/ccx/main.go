@@ -179,6 +179,9 @@ func defaultConfig() (*config.Config, error) {
 		home = "."
 	}
 	worktreeBase := filepath.Join(home, ".local", "share", "ccx-t2", "worktrees")
+	if err := os.MkdirAll(worktreeBase, 0o755); err != nil {
+		return nil, fmt.Errorf("create default worktree base: %w", err)
+	}
 	workerHarnesses, harnesses := detectHarnesses()
 	orchestratorHarness := ""
 	if len(workerHarnesses) > 0 {

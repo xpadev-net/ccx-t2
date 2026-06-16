@@ -1215,7 +1215,7 @@ func TestDefaultWorkerCleanerSkipsUnsafeDefaultBranchDelete(t *testing.T) {
 	repoPath := initWebTestRepo(t)
 	cfg := testConfig()
 	cfg.Project.RepoPath = repoPath
-	cfg.Project.WorktreeBase = filepath.Join(t.TempDir(), "worktrees")
+	cfg.Project.WorktreeBase = mkdirWebTestDir(t, "worktrees")
 	cleaner := defaultWorkerCleaner{
 		deps: func() cleanupDependencies {
 			return cleanupDependencies{cfg: cfg}
@@ -1242,7 +1242,7 @@ func TestDefaultWorkerCleanerSkipsOriginUnavailableBranchDelete(t *testing.T) {
 	runWebGit(t, repoPath, "branch", "feature/task-001")
 	cfg := testConfig()
 	cfg.Project.RepoPath = repoPath
-	cfg.Project.WorktreeBase = filepath.Join(t.TempDir(), "worktrees")
+	cfg.Project.WorktreeBase = mkdirWebTestDir(t, "worktrees")
 	registry := worker.NewRegistry()
 	registry.Register(worker.Info{WorkerID: "worker-task-001", TaskID: "task-001"})
 	cleaner := defaultWorkerCleaner{
@@ -1396,6 +1396,7 @@ func TestPatchConfigUpdatesAndPersistsEditableFields(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.yaml")
 	cfg := testConfig()
+	makeWebConfigPathsValid(t, cfg)
 	cfg.Server.McpSecret = "${CCX_TEST_SECRET}"
 	cfg.Project.ValidationCommand = "GITHUB_TOKEN=${GITHUB_TOKEN} go test ./..."
 	cfg.Harnesses["worker"] = config.HarnessConfig{
@@ -1415,8 +1416,9 @@ func TestPatchConfigUpdatesAndPersistsEditableFields(t *testing.T) {
 	}
 	server := New(Deps{Config: loaded, ConfigPath: configPath, AuthDisabled: true})
 
+	nextRepo := initWebTestRepo(t)
 	resp := performJSONRequest(server, http.MethodPatch, "/api/config", `{
-		"project": {"slug": "next", "repo_path": "/repo2"},
+		"project": {"slug": "next", "repo_path": "`+nextRepo+`"},
 		"server": {"host": "0.0.0.0", "port": 9091},
 		"orchestrator": {"harness": "orchestrator", "heartbeat_interval": "2m", "timeout": "45m"},
 		"worker_harnesses": ["worker"],
@@ -1436,7 +1438,7 @@ func TestPatchConfigUpdatesAndPersistsEditableFields(t *testing.T) {
 	if err := json.Unmarshal(resp.Body.Bytes(), &patched); err != nil {
 		t.Fatalf("decode config: %v", err)
 	}
-	if patched.Project.Slug != "next" || patched.Project.RepoPath != "/repo2" || patched.Server.Host != "0.0.0.0" || patched.Server.Port != 9091 {
+	if patched.Project.Slug != "next" || patched.Project.RepoPath != canonicalWebTestPath(t, nextRepo) || patched.Server.Host != "0.0.0.0" || patched.Server.Port != 9091 {
 		t.Fatalf("patched config = %#v, want updated project/server", patched)
 	}
 	if patched.Orchestrator.HeartbeatInterval != "2m0s" || patched.Orchestrator.Timeout != "45m0s" {
@@ -1457,6 +1459,7 @@ func TestPatchConfigRejectsInvalidDuration(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.yaml")
 	cfg := testConfig()
+	makeWebConfigPathsValid(t, cfg)
 	if err := config.Save(configPath, cfg); err != nil {
 		t.Fatalf("Save config: %v", err)
 	}
@@ -1466,6 +1469,98 @@ func TestPatchConfigRejectsInvalidDuration(t *testing.T) {
 	}`)
 	if resp.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusBadRequest, resp.Body.String())
+	}
+}
+
+func TestPatchConfigRejectsUnsafeProjectLedgerPath(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	cfg := testConfig()
+	makeWebConfigPathsValid(t, cfg)
+	cfg.Projects = map[string]config.ProjectConfig{
+		cfg.Project.Slug: cfg.Project,
+	}
+	cfg.Project = config.ProjectConfig{}
+	if err := config.Save(configPath, cfg); err != nil {
+		t.Fatalf("Save config: %v", err)
+	}
+	loaded, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("Load config: %v", err)
+	}
+	server := New(Deps{Config: loaded, ConfigPath: configPath, AuthDisabled: true})
+	unsafeLedger := filepath.Join(t.TempDir(), "ledger.md")
+
+	resp := performJSONRequest(server, http.MethodPatch, "/api/config", `{
+		"projects": {"ccx-t2": {"ledger_path": "`+unsafeLedger+`"}}
+	}`)
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusBadRequest, resp.Body.String())
+	}
+	if !strings.Contains(resp.Body.String(), "ledger_path") || !strings.Contains(resp.Body.String(), "under repo_path") {
+		t.Fatalf("body = %s, want ledger containment guidance", resp.Body.String())
+	}
+}
+
+func TestPatchConfigRejectsUnsafeTopLevelProjectLedgerPathWithProjects(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	cfg := testConfig()
+	makeWebConfigPathsValid(t, cfg)
+	cfg.Projects = map[string]config.ProjectConfig{
+		cfg.Project.Slug: cfg.Project,
+	}
+	cfg.Project = config.ProjectConfig{}
+	if err := config.Save(configPath, cfg); err != nil {
+		t.Fatalf("Save config: %v", err)
+	}
+	loaded, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("Load config: %v", err)
+	}
+	server := New(Deps{Config: loaded, ConfigPath: configPath, AuthDisabled: true})
+	repoPath := initWebTestRepo(t)
+	worktreeBase := mkdirWebTestDir(t, "top-level-worktrees")
+	unsafeLedger := filepath.Join(t.TempDir(), "ledger.md")
+
+	resp := performJSONRequest(server, http.MethodPatch, "/api/config", `{
+		"project": {
+			"slug": "rogue",
+			"repo_path": "`+repoPath+`",
+			"worktree_base": "`+worktreeBase+`",
+			"ledger_path": "`+unsafeLedger+`"
+		}
+	}`)
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusBadRequest, resp.Body.String())
+	}
+	if !strings.Contains(resp.Body.String(), "project.ledger_path") {
+		t.Fatalf("body = %s, want top-level project ledger_path guidance", resp.Body.String())
+	}
+}
+
+func TestPatchConfigRejectsRelativeRuntimeWorktreeBase(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	cfg := testConfig()
+	makeWebConfigPathsValid(t, cfg)
+	if err := config.Save(configPath, cfg); err != nil {
+		t.Fatalf("Save config: %v", err)
+	}
+	loaded, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("Load config: %v", err)
+	}
+	server := New(Deps{Config: loaded, ConfigPath: configPath, AuthDisabled: true})
+
+	resp := performJSONRequest(server, http.MethodPatch, "/api/config", `{
+		"runtime": {"worktree_base": "relative-worktrees"}
+	}`)
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusBadRequest, resp.Body.String())
+	}
+	if !strings.Contains(resp.Body.String(), "runtime.worktree_base") || !strings.Contains(resp.Body.String(), "absolute") {
+		t.Fatalf("body = %s, want runtime worktree_base guidance", resp.Body.String())
 	}
 }
 
@@ -1482,7 +1577,7 @@ func TestCreateProjectPersistsAndReloadsManager(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.yaml")
 	cfg := testConfig()
-	cfg.Runtime.WorktreeBase = filepath.Join(dir, "worktrees")
+	cfg.Runtime.WorktreeBase = mkdirWebTestDir(t, "worktrees")
 	cfg.Project = config.ProjectConfig{}
 	cfg.Projects = map[string]config.ProjectConfig{}
 	if err := config.Save(configPath, cfg); err != nil {
@@ -1498,9 +1593,10 @@ func TestCreateProjectPersistsAndReloadsManager(t *testing.T) {
 	}
 	server := New(Deps{Config: loaded, ConfigPath: configPath, Manager: manager, AuthDisabled: true})
 
+	repoPath := initWebTestRepo(t)
 	resp := performJSONRequest(server, http.MethodPost, "/api/projects", `{
 		"slug": "alpha",
-		"repo_path": "`+filepath.Join(dir, "alpha")+`"
+		"repo_path": "`+repoPath+`"
 	}`)
 	if resp.Code != http.StatusCreated {
 		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusCreated, resp.Body.String())
@@ -1512,9 +1608,191 @@ func TestCreateProjectPersistsAndReloadsManager(t *testing.T) {
 	if _, ok := reloaded.Projects["alpha"]; !ok {
 		t.Fatalf("project alpha missing from saved config: %#v", reloaded.Projects)
 	}
+	if got, want := reloaded.Projects["alpha"].LedgerPath, filepath.Join(canonicalWebTestPath(t, repoPath), "tasks", "ledger.md"); got != want {
+		t.Fatalf("project alpha ledger_path = %q, want %q", got, want)
+	}
 	tasks := performRequest(server, http.MethodGet, "/api/projects/alpha/tasks")
 	if tasks.Code != http.StatusOK {
 		t.Fatalf("project tasks status = %d, want %d; body=%s", tasks.Code, http.StatusOK, tasks.Body.String())
+	}
+}
+
+func TestCreateProjectRejectsInvalidRepoPath(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	cfg := testConfig()
+	cfg.Runtime.WorktreeBase = mkdirWebTestDir(t, "worktrees")
+	cfg.Project = config.ProjectConfig{}
+	cfg.Projects = map[string]config.ProjectConfig{}
+	if err := config.Save(configPath, cfg); err != nil {
+		t.Fatalf("Save config: %v", err)
+	}
+	loaded, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("Load config: %v", err)
+	}
+	manager, err := runtimepkg.NewManager(loaded, "http://127.0.0.1:8080")
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	server := New(Deps{Config: loaded, ConfigPath: configPath, Manager: manager, AuthDisabled: true})
+	nonRepo := mkdirWebTestDir(t, "not-git")
+
+	resp := performJSONRequest(server, http.MethodPost, "/api/projects", `{
+		"slug": "alpha",
+		"repo_path": "`+nonRepo+`"
+	}`)
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusBadRequest, resp.Body.String())
+	}
+	if !strings.Contains(resp.Body.String(), "repo_path") {
+		t.Fatalf("body = %s, want repo_path guidance", resp.Body.String())
+	}
+}
+
+func TestCreateProjectRejectsUnsafeLedgerPath(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	cfg := testConfig()
+	cfg.Runtime.WorktreeBase = mkdirWebTestDir(t, "worktrees")
+	cfg.Project = config.ProjectConfig{}
+	cfg.Projects = map[string]config.ProjectConfig{}
+	if err := config.Save(configPath, cfg); err != nil {
+		t.Fatalf("Save config: %v", err)
+	}
+	loaded, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("Load config: %v", err)
+	}
+	manager, err := runtimepkg.NewManager(loaded, "http://127.0.0.1:8080")
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	server := New(Deps{Config: loaded, ConfigPath: configPath, Manager: manager, AuthDisabled: true})
+	repoPath := initWebTestRepo(t)
+	unsafeLedger := filepath.Join(t.TempDir(), "ledger.md")
+
+	resp := performJSONRequest(server, http.MethodPost, "/api/projects", `{
+		"slug": "alpha",
+		"repo_path": "`+repoPath+`",
+		"ledger_path": "`+unsafeLedger+`"
+	}`)
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusBadRequest, resp.Body.String())
+	}
+	if !strings.Contains(resp.Body.String(), "ledger_path") || !strings.Contains(resp.Body.String(), "under repo_path") {
+		t.Fatalf("body = %s, want ledger containment guidance", resp.Body.String())
+	}
+}
+
+func TestCreateProjectRejectsRepoInternalLedgerPathOutsideDefault(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	cfg := testConfig()
+	cfg.Runtime.WorktreeBase = mkdirWebTestDir(t, "worktrees")
+	cfg.Project = config.ProjectConfig{}
+	cfg.Projects = map[string]config.ProjectConfig{}
+	if err := config.Save(configPath, cfg); err != nil {
+		t.Fatalf("Save config: %v", err)
+	}
+	loaded, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("Load config: %v", err)
+	}
+	manager, err := runtimepkg.NewManager(loaded, "http://127.0.0.1:8080")
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	server := New(Deps{Config: loaded, ConfigPath: configPath, Manager: manager, AuthDisabled: true})
+	repoPath := initWebTestRepo(t)
+	repoConfig := filepath.Join(repoPath, ".git", "config")
+
+	resp := performJSONRequest(server, http.MethodPost, "/api/projects", `{
+		"slug": "alpha",
+		"repo_path": "`+repoPath+`",
+		"ledger_path": "`+repoConfig+`"
+	}`)
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusBadRequest, resp.Body.String())
+	}
+	if !strings.Contains(resp.Body.String(), "ledger_path") || !strings.Contains(resp.Body.String(), "default repo ledger") {
+		t.Fatalf("body = %s, want default ledger guidance", resp.Body.String())
+	}
+}
+
+func TestCreateProjectRejectsLedgerPathSymlinkToRepoInternalFile(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	cfg := testConfig()
+	cfg.Runtime.WorktreeBase = mkdirWebTestDir(t, "worktrees")
+	cfg.Project = config.ProjectConfig{}
+	cfg.Projects = map[string]config.ProjectConfig{}
+	if err := config.Save(configPath, cfg); err != nil {
+		t.Fatalf("Save config: %v", err)
+	}
+	loaded, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("Load config: %v", err)
+	}
+	manager, err := runtimepkg.NewManager(loaded, "http://127.0.0.1:8080")
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	server := New(Deps{Config: loaded, ConfigPath: configPath, Manager: manager, AuthDisabled: true})
+	repoPath := initWebTestRepo(t)
+	tasksDir := filepath.Join(repoPath, "tasks")
+	if err := os.MkdirAll(tasksDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll tasks: %v", err)
+	}
+	ledgerPath := filepath.Join(tasksDir, "ledger.md")
+	if err := os.Symlink(filepath.Join(repoPath, ".git", "config"), ledgerPath); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+
+	resp := performJSONRequest(server, http.MethodPost, "/api/projects", `{
+		"slug": "alpha",
+		"repo_path": "`+repoPath+`",
+		"ledger_path": "`+ledgerPath+`"
+	}`)
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusBadRequest, resp.Body.String())
+	}
+	if !strings.Contains(resp.Body.String(), "ledger_path") || !strings.Contains(resp.Body.String(), "symlink") {
+		t.Fatalf("body = %s, want ledger symlink guidance", resp.Body.String())
+	}
+}
+
+func TestCreateProjectRejectsUnsafeWorktreeBase(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	cfg := testConfig()
+	cfg.Runtime.WorktreeBase = mkdirWebTestDir(t, "worktrees")
+	cfg.Project = config.ProjectConfig{}
+	cfg.Projects = map[string]config.ProjectConfig{}
+	if err := config.Save(configPath, cfg); err != nil {
+		t.Fatalf("Save config: %v", err)
+	}
+	loaded, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("Load config: %v", err)
+	}
+	manager, err := runtimepkg.NewManager(loaded, "http://127.0.0.1:8080")
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	server := New(Deps{Config: loaded, ConfigPath: configPath, Manager: manager, AuthDisabled: true})
+	repoPath := initWebTestRepo(t)
+
+	resp := performJSONRequest(server, http.MethodPost, "/api/projects", `{
+		"slug": "alpha",
+		"repo_path": "`+repoPath+`",
+		"worktree_base": "relative-worktrees"
+	}`)
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusBadRequest, resp.Body.String())
+	}
+	if !strings.Contains(resp.Body.String(), "worktree_base") || !strings.Contains(resp.Body.String(), "absolute") {
+		t.Fatalf("body = %s, want worktree_base guidance", resp.Body.String())
 	}
 }
 
@@ -1522,14 +1800,15 @@ func TestDeleteProjectPersistsAndReloadsManager(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.yaml")
 	cfg := testConfig()
-	cfg.Runtime.WorktreeBase = filepath.Join(dir, "worktrees")
+	cfg.Runtime.WorktreeBase = mkdirWebTestDir(t, "worktrees")
+	repoPath := initWebTestRepo(t)
 	cfg.Project = config.ProjectConfig{}
 	cfg.Projects = map[string]config.ProjectConfig{
 		"alpha": {
 			Slug:         "alpha",
-			RepoPath:     filepath.Join(dir, "alpha"),
+			RepoPath:     repoPath,
 			WorktreeBase: cfg.Runtime.WorktreeBase,
-			LedgerPath:   filepath.Join(dir, "alpha", "tasks", "ledger.md"),
+			LedgerPath:   filepath.Join(repoPath, "tasks", "ledger.md"),
 			Orchestrator: cfg.Orchestrator,
 			GitHub:       cfg.GitHub,
 		},
@@ -1568,6 +1847,7 @@ func TestPatchConfigConcurrentRequestsPreserveUpdates(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.yaml")
 	cfg := testConfig()
+	makeWebConfigPathsValid(t, cfg)
 	if err := config.Save(configPath, cfg); err != nil {
 		t.Fatalf("Save config: %v", err)
 	}
@@ -1620,6 +1900,7 @@ func TestPatchConfigDoesNotMutateCallerConfigPointer(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.yaml")
 	cfg := testConfig()
+	makeWebConfigPathsValid(t, cfg)
 	if err := config.Save(configPath, cfg); err != nil {
 		t.Fatalf("Save config: %v", err)
 	}
@@ -2404,14 +2685,32 @@ func newTestProjectManager(t *testing.T, slugs ...string) (*config.Config, *runt
 	return cfg, manager
 }
 
+func makeWebConfigPathsValid(t *testing.T, cfg *config.Config) {
+	t.Helper()
+	cfg.Project.RepoPath = initWebTestRepo(t)
+	cfg.Project.WorktreeBase = mkdirWebTestDir(t, "worktrees")
+	if cfg.Project.LedgerPath != "" {
+		cfg.Project.LedgerPath = filepath.Join(cfg.Project.RepoPath, "tasks", "ledger.md")
+	}
+}
+
 func initWebTestRepo(t *testing.T) string {
 	t.Helper()
-	repoPath := t.TempDir()
+	repoPath := mkdirWebTestDir(t, "repo")
 	runWebGit(t, repoPath, "init", "-b", "main")
 	runWebGit(t, repoPath, "config", "user.email", "test@example.com")
 	runWebGit(t, repoPath, "config", "user.name", "Test User")
 	runWebGit(t, repoPath, "commit", "--allow-empty", "-m", "init")
 	return repoPath
+}
+
+func mkdirWebTestDir(t *testing.T, name string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), name)
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatalf("MkdirAll %s: %v", path, err)
+	}
+	return path
 }
 
 func runWebGit(t *testing.T, repoPath string, args ...string) {
@@ -2421,6 +2720,19 @@ func runWebGit(t *testing.T, repoPath string, args ...string) {
 	if err != nil {
 		t.Fatalf("git %v failed: %v\n%s", args, err, string(out))
 	}
+}
+
+func canonicalWebTestPath(t *testing.T, path string) string {
+	t.Helper()
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		t.Fatalf("Abs %s: %v", path, err)
+	}
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		t.Fatalf("EvalSymlinks %s: %v", path, err)
+	}
+	return resolved
 }
 
 func webTestBranchExists(t *testing.T, repoPath, branch string) bool {
