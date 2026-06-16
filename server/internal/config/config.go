@@ -346,6 +346,7 @@ func validate(cfg *Config) error {
 			return fmt.Errorf("config: worker harness %q: %w", name, err)
 		}
 	}
+	projectPathsNormalized := false
 	for slug, project := range cfg.Projects {
 		if strings.TrimSpace(slug) == "" {
 			return fmt.Errorf("config: project slug cannot be empty")
@@ -379,9 +380,10 @@ func validate(cfg *Config) error {
 		if cfg.Project.Slug == project.Slug {
 			cfg.Project = project
 			cfg.GitHub = project.GitHub
+			projectPathsNormalized = true
 		}
 	}
-	if projectHasPathOverride(cfg.Project) {
+	if !projectPathsNormalized && projectHasPathOverride(cfg.Project) {
 		project := cfg.Project
 		if strings.TrimSpace(project.WorktreeBase) == "" {
 			project.WorktreeBase = cfg.Runtime.WorktreeBase
@@ -498,7 +500,7 @@ func validateProjectPaths(prefix string, project ProjectConfig) (ProjectConfig, 
 	project.LedgerPath = ledgerPath
 
 	if _, err := ProjectWorktreePath(project, "task-00000000-0000"); err != nil {
-		return project, fmt.Errorf("config: %s.%w", prefix, err)
+		return project, fmt.Errorf("config: %s: %w", prefix, err)
 	}
 	return project, nil
 }
