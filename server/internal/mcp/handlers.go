@@ -1136,7 +1136,8 @@ func handleNotify(deps *Deps) ToolHandler {
 		}
 
 		if err := triggerAfterNotify(ctx, toolDeps, notifyType, taskID); err != nil {
-			return nil, err
+			log.Printf("warn: notify %s for task %s updated ledger but failed to trigger orchestrator: %v",
+				notifyType, taskID, err)
 		}
 		return map[string]any{"ok": true}, nil
 	}
@@ -1179,8 +1180,10 @@ func depsForProject(deps *Deps, slug string) (*Deps, error) {
 	if err != nil {
 		return nil, err
 	}
-	notifyTrigger := project.NotifyTrigger
-	if notifyTrigger == nil {
+	var notifyTrigger notifyTriggerer
+	if project.NotifyTrigger != nil {
+		notifyTrigger = project.NotifyTrigger
+	} else if project.Orchestrator != nil {
 		notifyTrigger = project.Orchestrator
 	}
 	return &Deps{

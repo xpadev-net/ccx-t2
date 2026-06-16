@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -24,6 +25,7 @@ import (
 type recordingNotifyTrigger struct {
 	reasons   []string
 	onTrigger func()
+	err       error
 }
 
 func (r *recordingNotifyTrigger) Trigger(_ context.Context, reason string) error {
@@ -31,7 +33,7 @@ func (r *recordingNotifyTrigger) Trigger(_ context.Context, reason string) error
 	if r.onTrigger != nil {
 		r.onTrigger()
 	}
-	return nil
+	return r.err
 }
 
 func TestBuildHarnessCommandPreservesExpandedMCPValuesAsSingleArgs(t *testing.T) {
@@ -232,6 +234,73 @@ func TestRegisterWorkerToolsNotifyTriggersOrchestratorOnce(t *testing.T) {
 				t.Fatalf("trigger reason = %q, want %q", trigger.reasons[0], tc.wantReason)
 			}
 		})
+	}
+}
+
+func TestRegisterWorkerToolsNotifySucceedsWhenPostMutationTriggerFails(t *testing.T) {
+	dir := t.TempDir()
+	l := ledger.NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
+	if err := l.Add(ledger.Task{
+		ID:       "task-001",
+		Title:    "Task",
+		Status:   "in_progress",
+		WorkerID: "worker-current",
+		Body:     "current body",
+	}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	trigger := &recordingNotifyTrigger{err: errors.New("trigger unavailable")}
+	deps := testMCPDeps(dir, l)
+	deps.NotifyTrigger = trigger
+	s := NewServer("worker", "")
+	RegisterWorkerTools(s, deps)
+
+	call := map[string]any{
+		"jsonrpc": "2.0",
+		"id":      "trigger-error",
+		"method":  "tools/call",
+		"params": map[string]any{
+			"name": "notify",
+			"arguments": map[string]any{
+				"type": "completed",
+				"payload": map[string]any{
+					"task_id":      "task-001",
+					"worker_id":    "worker-current",
+					"pr_url":       "https://example.test/pr/1",
+					"merge_commit": "abc123def456",
+				},
+			},
+		},
+	}
+	body, err := json.Marshal(call)
+	if err != nil {
+		t.Fatalf("Marshal call: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/mcp/worker", bytes.NewReader(body))
+	rr := httptest.NewRecorder()
+
+	s.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("response is not JSON: %v\n%s", err, rr.Body.String())
+	}
+	if errPayload, ok := resp["error"]; ok {
+		t.Fatalf("notify returned error after committed mutation: %#v", errPayload)
+	}
+	if len(trigger.reasons) != 1 || trigger.reasons[0] != "worker completed: task-001" {
+		t.Fatalf("trigger calls = %#v, want one attempted completion trigger", trigger.reasons)
+	}
+	tasks, err := l.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(tasks) != 1 || tasks[0].Status != "completed" || tasks[0].WorkerID != "" {
+		t.Fatalf("tasks = %#v, want completed mutation preserved", tasks)
 	}
 }
 
