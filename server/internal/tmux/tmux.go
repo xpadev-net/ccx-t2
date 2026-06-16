@@ -209,8 +209,7 @@ func run(name string, args ...string) error {
 }
 
 func runCtx(ctx context.Context, name string, args ...string) error {
-	cmd := exec.CommandContext(ctx, name, args...)
-	out, err := cmd.CombinedOutput()
+	out, err := combinedOutputCtx(ctx, name, args...)
 	if err != nil {
 		return fmt.Errorf("%s %v: %w: %s", name, args, err, strings.TrimSpace(string(out)))
 	}
@@ -218,9 +217,15 @@ func runCtx(ctx context.Context, name string, args ...string) error {
 }
 
 func outputCtx(ctx context.Context, name string, args ...string) (string, error) {
-	cmd := exec.CommandContext(ctx, name, args...)
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	cmd := execCommandContext(ctx, name, args...)
 	out, err := cmd.Output()
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", ctxErr
+		}
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
 			return "", fmt.Errorf("%s %v: %w: %s", name, args, err, strings.TrimSpace(string(exitErr.Stderr)))
@@ -228,4 +233,20 @@ func outputCtx(ctx context.Context, name string, args ...string) (string, error)
 		return "", fmt.Errorf("%s %v: %w", name, args, err)
 	}
 	return string(out), nil
+}
+
+var execCommandContext = exec.CommandContext
+
+func combinedOutputCtx(ctx context.Context, name string, args ...string) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	cmd := execCommandContext(ctx, name, args...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return out, ctxErr
+		}
+	}
+	return out, err
 }

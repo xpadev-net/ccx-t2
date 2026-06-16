@@ -53,6 +53,7 @@ type Server struct {
 }
 
 const deleteCleanupLease = 5 * time.Minute
+const deleteCleanupTimeout = 4 * time.Minute
 const maxFollowupMessageBytes = 20000
 const followupTmuxOperationTimeout = 5 * time.Second
 
@@ -826,7 +827,9 @@ func (s *Server) deleteTask(w http.ResponseWriter, r *http.Request, id string) {
 	}
 	resp := taskDeleteResponse{Deleted: taskResponseFromLedger(task)}
 	if needsCleanup {
-		if err := s.cleaner.CleanupWorker(context.WithoutCancel(r.Context()), task); err != nil {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), deleteCleanupTimeout)
+		defer cancel()
+		if err := s.cleaner.CleanupWorker(cleanupCtx, task); err != nil {
 			log.Printf("web: cleanup after task delete failed: %v", err)
 			restored, restoreErr := s.ledger.RestoreTaskSnapshotIfCurrent(task, marker)
 			if restoreErr != nil {

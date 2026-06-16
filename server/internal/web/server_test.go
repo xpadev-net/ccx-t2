@@ -948,6 +948,53 @@ func TestDeleteInProgressTaskCleansWorker(t *testing.T) {
 	}
 }
 
+func TestDeleteInProgressTaskCleanupUsesBoundedContextWithoutRequestCancel(t *testing.T) {
+	l := newTestLedger(t)
+	if err := l.Add(ledger.Task{
+		ID:       "task-001",
+		Title:    "Delete worker",
+		Status:   "in_progress",
+		WorkerID: "worker-task-001",
+	}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	cleaner := &fakeCleaner{
+		fnCtx: func(ctx context.Context) error {
+			if err := ctx.Err(); err != nil {
+				return fmt.Errorf("cleanup context already canceled: %w", err)
+			}
+			deadline, ok := ctx.Deadline()
+			if !ok {
+				return errors.New("cleanup context has no deadline")
+			}
+			now := time.Now()
+			if deadline.Before(now) || deadline.After(now.Add(deleteCleanupTimeout+time.Second)) {
+				return fmt.Errorf("cleanup deadline = %v, want within delete cleanup timeout", deadline)
+			}
+			if !deadline.Before(now.Add(deleteCleanupLease)) {
+				return fmt.Errorf("cleanup deadline = %v, want shorter than delete cleanup lease", deadline)
+			}
+			return nil
+		},
+	}
+	handler := New(Deps{Ledger: l, Cleaner: cleaner, AuthDisabled: true})
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/tasks/task-001", nil)
+	ctx, cancel := context.WithCancel(req.Context())
+	cancel()
+	req = req.WithContext(ctx)
+	resp := httptest.NewRecorder()
+
+	handler.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	if len(cleaner.tasks) != 1 {
+		t.Fatalf("cleanup calls = %d, want 1", len(cleaner.tasks))
+	}
+}
+
 func TestDeleteInProgressTaskReportsCleanupFailure(t *testing.T) {
 	l := newTestLedger(t)
 	if err := l.Add(ledger.Task{ID: "task-001", Title: "Delete worker", Status: "in_progress", WorkerID: "worker-task-001"}); err != nil {
@@ -2912,13 +2959,19 @@ func (f *fakeTrigger) Trigger(ctx context.Context, reason string) error {
 }
 
 type fakeCleaner struct {
-	tasks []ledger.Task
-	err   error
-	fn    func() error
+	tasks    []ledger.Task
+	contexts []context.Context
+	err      error
+	fn       func() error
+	fnCtx    func(context.Context) error
 }
 
 func (f *fakeCleaner) CleanupWorker(ctx context.Context, task ledger.Task) error {
 	f.tasks = append(f.tasks, task)
+	f.contexts = append(f.contexts, ctx)
+	if f.fnCtx != nil {
+		return f.fnCtx(ctx)
+	}
 	if f.fn != nil {
 		return f.fn()
 	}
