@@ -15,6 +15,11 @@ import (
 // Both repoPath and worktreePath must be absolute so that os.Stat and git
 // resolve them consistently regardless of the process working directory.
 func Create(repoPath, branch, worktreePath, baseRef string) error {
+	return CreateContext(context.Background(), repoPath, branch, worktreePath, baseRef)
+}
+
+// CreateContext creates a new git worktree with cancellation support.
+func CreateContext(ctx context.Context, repoPath, branch, worktreePath, baseRef string) error {
 	if !filepath.IsAbs(repoPath) {
 		return fmt.Errorf("repoPath must be absolute, got: %s", repoPath)
 	}
@@ -26,7 +31,24 @@ func Create(repoPath, branch, worktreePath, baseRef string) error {
 	} else if !os.IsNotExist(err) {
 		return fmt.Errorf("checking worktree path %s: %w", worktreePath, err)
 	}
-	return run("git", "-C", repoPath, "worktree", "add", "-b", branch, worktreePath, baseRef)
+	return runContext(ctx, "git", "-C", repoPath, "worktree", "add", "-b", branch, worktreePath, baseRef)
+}
+
+// HeadRef returns the current HEAD commit for repoPath.
+func HeadRef(repoPath string) (string, error) {
+	return HeadRefContext(context.Background(), repoPath)
+}
+
+// HeadRefContext returns the current HEAD commit for repoPath with cancellation support.
+func HeadRefContext(ctx context.Context, repoPath string) (string, error) {
+	if !filepath.IsAbs(repoPath) {
+		return "", fmt.Errorf("repoPath must be absolute, got: %s", repoPath)
+	}
+	out, err := commandCombinedOutput(ctx, "git", "-C", repoPath, "rev-parse", "HEAD")
+	if err != nil {
+		return "", fmt.Errorf("rev-parse HEAD: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return strings.TrimSpace(string(out)), nil
 }
 
 // Remove removes a git worktree. repoPath is the main repository root;
@@ -176,7 +198,7 @@ func branchRemoteSafety(ctx context.Context, repoPath, branch string) (string, b
 }
 
 func localBranchExists(ctx context.Context, repoPath, branch string) (bool, error) {
-	err := exec.CommandContext(ctx, "git", "-C", repoPath, "show-ref", "--verify", "--quiet", "refs/heads/"+branch).Run()
+	err := commandRun(ctx, "git", "-C", repoPath, "show-ref", "--verify", "--quiet", "refs/heads/"+branch)
 	if err == nil {
 		return true, nil
 	}
@@ -206,7 +228,7 @@ func remoteDefaultBranchNames(ctx context.Context, repoPath string, remotes []st
 }
 
 func gitRemotes(ctx context.Context, repoPath string) ([]string, error) {
-	out, err := exec.CommandContext(ctx, "git", "-C", repoPath, "remote").CombinedOutput()
+	out, err := commandCombinedOutput(ctx, "git", "-C", repoPath, "remote")
 	if err != nil {
 		return nil, fmt.Errorf("list remotes: %w: %s", err, strings.TrimSpace(string(out)))
 	}
@@ -215,7 +237,7 @@ func gitRemotes(ctx context.Context, repoPath string) ([]string, error) {
 
 func remoteDefaultBranchNamesForRemote(ctx context.Context, repoPath, remote string) ([]string, error) {
 	var defaults []string
-	if out, err := exec.CommandContext(ctx, "git", "-C", repoPath, "symbolic-ref", "--quiet", "--short", "refs/remotes/"+remote+"/HEAD").CombinedOutput(); err == nil {
+	if out, err := commandCombinedOutput(ctx, "git", "-C", repoPath, "symbolic-ref", "--quiet", "--short", "refs/remotes/"+remote+"/HEAD"); err == nil {
 		ref := strings.TrimSpace(string(out))
 		if i := strings.IndexByte(ref, '/'); i >= 0 {
 			defaults = append(defaults, ref[i+1:])
@@ -223,7 +245,7 @@ func remoteDefaultBranchNamesForRemote(ctx context.Context, repoPath, remote str
 	}
 	remoteCtx, cancel := contextWithDefaultTimeout(ctx, 5*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(remoteCtx, "git", "-C", repoPath, "ls-remote", "--symref", remote, "HEAD").CombinedOutput()
+	out, err := commandCombinedOutput(remoteCtx, "git", "-C", repoPath, "ls-remote", "--symref", remote, "HEAD")
 	if err != nil {
 		if len(defaults) > 0 {
 			return defaults, nil
@@ -240,7 +262,7 @@ func remoteDefaultBranchNamesForRemote(ctx context.Context, repoPath, remote str
 }
 
 func branchCheckedOutInWorktree(ctx context.Context, repoPath, branch string) (bool, error) {
-	out, err := exec.CommandContext(ctx, "git", "-C", repoPath, "worktree", "list", "--porcelain").CombinedOutput()
+	out, err := commandCombinedOutput(ctx, "git", "-C", repoPath, "worktree", "list", "--porcelain")
 	if err != nil {
 		return false, fmt.Errorf("list worktrees: %w: %s", err, strings.TrimSpace(string(out)))
 	}
@@ -254,7 +276,7 @@ func branchCheckedOutInWorktree(ctx context.Context, repoPath, branch string) (b
 }
 
 func branchHasRemoteRef(ctx context.Context, repoPath, branch string) (bool, error) {
-	out, err := exec.CommandContext(ctx, "git", "-C", repoPath, "for-each-ref", "--format=%(refname:short)", "refs/remotes").CombinedOutput()
+	out, err := commandCombinedOutput(ctx, "git", "-C", repoPath, "for-each-ref", "--format=%(refname:short)", "refs/remotes")
 	if err != nil {
 		return false, fmt.Errorf("list remote branches: %w: %s", err, strings.TrimSpace(string(out)))
 	}
@@ -284,7 +306,7 @@ func branchExistsOnRemote(ctx context.Context, repoPath string, remotes []string
 	want := "refs/heads/" + branch
 	for _, remote := range remotes {
 		remoteCtx, cancel := contextWithDefaultTimeout(ctx, 5*time.Second)
-		out, err := exec.CommandContext(remoteCtx, "git", "-C", repoPath, "ls-remote", "--heads", remote, want).CombinedOutput()
+		out, err := commandCombinedOutput(remoteCtx, "git", "-C", repoPath, "ls-remote", "--heads", remote, want)
 		cancel()
 		if err != nil {
 			return false, fmt.Errorf("%w: check remote branch on %s: %w: %s", ErrOriginUnavailable, remote, err, strings.TrimSpace(string(out)))
@@ -300,14 +322,11 @@ func branchExistsOnRemote(ctx context.Context, repoPath string, remotes []string
 }
 
 func contextWithDefaultTimeout(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
-	if _, ok := ctx.Deadline(); ok {
-		return ctx, func() {}
-	}
 	return context.WithTimeout(ctx, timeout)
 }
 
 func branchHasUpstream(ctx context.Context, repoPath, branch string) (bool, error) {
-	out, err := exec.CommandContext(ctx, "git", "-C", repoPath, "for-each-ref", "--format=%(upstream:short)", "refs/heads/"+branch).CombinedOutput()
+	out, err := commandCombinedOutput(ctx, "git", "-C", repoPath, "for-each-ref", "--format=%(upstream:short)", "refs/heads/"+branch)
 	if err != nil {
 		return false, fmt.Errorf("read branch upstream: %w: %s", err, strings.TrimSpace(string(out)))
 	}
@@ -362,10 +381,39 @@ func run(name string, args ...string) error {
 }
 
 func runContext(ctx context.Context, name string, args ...string) error {
-	cmd := exec.CommandContext(ctx, name, args...)
-	out, err := cmd.CombinedOutput()
+	out, err := commandCombinedOutput(ctx, name, args...)
 	if err != nil {
 		return fmt.Errorf("%s %v: %w: %s", name, args, err, strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+var execCommandContext = exec.CommandContext
+
+func commandCombinedOutput(ctx context.Context, name string, args ...string) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	cmd := execCommandContext(ctx, name, args...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return out, ctxErr
+		}
+	}
+	return out, err
+}
+
+func commandRun(ctx context.Context, name string, args ...string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	cmd := execCommandContext(ctx, name, args...)
+	err := cmd.Run()
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+	}
+	return err
 }

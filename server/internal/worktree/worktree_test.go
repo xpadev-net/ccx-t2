@@ -1,12 +1,15 @@
 package worktree
 
 import (
+	"context"
 	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestCreateCreatesDedicatedBranchWorktree(t *testing.T) {
@@ -49,6 +52,95 @@ func TestCreateRejectsDuplicateBranch(t *testing.T) {
 	err := Create(repoPath, "feature/task-001", worktreePath, "HEAD")
 	if err == nil {
 		t.Fatal("Create error = nil, want duplicate branch error")
+	}
+}
+
+func TestCreateContextRejectsCanceledContext(t *testing.T) {
+	repoPath := initRepo(t)
+	worktreePath := filepath.Join(t.TempDir(), "worker-task-001")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	oldExecCommandContext := execCommandContext
+	called := false
+	execCommandContext = func(context.Context, string, ...string) *exec.Cmd {
+		called = true
+		return exec.Command("sh", "-c", "true")
+	}
+	t.Cleanup(func() { execCommandContext = oldExecCommandContext })
+
+	err := CreateContext(ctx, repoPath, "feature/task-001", worktreePath, "HEAD")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("CreateContext canceled error = %v, want context.Canceled", err)
+	}
+	if called {
+		t.Fatal("git command was started after context was already canceled")
+	}
+}
+
+func TestHeadRefContextUsesCommandContext(t *testing.T) {
+	repoPath := t.TempDir()
+	ctx := context.WithValue(context.Background(), struct{}{}, "marker")
+	var gotCtx context.Context
+	var gotName string
+	var gotArgs []string
+
+	oldExecCommandContext := execCommandContext
+	execCommandContext = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		gotCtx = ctx
+		gotName = name
+		gotArgs = append([]string(nil), args...)
+		return exec.Command("sh", "-c", "printf abc123")
+	}
+	t.Cleanup(func() { execCommandContext = oldExecCommandContext })
+
+	got, err := HeadRefContext(ctx, repoPath)
+	if err != nil {
+		t.Fatalf("HeadRefContext: %v", err)
+	}
+	if got != "abc123" {
+		t.Fatalf("HeadRefContext = %q, want abc123", got)
+	}
+	if gotCtx != ctx {
+		t.Fatal("HeadRefContext did not pass caller context to git command")
+	}
+	wantArgs := []string{"-C", repoPath, "rev-parse", "HEAD"}
+	if gotName != "git" || !reflect.DeepEqual(gotArgs, wantArgs) {
+		t.Fatalf("command = %s %#v, want git %#v", gotName, gotArgs, wantArgs)
+	}
+}
+
+func TestContextWithDefaultTimeoutKeepsRemoteChecksShorterThanLongParent(t *testing.T) {
+	parent, cancelParent := context.WithTimeout(context.Background(), time.Hour)
+	defer cancelParent()
+
+	ctx, cancel := contextWithDefaultTimeout(parent, 5*time.Second)
+	defer cancel()
+
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		t.Fatal("contextWithDefaultTimeout returned context without deadline")
+	}
+	now := time.Now()
+	if deadline.Before(now) || deadline.After(now.Add(6*time.Second)) {
+		t.Fatalf("deadline = %v, want default timeout near 5s", deadline)
+	}
+}
+
+func TestContextWithDefaultTimeoutHonorsShorterParent(t *testing.T) {
+	parent, cancelParent := context.WithTimeout(context.Background(), time.Second)
+	defer cancelParent()
+
+	ctx, cancel := contextWithDefaultTimeout(parent, 5*time.Second)
+	defer cancel()
+
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		t.Fatal("contextWithDefaultTimeout returned context without deadline")
+	}
+	now := time.Now()
+	if deadline.Before(now) || deadline.After(now.Add(2*time.Second)) {
+		t.Fatalf("deadline = %v, want shorter parent deadline", deadline)
 	}
 }
 
