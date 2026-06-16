@@ -900,7 +900,7 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 
 		// Step 2: Create tmux window.
 		if err := ops.createWindow(spawnCtx, toolDeps.Session, workerID, worktreePath); err != nil {
-			cleanupSpawnResources(spawnCtx, ops, toolDeps, workerID, branch, taskID, repoPath, worktreePath, true)
+			cleanupSpawnResources(spawnCtx, ops, toolDeps, workerID, branch, taskID, repoPath, worktreePath, false)
 			return nil, fmt.Errorf("create tmux window: %w", err)
 		}
 
@@ -1954,9 +1954,6 @@ func isContextDoneError(ctx context.Context, err error) bool {
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return true
-	}
-	if ctxErr := ctx.Err(); ctxErr != nil {
-		return errors.Is(err, ctxErr)
 	}
 	return false
 }

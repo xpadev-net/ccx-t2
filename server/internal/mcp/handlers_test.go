@@ -685,6 +685,56 @@ func TestHandleSpawnWorkerCancellationRollsBackWithBoundedCleanupContext(t *test
 	}
 }
 
+func TestHandleSpawnWorkerCreateWindowFailureDoesNotKillMissingWindow(t *testing.T) {
+	dir := t.TempDir()
+	l := ledger.NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
+	if err := l.Add(ledger.Task{ID: "task-001", Title: "Task", Status: "unstarted"}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	deps := testMCPDeps(dir, l)
+	deps.Config.WorkerHarnesses = []string{"sh"}
+	deps.Config.Harnesses = map[string]config.HarnessConfig{
+		"sh": {Command: "sh", McpArgs: "--mcp-url {url}"},
+	}
+	killCalled := false
+	removeCalled := false
+	deleteBranchCalled := false
+	deps.spawn = spawnWorkerOps{
+		validateBranchName:       func(context.Context, string) error { return nil },
+		ensureBranchCreationSafe: func(context.Context, string, string) error { return nil },
+		headRef:                  func(context.Context, string) (string, error) { return "abc123", nil },
+		createWorktree:           func(context.Context, string, string, string, string) error { return nil },
+		createWindow:             func(context.Context, string, string, string) error { return errors.New("tmux failed") },
+		killWindow: func(context.Context, string, string) error {
+			killCalled = true
+			return nil
+		},
+		removeWorktree: func(context.Context, string, string) error {
+			removeCalled = true
+			return nil
+		},
+		deleteTaskBranch: func(context.Context, string, string, string) error {
+			deleteBranchCalled = true
+			return nil
+		},
+	}
+
+	_, err := handleSpawnWorker(deps)(context.Background(), map[string]any{
+		"task_id":       "task-001",
+		"branch":        "feature/task-001-work",
+		"allowed_files": []any{"server/internal/mcp"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "create tmux window") {
+		t.Fatalf("handleSpawnWorker error = %v, want create tmux window failure", err)
+	}
+	if killCalled {
+		t.Fatal("killWindow called even though createWindow failed before creating a window")
+	}
+	if !removeCalled || !deleteBranchCalled {
+		t.Fatalf("cleanup calls remove=%v deleteBranch=%v, want both true", removeCalled, deleteBranchCalled)
+	}
+}
+
 func TestRollbackSpawnAfterLedgerUpdateDoesNotRemoveReplacementRegistryEntry(t *testing.T) {
 	dir := t.TempDir()
 	l := ledger.NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
