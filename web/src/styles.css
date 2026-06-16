@@ -203,7 +203,7 @@ button:disabled {
 .task-row.selected {
   background: #edf7f6;
   box-shadow: inset 4px 0 0 #2f6f73;
-  font-weight: 680;
+  font-weight: 700;
 }
 
 .project-overview {
@@ -260,6 +260,11 @@ button:disabled {
 .project-row.selected {
   background: #edf7f6;
   box-shadow: inset 4px 0 0 #2f6f73;
+  font-weight: 700;
+}
+
+.project-row.selected span {
+  font-weight: 700;
 }
 
 .project-row span {
@@ -307,7 +312,7 @@ button:disabled {
 .worker-row.selected {
   background: #edf7f6;
   box-shadow: inset 4px 0 0 #2f6f73;
-  font-weight: 680;
+  font-weight: 700;
 }
 
 .worker-row span {

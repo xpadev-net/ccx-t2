@@ -794,7 +794,7 @@ function App() {
               const isSelected = project.slug === selectedProjectSlug;
               return (
                 <button
-                  aria-pressed={isSelected}
+                  aria-current={isSelected ? "true" : undefined}
                   className={`project-row ${isSelected ? "selected" : ""}`}
                   key={project.slug}
                   type="button"
@@ -844,7 +844,7 @@ function App() {
               const isSelected = task.id === selectedTask?.id;
               return (
                 <button
-                  aria-pressed={isSelected}
+                  aria-current={isSelected ? "true" : undefined}
                   className={`task-row ${isSelected ? "selected" : ""}`}
                   key={task.id}
                   type="button"
@@ -949,7 +949,7 @@ function App() {
                 const isSelected = worker.worker_id === selectedWorker?.worker_id;
                 return (
                   <button
-                    aria-pressed={isSelected}
+                    aria-current={isSelected ? "true" : undefined}
                     className={`worker-row ${isSelected ? "selected" : ""}`}
                     key={worker.worker_id}
                     type="button"
