@@ -1,4 +1,5 @@
-import { FormEvent, StrictMode, useEffect, useMemo, useRef, useState } from "react";
+import { StrictMode, useEffect, useMemo, useRef, useState } from "react";
+import type { Dispatch, FormEvent, SetStateAction } from "react";
 import { createRoot } from "react-dom/client";
 import "./styles.css";
 
@@ -106,6 +107,16 @@ type TaskEditorDirty = {
   status: boolean;
 };
 
+type ConnectionPhase = "idle" | "connecting" | "open" | "retrying" | "unauthorized" | "forbidden" | "blocked" | "failed";
+
+type ConnectionState = {
+  phase: ConnectionPhase;
+  detail?: string;
+  attempt?: number;
+  maxAttempts?: number;
+  retryInMs?: number;
+};
+
 type HarnessInfo = {
   name: string;
   available: boolean;
@@ -115,8 +126,26 @@ type HarnessInfo = {
   };
 };
 
+type WebSocketDiagnosis = {
+  phase: ConnectionPhase;
+  detail: string;
+  retryable: boolean;
+};
+
+type ReconnectingWebSocketOptions = {
+  path: string;
+  token: string;
+  setState: (state: ConnectionState) => void;
+  onMessage: (event: MessageEvent) => void;
+  onSocketError?: () => void;
+};
+
+type LogSetter = Dispatch<SetStateAction<string[]>>;
+
 const statusOptions = ["unstarted", "in_progress", "blocked", "completed", "split"];
 const tokenStorageKey = "ccx.webToken";
+const reconnectDelaysMs = [250, 500, 1000, 2000, 4000];
+const stableOpenResetDelayMs = 10000;
 
 function App() {
   const [tasks, setTasks] = useState<Task[]>([]);
@@ -131,6 +160,13 @@ function App() {
   const [selectedWorkerID, setSelectedWorkerID] = useState("");
   const [orchestratorLog, setOrchestratorLog] = useState<string[]>([]);
   const [workerLog, setWorkerLog] = useState<string[]>([]);
+  const [ledgerConnection, setLedgerConnection] = useState<ConnectionState>(() => idleConnection("Ledger stream is idle."));
+  const [orchestratorConnection, setOrchestratorConnection] = useState<ConnectionState>(() =>
+    idleConnection("Select a project to open the orchestrator log.")
+  );
+  const [workerConnection, setWorkerConnection] = useState<ConnectionState>(() =>
+    idleConnection("Select a worker to open its log stream.")
+  );
   const [followupMessage, setFollowupMessage] = useState("");
   const [followupSending, setFollowupSending] = useState(false);
   const [projects, setProjects] = useState<ProjectInfo[]>([]);
@@ -149,6 +185,7 @@ function App() {
   const [error, setError] = useState("");
   const settingsDirtyRef = useRef(false);
   const selectedProjectSlugRef = useRef("");
+  const tokenRef = useRef(token);
   const taskEditorDirtyRef = useRef<TaskEditorDirty>(emptyTaskEditorDirty());
   const taskEditorTaskIDRef = useRef("");
 
@@ -186,155 +223,61 @@ function App() {
   }, [selectedProjectSlug]);
 
   useEffect(() => {
-    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const tokenQuery = token ? `?token=${encodeURIComponent(token)}` : "";
-    const ledgerPath = selectedProjectSlug
-      ? `/ws/projects/${encodeURIComponent(selectedProjectSlug)}/ledger`
-      : "/ws/ledger";
-    const socket = new WebSocket(`${protocol}//${window.location.host}${ledgerPath}${tokenQuery}`);
-    socket.addEventListener("message", (event) => {
-      try {
-        const msg = JSON.parse(String(event.data)) as { type?: string };
-        if (msg.type === "ledger_changed") {
-          void refreshProjectData(false);
+    tokenRef.current = token;
+  }, [token]);
+
+  useEffect(() => {
+    return openReconnectingWebSocket({
+      path: ledgerWSPath(selectedProjectSlug),
+      token,
+      setState: setLedgerConnection,
+      onMessage: (event) => {
+        try {
+          const msg = JSON.parse(String(event.data)) as { type?: string };
+          if (msg.type === "ledger_changed") {
+            void refreshProjectData(false);
+          }
+        } catch {
+          // Ignore malformed websocket messages; the next manual refresh will recover.
         }
-      } catch {
-        // Ignore malformed websocket messages; the next manual refresh will recover.
       }
     });
-    return () => socket.close();
   }, [selectedProjectSlug, token]);
 
   useEffect(() => {
     if (!selectedWorker) {
       setSelectedWorkerID("");
       setWorkerLog([]);
+      setWorkerConnection(idleConnection("Select a worker to open its log stream."));
       setFollowupMessage("");
       return;
     }
     setSelectedWorkerID(selectedWorker.worker_id);
     setWorkerLog([]);
     setFollowupMessage("");
-    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const tokenQuery = token ? `?token=${encodeURIComponent(token)}` : "";
-    let attempts = 0;
-    let closed = false;
-    let retryTimer: number | undefined;
-    let socket: WebSocket | undefined;
-    const connect = () => {
-      if (closed) {
-        return;
-      }
-      let connectionOpened = false;
-      socket = new WebSocket(
-        `${protocol}//${window.location.host}${workerLogPath(selectedProjectSlug, selectedWorker.worker_id)}${tokenQuery}`
-      );
-      socket.addEventListener("open", () => {
-        connectionOpened = true;
-        attempts = 0;
-        if (retryTimer !== undefined) {
-          window.clearTimeout(retryTimer);
-          retryTimer = undefined;
-        }
-      });
-      socket.addEventListener("message", (event) => {
-        try {
-          const msg = JSON.parse(String(event.data)) as { type?: string; data?: string };
-          if (msg.type === "line" && typeof msg.data === "string") {
-            setWorkerLog((current) => [...current.slice(-299), msg.data as string]);
-          } else if (msg.type === "closed") {
-            setWorkerLog((current) => [...current, "[stream closed]"]);
-          } else if (msg.type === "error" && msg.data) {
-            setWorkerLog((current) => [...current, `[error] ${msg.data}`]);
-          }
-        } catch {
-          setWorkerLog((current) => [...current, String(event.data)]);
-        }
-      });
-      socket.addEventListener("error", () => {
-        if (connectionOpened) {
-          setWorkerLog((current) => [...current, "[stream error]"]);
-        }
-      });
-      socket.addEventListener("close", () => {
-        if (connectionOpened && !closed && attempts < 3) {
-          attempts += 1;
-          retryTimer = window.setTimeout(connect, 250 * attempts);
-        }
-      });
-    };
-    connect();
-    return () => {
-      closed = true;
-      if (retryTimer !== undefined) {
-        window.clearTimeout(retryTimer);
-      }
-      socket?.close();
-    };
+    return openReconnectingWebSocket({
+      path: workerLogPath(selectedProjectSlug, selectedWorker.worker_id),
+      token,
+      setState: setWorkerConnection,
+      onMessage: (event) => appendLogEvent(event, setWorkerLog),
+      onSocketError: () => appendLogLine(setWorkerLog, "[stream error]", false)
+    });
   }, [selectedProjectSlug, selectedWorker?.worker_id, token]);
 
   useEffect(() => {
     if (!selectedProjectSlug) {
       setOrchestratorLog([]);
+      setOrchestratorConnection(idleConnection("Select a project to open the orchestrator log."));
       return;
     }
     setOrchestratorLog([]);
-    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const tokenQuery = token ? `?token=${encodeURIComponent(token)}` : "";
-    let attempts = 0;
-    let closed = false;
-    let retryTimer: number | undefined;
-    let socket: WebSocket | undefined;
-    const connect = () => {
-      if (closed) {
-        return;
-      }
-      let connectionOpened = false;
-      socket = new WebSocket(
-        `${protocol}//${window.location.host}${orchestratorLogPath(selectedProjectSlug)}${tokenQuery}`
-      );
-      socket.addEventListener("open", () => {
-        connectionOpened = true;
-        attempts = 0;
-        if (retryTimer !== undefined) {
-          window.clearTimeout(retryTimer);
-          retryTimer = undefined;
-        }
-      });
-      socket.addEventListener("message", (event) => {
-        try {
-          const msg = JSON.parse(String(event.data)) as { type?: string; data?: string };
-          if (msg.type === "line" && typeof msg.data === "string") {
-            setOrchestratorLog((current) => [...current.slice(-299), msg.data as string]);
-          } else if (msg.type === "closed") {
-            setOrchestratorLog((current) => [...current, "[stream closed]"]);
-          } else if (msg.type === "error" && msg.data) {
-            setOrchestratorLog((current) => [...current, `[error] ${msg.data}`]);
-          }
-        } catch {
-          setOrchestratorLog((current) => [...current, String(event.data)]);
-        }
-      });
-      socket.addEventListener("error", () => {
-        if (connectionOpened) {
-          setOrchestratorLog((current) => [...current, "[stream error]"]);
-        }
-      });
-      socket.addEventListener("close", () => {
-        if (connectionOpened && !closed && attempts < 3) {
-          attempts += 1;
-          retryTimer = window.setTimeout(connect, 250 * attempts);
-        }
-      });
-    };
-    connect();
-    return () => {
-      closed = true;
-      if (retryTimer !== undefined) {
-        window.clearTimeout(retryTimer);
-      }
-      socket?.close();
-    };
+    return openReconnectingWebSocket({
+      path: orchestratorLogPath(selectedProjectSlug),
+      token,
+      setState: setOrchestratorConnection,
+      onMessage: (event) => appendLogEvent(event, setOrchestratorLog),
+      onSocketError: () => appendLogLine(setOrchestratorLog, "[stream error]", false)
+    });
   }, [selectedProjectSlug, token]);
 
   useEffect(() => {
@@ -376,9 +319,11 @@ function App() {
     rethrowErrors = false
   ) {
     if (!projectSlug) {
-      setTasks([]);
-      setSelectedID("");
-      setLoading(false);
+      if (isCurrentRefresh(projectSlug, authToken)) {
+        setTasks([]);
+        setSelectedID("");
+        setLoading(false);
+      }
       return;
     }
     if (showLoading) {
@@ -387,31 +332,47 @@ function App() {
     setError("");
     try {
       const data = await api<Task[]>(tasksPath(projectSlug), {}, authToken);
+      if (!isCurrentRefresh(projectSlug, authToken)) {
+        return;
+      }
       setTasks(data);
       setSelectedID((current) => (data.some((task) => task.id === current) ? current : data[0]?.id || ""));
     } catch (err) {
+      if (!isCurrentRefresh(projectSlug, authToken)) {
+        return;
+      }
       setError(errorMessage(err));
       if (rethrowErrors) {
         throw err;
       }
     } finally {
-      setLoading(false);
+      if (isCurrentRefresh(projectSlug, authToken)) {
+        setLoading(false);
+      }
     }
   }
 
   async function refreshWorkers(authToken = token, projectSlug = selectedProjectSlug, rethrowErrors = false) {
     if (!projectSlug) {
-      setWorkers([]);
-      setSelectedWorkerID("");
+      if (isCurrentRefresh(projectSlug, authToken)) {
+        setWorkers([]);
+        setSelectedWorkerID("");
+      }
       return;
     }
     try {
       const data = await api<WorkerInfo[]>(workersPath(projectSlug), {}, authToken);
+      if (!isCurrentRefresh(projectSlug, authToken)) {
+        return;
+      }
       setWorkers(data);
       setSelectedWorkerID((current) =>
         data.some((worker) => worker.worker_id === current) ? current : data[0]?.worker_id || ""
       );
     } catch (err) {
+      if (!isCurrentRefresh(projectSlug, authToken)) {
+        return;
+      }
       setError(errorMessage(err));
       if (rethrowErrors) {
         throw err;
@@ -449,6 +410,9 @@ function App() {
         api<HarnessInfo[]>("/api/harnesses", {}, authToken),
         api<ProjectInfo[]>("/api/projects", {}, authToken)
       ]);
+      if (authToken !== tokenRef.current) {
+        return selectedProjectSlugRef.current;
+      }
       setConfig(configData);
       setProjects(projectData);
       const normalizedProjectSlug = normalizedProjectSelection(
@@ -465,13 +429,18 @@ function App() {
       setHarnesses(harnessData);
       return normalizedProjectSlug;
     } catch (err) {
+      if (authToken !== tokenRef.current) {
+        return selectedProjectSlugRef.current;
+      }
       setError(errorMessage(err));
       if (rethrowErrors) {
         throw err;
       }
       return selectedProjectSlugRef.current;
     } finally {
-      setSettingsLoading(false);
+      if (authToken === tokenRef.current) {
+        setSettingsLoading(false);
+      }
     }
   }
 
@@ -707,6 +676,10 @@ function App() {
     setSelectedProjectSlug(slug);
   }
 
+  function isCurrentRefresh(projectSlug: string, authToken: string) {
+    return projectSlug === selectedProjectSlugRef.current && authToken === tokenRef.current;
+  }
+
   function updateTaskTitle(value: string) {
     setTitle(value);
     markTaskEditorDirty("title");
@@ -837,7 +810,10 @@ function App() {
         <aside className="task-list" aria-label="Task ledger">
           <div className="section-heading">
             <h2>Tasks</h2>
-            <span>{loading ? "Loading" : `${tasks.length} total`}</span>
+            <div className="heading-status">
+              <span>{loading ? "Loading" : `${tasks.length} total`}</span>
+              <ConnectionBadge label="Ledger" state={ledgerConnection} />
+            </div>
           </div>
           <div className="rows">
             {tasks.map((task) => {
@@ -922,7 +898,10 @@ function App() {
         <section className="orchestrator-dashboard" aria-label="Orchestrator console">
           <div className="section-heading">
             <h2>Orchestrator</h2>
-            <span>{selectedProjectSlug || "No project"}</span>
+            <div className="heading-status">
+              <span>{selectedProjectSlug || "No project"}</span>
+              <ConnectionBadge label="Orchestrator log" state={orchestratorConnection} />
+            </div>
           </div>
           <div className="console-metadata">
             <span>Project: {selectedProjectSlug || "None"}</span>
@@ -934,14 +913,22 @@ function App() {
               <span>{orchestratorWindow}</span>
               <span>{selectedProject?.repo_path || "No repository"}</span>
             </div>
-            <pre>{orchestratorLog.length ? orchestratorLog.join("\n") : "Waiting for orchestrator output..."}</pre>
+            <pre>{logDisplayText(
+              orchestratorLog,
+              orchestratorConnection,
+              "No orchestrator output yet.",
+              "Select a project to open the orchestrator log."
+            )}</pre>
           </div>
         </section>
 
         <section className="worker-dashboard" aria-label="Worker dashboard">
           <div className="section-heading">
             <h2>Workers</h2>
-            <span>{workers.length} active</span>
+            <div className="heading-status">
+              <span>{workers.length} active</span>
+              <ConnectionBadge label="Worker log" state={workerConnection} />
+            </div>
           </div>
           <div className="worker-layout">
             <div className="worker-list">
@@ -967,7 +954,12 @@ function App() {
                 <span>{selectedWorker?.worker_id || "No worker selected"}</span>
                 <span>{selectedWorkerTask?.branch || selectedWorker?.task_id || "No task"}</span>
               </div>
-              <pre>{workerLog.length ? workerLog.join("\n") : "Waiting for worker output..."}</pre>
+              <pre>{logDisplayText(
+                workerLog,
+                workerConnection,
+                "No worker output yet.",
+                "Select a worker to open its log stream."
+              )}</pre>
             </div>
           </div>
           <form className="followup-form" onSubmit={sendWorkerFollowup}>
@@ -1160,6 +1152,7 @@ function App() {
             <button
               type="button"
               onClick={() => {
+                tokenRef.current = tokenDraft;
                 setToken(tokenDraft);
                 storeToken(tokenDraft);
                 void refreshAll(true, tokenDraft, true);
@@ -1197,6 +1190,291 @@ function emptyTaskEditorDirty(): TaskEditorDirty {
     body: false,
     status: false
   };
+}
+
+function idleConnection(detail: string): ConnectionState {
+  return { phase: "idle", detail };
+}
+
+function openReconnectingWebSocket(options: ReconnectingWebSocketOptions) {
+  let closed = false;
+  let retryTimer: number | undefined;
+  let stableTimer: number | undefined;
+  let socket: WebSocket | undefined;
+  let attempts = 0;
+
+  const connect = () => {
+    if (closed) {
+      return;
+    }
+    let opened = false;
+    options.setState({ phase: "connecting", detail: "Opening stream..." });
+    socket = new WebSocket(webSocketURL(options.path, options.token));
+    socket.addEventListener("open", () => {
+      if (closed) {
+        return;
+      }
+      opened = true;
+      options.setState({ phase: "open", detail: "Connected." });
+      stableTimer = window.setTimeout(() => {
+        attempts = 0;
+        stableTimer = undefined;
+      }, stableOpenResetDelayMs);
+    });
+    socket.addEventListener("message", (event) => {
+      if (!closed) {
+        options.onMessage(event);
+      }
+    });
+    socket.addEventListener("error", () => {
+      if (!closed && opened) {
+        options.onSocketError?.();
+      }
+    });
+    socket.addEventListener("close", () => {
+      if (closed) {
+        return;
+      }
+      clearStableTimer();
+      if (opened) {
+        scheduleReconnect("Stream disconnected.");
+        return;
+      }
+      void diagnoseWebSocketFailure(options.path, options.token).then((diagnosis) => {
+        if (closed) {
+          return;
+        }
+        if (!diagnosis.retryable) {
+          options.setState({ phase: diagnosis.phase, detail: diagnosis.detail });
+          return;
+        }
+        scheduleReconnect(diagnosis.detail, diagnosis.phase);
+      });
+    });
+  };
+
+  const scheduleReconnect = (detail: string, exhaustedPhase: ConnectionPhase = "failed") => {
+    if (attempts >= reconnectDelaysMs.length) {
+      options.setState({ phase: exhaustedPhase, detail: `${detail} Reconnect attempts exhausted.` });
+      return;
+    }
+    const retryInMs = reconnectDelaysMs[attempts];
+    attempts += 1;
+    options.setState({
+      phase: "retrying",
+      detail,
+      attempt: attempts,
+      maxAttempts: reconnectDelaysMs.length,
+      retryInMs
+    });
+    retryTimer = window.setTimeout(connect, retryInMs);
+  };
+
+  const clearStableTimer = () => {
+    if (stableTimer !== undefined) {
+      window.clearTimeout(stableTimer);
+      stableTimer = undefined;
+    }
+  };
+
+  connect();
+
+  return () => {
+    closed = true;
+    if (retryTimer !== undefined) {
+      window.clearTimeout(retryTimer);
+    }
+    clearStableTimer();
+    socket?.close();
+  };
+}
+
+async function diagnoseWebSocketFailure(path: string, token: string): Promise<WebSocketDiagnosis> {
+  try {
+    const response = await fetch(withTokenQuery(path, token), {
+      cache: "no-store",
+      headers: {
+        Accept: "application/json",
+        ...(token ? { Authorization: `Bearer ${token}` } : {})
+      }
+    });
+    const detail = await responseErrorDetail(response);
+    if (response.status === 401) {
+      return {
+        phase: "unauthorized",
+        detail: "Unauthorized. Apply a valid API token.",
+        retryable: false
+      };
+    }
+    if (response.status === 403) {
+      return {
+        phase: "forbidden",
+        detail: detail || "Forbidden for this stream.",
+        retryable: false
+      };
+    }
+    if (response.status === 409) {
+      return {
+        phase: "blocked",
+        detail: detail || "Another active log stream is already open.",
+        retryable: true
+      };
+    }
+    if (response.status === 404) {
+      return {
+        phase: "failed",
+        detail: detail || "Stream not found.",
+        retryable: false
+      };
+    }
+    if (response.status >= 500) {
+      return {
+        phase: "failed",
+        detail: detail || "Server failed before opening the stream.",
+        retryable: true
+      };
+    }
+    if (response.status === 400) {
+      return {
+        phase: "failed",
+        detail: "WebSocket handshake did not complete.",
+        retryable: true
+      };
+    }
+    return {
+      phase: "failed",
+      detail: detail || "WebSocket handshake was rejected before opening.",
+      retryable: false
+    };
+  } catch {
+    return {
+      phase: "failed",
+      detail: "Server is unreachable.",
+      retryable: true
+    };
+  }
+}
+
+async function responseErrorDetail(response: Response) {
+  const payload = (await response
+    .clone()
+    .json()
+    .catch(() => undefined)) as { error?: unknown } | undefined;
+  if (payload && typeof payload.error === "string") {
+    return payload.error;
+  }
+  const text = await response.text().catch(() => "");
+  return text.trim() || response.statusText;
+}
+
+function appendLogEvent(event: MessageEvent, setLog: LogSetter) {
+  try {
+    const msg = JSON.parse(String(event.data)) as { type?: string; data?: string };
+    if (msg.type === "line" && typeof msg.data === "string") {
+      appendLogLine(setLog, msg.data);
+    } else if (msg.type === "closed") {
+      appendLogLine(setLog, "[stream closed]", false);
+    } else if (msg.type === "error" && msg.data) {
+      appendLogLine(setLog, `[error] ${msg.data}`, false);
+    }
+  } catch {
+    appendLogLine(setLog, String(event.data));
+  }
+}
+
+function appendLogLine(setLog: LogSetter, line: string, trim = true) {
+  setLog((current) => [...(trim ? current.slice(-299) : current), line]);
+}
+
+function logDisplayText(lines: string[], state: ConnectionState, emptyText: string, idleText: string) {
+  if (lines.length) {
+    return lines.join("\n");
+  }
+  switch (state.phase) {
+    case "idle":
+      return state.detail || idleText;
+    case "connecting":
+      return "Connecting to stream...";
+    case "open":
+      return emptyText;
+    case "retrying":
+      return `${state.detail || "Stream disconnected."} Reconnecting in ${formatRetryDelay(state.retryInMs)} (${state.attempt}/${state.maxAttempts}).`;
+    case "unauthorized":
+    case "forbidden":
+    case "blocked":
+    case "failed":
+      return state.detail || connectionLabel(state);
+  }
+}
+
+function ConnectionBadge({ label, state }: { label: string; state: ConnectionState }) {
+  const text = connectionLabel(state);
+  const detail = connectionDetail(state);
+  return (
+    <span
+      aria-label={`${label} connection: ${detail}`}
+      className={`connection-badge ${connectionTone(state.phase)}`}
+      role="status"
+      title={detail}
+    >
+      {text}
+    </span>
+  );
+}
+
+function connectionLabel(state: ConnectionState) {
+  switch (state.phase) {
+    case "idle":
+      return "Idle";
+    case "connecting":
+      return "Connecting";
+    case "open":
+      return "Live";
+    case "retrying":
+      return `Reconnecting ${state.attempt}/${state.maxAttempts}`;
+    case "unauthorized":
+      return "Unauthorized";
+    case "forbidden":
+      return "Forbidden";
+    case "blocked":
+      return "Blocked";
+    case "failed":
+      return "Disconnected";
+  }
+}
+
+function connectionDetail(state: ConnectionState) {
+  if (state.phase === "retrying") {
+    return `${state.detail || "Stream disconnected."} Reconnecting in ${formatRetryDelay(state.retryInMs)} (${state.attempt}/${state.maxAttempts}).`;
+  }
+  return state.detail || connectionLabel(state);
+}
+
+function connectionTone(phase: ConnectionPhase) {
+  switch (phase) {
+    case "open":
+      return "open";
+    case "connecting":
+    case "retrying":
+      return "pending";
+    case "unauthorized":
+    case "forbidden":
+    case "blocked":
+    case "failed":
+      return "problem";
+    case "idle":
+      return "idle";
+  }
+}
+
+function formatRetryDelay(delay?: number) {
+  if (delay === undefined) {
+    return "soon";
+  }
+  if (delay < 1000) {
+    return `${delay}ms`;
+  }
+  return `${delay / 1000}s`;
 }
 
 function configToDraft(config: ConfigResponse): ConfigDraft {
@@ -1284,6 +1562,10 @@ function workerLogPath(projectSlug: string, workerID: string) {
     : `/ws/worker/${encodeURIComponent(workerID)}`;
 }
 
+function ledgerWSPath(projectSlug: string) {
+  return projectSlug ? `/ws/projects/${encodeURIComponent(projectSlug)}/ledger` : "/ws/ledger";
+}
+
 function orchestratorLogPath(projectSlug: string) {
   return projectSlug ? `/ws/projects/${encodeURIComponent(projectSlug)}/orchestrator` : "/ws/orchestrator";
 }
@@ -1292,6 +1574,19 @@ function workerFollowupPath(projectSlug: string, workerID: string) {
   return projectSlug
     ? `/api/projects/${encodeURIComponent(projectSlug)}/workers/${encodeURIComponent(workerID)}/followup`
     : `/api/workers/${encodeURIComponent(workerID)}/followup`;
+}
+
+function webSocketURL(path: string, token: string) {
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  return `${protocol}//${window.location.host}${withTokenQuery(path, token)}`;
+}
+
+function withTokenQuery(path: string, token: string) {
+  if (!token) {
+    return path;
+  }
+  const separator = path.includes("?") ? "&" : "?";
+  return `${path}${separator}token=${encodeURIComponent(token)}`;
 }
 
 async function api<T>(path: string, init: RequestInit = {}, token = ""): Promise<T> {
