@@ -2,12 +2,15 @@ package mcp
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,7 +25,12 @@ import (
 	"github.com/xpadev/ccx-t2/internal/worktree"
 )
 
-var mergeCommitRE = regexp.MustCompile(`^[0-9a-fA-F]{7,64}$`)
+var (
+	mergeCommitRE              = regexp.MustCompile(`^[0-9a-fA-F]{7,64}$`)
+	cleanupPendingCommentRE    = regexp.MustCompile(`(?m)\n?<!-- cleanup_pending: ([A-Za-z0-9+/=]+) -->`)
+	cleanupPendingCommentStart = "<!-- cleanup_pending: "
+	cleanupPendingCommentEnd   = " -->"
+)
 
 type notifyTriggerer interface {
 	Trigger(ctx context.Context, reason string) error
@@ -42,6 +50,96 @@ type Deps struct {
 	NotifyTrigger notifyTriggerer
 
 	notifyAfterOwnershipPreflight func()
+	cleanup                       workerCleanupOps
+}
+
+type cleanupIntent string
+
+const (
+	cleanupIntentStopWorker   cleanupIntent = "stop_worker"
+	cleanupIntentCompleted    cleanupIntent = "completed"
+	cleanupIntentSplitRequest cleanupIntent = "split_request"
+
+	cleanupOriginalSplitReasonPrefix = "\noriginal split reason: "
+)
+
+type workerCleanupOps struct {
+	isWindowAlive    func(session, window string) (bool, error)
+	killWindow       func(session, window string) error
+	removeWorktree   func(repoPath, worktreePath string) error
+	deleteTaskBranch func(repoPath, branch, taskID string) error
+}
+
+func (ops workerCleanupOps) withDefaults() workerCleanupOps {
+	if ops.isWindowAlive == nil {
+		ops.isWindowAlive = tmux.IsWindowAlive
+	}
+	if ops.killWindow == nil {
+		ops.killWindow = tmux.KillWindow
+	}
+	if ops.removeWorktree == nil {
+		ops.removeWorktree = worktree.Remove
+	}
+	if ops.deleteTaskBranch == nil {
+		ops.deleteTaskBranch = cleanupTaskBranch
+	}
+	return ops
+}
+
+type workerCleanupResult struct {
+	WorkerID     string
+	WorktreePath string
+	Branch       string
+	TmuxErr      error
+	WorktreeErr  error
+	BranchErr    error
+}
+
+func (r workerCleanupResult) Failed() bool {
+	return r.TmuxErr != nil || r.WorktreeErr != nil || r.BranchErr != nil
+}
+
+func (r workerCleanupResult) Err() error {
+	if !r.Failed() {
+		return nil
+	}
+	return &workerCleanupError{result: r}
+}
+
+func (r workerCleanupResult) errors() []error {
+	var errs []error
+	if r.TmuxErr != nil {
+		errs = append(errs, r.TmuxErr)
+	}
+	if r.WorktreeErr != nil {
+		errs = append(errs, r.WorktreeErr)
+	}
+	if r.BranchErr != nil {
+		errs = append(errs, r.BranchErr)
+	}
+	return errs
+}
+
+type workerCleanupError struct {
+	result workerCleanupResult
+}
+
+type cleanupPendingMarker struct {
+	Intent         string `json:"intent"`
+	OriginalReason string `json:"original_reason,omitempty"`
+}
+
+func (e *workerCleanupError) Error() string {
+	errs := e.result.errors()
+	parts := make([]string, 0, len(errs))
+	for _, err := range errs {
+		parts = append(parts, err.Error())
+	}
+	return "worker cleanup failed: " + strings.Join(parts, "; ")
+}
+
+func (e *workerCleanupError) Unwrap() []error {
+	return e.result.errors()
 }
 
 // RegisterOrchestratorTools registers the Orchestrator tools on s.
@@ -134,7 +232,7 @@ func RegisterOrchestratorTools(s *Server, deps *Deps) {
 
 	s.Register(ToolDef{
 		Name:        "stop_worker",
-		Description: "Kill a worker window, remove its worktree, and reset the task to unstarted.",
+		Description: "Kill a worker window, remove its worktree, and reset the task to unstarted or finish pending cleanup.",
 		InputSchema: inSchema(projectProps(map[string]any{
 			"worker_id": prop("string", "Worker ID (tmux window name)"),
 		}), []string{"worker_id"}),
@@ -315,12 +413,26 @@ func handleUpdateTask(deps *Deps) ToolHandler {
 			return nil, fmt.Errorf("status cannot be changed via update_task")
 		}
 
-		// Atomically reject updates to terminal tasks (completed, split) using
-		// UpdateIfStatuses so the status check and write are in the same mutex lock,
-		// preventing a concurrent transition from sneaking in between Load and Update.
-		return nil, toolDeps.Ledger.UpdateIfStatuses(id,
+		// Atomically reject updates to terminal tasks (completed, split). When a
+		// task is blocked on cleanup, preserve the internal retry marker even if
+		// the visible description is edited via update_task.
+		_, err = toolDeps.Ledger.UpdateIfStatusesReturnPrevWith(id,
 			[]string{"unstarted", "in_progress", "blocked"},
-			fields)
+			func(current ledger.Task) (map[string]any, error) {
+				next := make(map[string]any, len(fields))
+				for k, v := range fields {
+					next[k] = v
+				}
+				if bodyValue, ok := next["body"]; ok {
+					if body, ok := bodyValue.(string); ok {
+						if pendingIntent, originalReason, ok := cleanupIntentFromTask(current); ok {
+							next["body"] = bodyWithCleanupPending(body, pendingIntent, originalReason)
+						}
+					}
+				}
+				return next, nil
+			})
+		return nil, err
 	}
 }
 
@@ -363,6 +475,44 @@ func handleSplitTask(deps *Deps) ToolHandler {
 		switch original.Status {
 		case "split", "completed":
 			return nil, fmt.Errorf("cannot split task with status %q", original.Status)
+		}
+		if pendingIntent, originalReason, ok := cleanupIntentFromTask(*original); ok {
+			if pendingIntent != cleanupIntentSplitRequest {
+				return nil, fmt.Errorf("task %s has %s cleanup pending; retry that cleanup before split_task", id, pendingIntent)
+			}
+			pendingTask, err := toolDeps.Ledger.UpdateIfStatusesReturnPrevWith(id, []string{"blocked"},
+				func(current ledger.Task) (map[string]any, error) {
+					currentIntent, currentOriginalReason, ok := cleanupIntentFromTask(current)
+					if !ok {
+						return nil, fmt.Errorf("task %s is missing cleanup marker", id)
+					}
+					if currentIntent != cleanupIntentSplitRequest {
+						return nil, fmt.Errorf("task %s has %s cleanup pending, not %s",
+							id, currentIntent, cleanupIntentSplitRequest)
+					}
+					originalReason = currentOriginalReason
+					return map[string]any{
+						"reason": cleanupPendingReason(cleanupIntentSplitRequest, nil, originalReason),
+					}, nil
+				})
+			if err != nil {
+				return nil, err
+			}
+			wid := pendingTask.WorkerID
+			if wid == "" {
+				wid = workerIDFor(toolDeps, id)
+			}
+			result := cleanupWorkerResources(toolDeps, wid, pendingTask.Branch, id, true)
+			if cleanupErr := result.Err(); cleanupErr != nil {
+				if err := markCleanupPending(toolDeps, id, wid, pendingTask, cleanupIntentSplitRequest, originalReason, cleanupErr); err != nil {
+					return nil, fmt.Errorf("%w; additionally failed to record cleanup state: %v", cleanupErr, err)
+				}
+				return nil, cleanupErr
+			}
+			if err := finishPendingCleanup(toolDeps, id, wid, cleanupIntentSplitRequest, originalReason); err != nil {
+				return nil, err
+			}
+			return map[string]any{"child_ids": []string{}, "cleanup_retried": true}, nil
 		}
 
 		// Build all child tasks first (before any mutations) to validate paths.
@@ -451,12 +601,24 @@ func handleSplitTask(deps *Deps) ToolHandler {
 		if original.Status == "in_progress" || original.Status == "blocked" {
 			allowedStatuses = []string{"in_progress", "blocked"}
 		}
-		prevTask, err := toolDeps.Ledger.UpdateIfStatusesReturnPrev(id, allowedStatuses, map[string]any{
-			"status":    "split",
-			"reason":    reason,
-			"worker_id": "",
-			"branch":    "",
-			"harness":   "",
+		prevTask, err := toolDeps.Ledger.UpdateIfStatusesReturnPrevWith(id, allowedStatuses, func(current ledger.Task) (map[string]any, error) {
+			if pendingIntent, _, ok := cleanupIntentFromTask(current); ok {
+				return nil, fmt.Errorf("task %s has %s cleanup pending; retry that cleanup before split_task", id, pendingIntent)
+			}
+			if current.Status == "in_progress" || current.Status == "blocked" {
+				return map[string]any{
+					"status": "blocked",
+					"reason": cleanupPendingReason(cleanupIntentSplitRequest, nil, reason),
+					"body":   bodyWithCleanupPending(current.Body, cleanupIntentSplitRequest, reason),
+				}, nil
+			}
+			return map[string]any{
+				"status":    "split",
+				"reason":    reason,
+				"worker_id": "",
+				"branch":    "",
+				"harness":   "",
+			}, nil
 		})
 		if err != nil {
 			// Roll back the children to avoid orphans on retry.
@@ -467,7 +629,20 @@ func handleSplitTask(deps *Deps) ToolHandler {
 		// Clean up worker resources based on the actual previous status and
 		// worker_id/branch from the atomic snapshot, not the stale preflight read.
 		if prevTask.Status == "in_progress" || prevTask.Status == "blocked" {
-			stopWorkerCleanup(toolDeps, prevTask.WorkerID, prevTask.Branch, id)
+			wid := prevTask.WorkerID
+			if wid == "" {
+				wid = workerIDFor(toolDeps, id)
+			}
+			result := cleanupWorkerResources(toolDeps, wid, prevTask.Branch, id, true)
+			if cleanupErr := result.Err(); cleanupErr != nil {
+				if err := markCleanupPending(toolDeps, id, wid, prevTask, cleanupIntentSplitRequest, reason, cleanupErr); err != nil {
+					return nil, fmt.Errorf("%w; additionally failed to record cleanup state: %v", cleanupErr, err)
+				}
+				return nil, cleanupErr
+			}
+			if err := finishPendingCleanup(toolDeps, id, wid, cleanupIntentSplitRequest, reason); err != nil {
+				return nil, err
+			}
 		}
 
 		return map[string]any{"child_ids": childIDs}, nil
@@ -538,7 +713,7 @@ func cleanupArchivedTaskResources(deps *Deps, taskID, branch string) {
 		deps.Config.Project.Slug+"-"+taskID)
 	_ = worktree.Remove(deps.Config.Project.RepoPath, wPath)
 	if branch != "" {
-		cleanupTaskBranch(deps.Config.Project.RepoPath, branch, taskID)
+		_ = cleanupTaskBranch(deps.Config.Project.RepoPath, branch, taskID)
 	}
 }
 
@@ -666,7 +841,7 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 		// Step 2: Create tmux window.
 		if err := tmux.CreateWindow(toolDeps.Session, workerID, worktreePath); err != nil {
 			_ = worktree.Remove(repoPath, worktreePath)
-			cleanupTaskBranch(repoPath, branch, taskID)
+			_ = cleanupTaskBranch(repoPath, branch, taskID)
 			return nil, fmt.Errorf("create tmux window: %w", err)
 		}
 
@@ -684,7 +859,7 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 		if updateErr != nil {
 			_ = tmux.KillWindow(toolDeps.Session, workerID)
 			_ = worktree.Remove(repoPath, worktreePath)
-			cleanupTaskBranch(repoPath, branch, taskID)
+			_ = cleanupTaskBranch(repoPath, branch, taskID)
 			return nil, fmt.Errorf("update ledger: %w", updateErr)
 		}
 		promptTask, err := loadTaskByID(toolDeps.Ledger, taskID)
@@ -771,18 +946,30 @@ func handleStopWorker(deps *Deps) ToolHandler {
 			return nil, fmt.Errorf("worker %q not found in registry or ledger", workerID)
 		}
 
-		// Commit ledger first, only when the task is in a recoverable state.
-		// Reject if the task is already terminal to prevent overwriting
-		// "completed" or "split" tasks back to "unstarted" in a narrow race
-		// with notify(completed) or split_request cleanup.
-		prevTask, err := toolDeps.Ledger.UpdateIfStatusesReturnPrev(taskID,
+		// Record cleanup as pending before touching external resources. If this
+		// process exits between killing tmux and removing the worktree, list_tasks
+		// still shows a retryable blocked task instead of an invisible orphan.
+		intent := cleanupIntentStopWorker
+		originalReason := ""
+		prevTask, err := toolDeps.Ledger.UpdateIfStatusesReturnPrevWith(taskID,
 			[]string{"in_progress", "blocked", "unstarted"},
-			map[string]any{
-				"status":    "unstarted",
-				"worker_id": "",
-				"branch":    "",
-				"harness":   "",
-				"reason":    "",
+			func(current ledger.Task) (map[string]any, error) {
+				if current.WorkerID != "" && current.WorkerID != workerID {
+					return nil, fmt.Errorf("worker %q is not assigned to task %s (assigned to %q)",
+						workerID, taskID, current.WorkerID)
+				}
+				if pendingIntent, pendingOriginalReason, ok := cleanupIntentFromTask(current); ok {
+					intent = pendingIntent
+					originalReason = pendingOriginalReason
+				}
+				fields := map[string]any{
+					"status": "blocked",
+					"reason": cleanupPendingReason(intent, nil, originalReason),
+				}
+				if current.WorkerID == "" {
+					fields["worker_id"] = workerID
+				}
+				return fields, nil
 			})
 		if err != nil {
 			return nil, err
@@ -791,7 +978,22 @@ func handleStopWorker(deps *Deps) ToolHandler {
 		if cleanupWorkerID == "" {
 			cleanupWorkerID = workerID
 		}
-		stopWorkerCleanup(toolDeps, cleanupWorkerID, prevTask.Branch, taskID)
+		result := cleanupWorkerResources(toolDeps, cleanupWorkerID, prevTask.Branch, taskID, intentDeletesBranch(intent))
+		if cleanupErr := result.Err(); cleanupErr != nil {
+			if err := markCleanupPending(toolDeps, taskID, cleanupWorkerID, prevTask, intent, originalReason, cleanupErr); err != nil {
+				return nil, fmt.Errorf("%w; additionally failed to record cleanup state: %v", cleanupErr, err)
+			}
+			return nil, cleanupErr
+		}
+		if err := finishPendingCleanup(toolDeps, taskID, cleanupWorkerID, intent, originalReason); err != nil {
+			return nil, err
+		}
+		if notifyType, ok := notifyTypeForCleanupIntent(intent); ok {
+			if err := triggerAfterNotify(ctx, toolDeps, notifyType, taskID); err != nil {
+				log.Printf("warn: stop_worker finalized %s cleanup for task %s but failed to trigger orchestrator: %v",
+					notifyType, taskID, err)
+			}
+		}
 
 		return map[string]any{"stopped": workerID}, nil
 	}
@@ -927,6 +1129,12 @@ func handleNotify(deps *Deps) ToolHandler {
 				notifyType, taskID, task.Status)
 			return map[string]any{"ignored": true}, nil
 		}
+		if pendingIntent, _, ok := cleanupIntentFromTask(*task); ok {
+			if expectedIntent, supported := cleanupIntentForNotifyType(notifyType); !supported || expectedIntent != pendingIntent {
+				return nil, fmt.Errorf("task %s has %s cleanup pending; retry that cleanup before notify(%s)",
+					taskID, pendingIntent, notifyType)
+			}
+		}
 
 		switch notifyType {
 		case "completed":
@@ -956,21 +1164,26 @@ func handleNotify(deps *Deps) ToolHandler {
 						return nil, fmt.Errorf("worker %q is not assigned to task %s (assigned to %q)",
 							callerWorkerID, taskID, current.WorkerID)
 					}
+					if pendingIntent, _, ok := cleanupIntentFromTask(current); ok && pendingIntent != cleanupIntentCompleted {
+						return nil, fmt.Errorf("task %s has %s cleanup pending; retry that cleanup before notify(completed)",
+							taskID, pendingIntent)
+					}
 					fields := map[string]any{
-						"status":    "completed",
-						"pr_url":    prURL,
-						"worker_id": "",
-						"harness":   "",
+						"status": "blocked",
+						"pr_url": prURL,
+						"reason": cleanupPendingReason(cleanupIntentCompleted, nil, ""),
 					}
 					// Append a fresh merge_commit comment so archive_task reads the
 					// verified completion value, not a stale marker from the task body.
 					comment := "<!-- merge_commit: " + mergeCommit + " -->"
 					body := ledger.RemoveMergeCommitComment(current.Body)
+					var nextBody string
 					if strings.TrimSpace(body) == "" {
-						fields["body"] = comment
+						nextBody = comment
 					} else {
-						fields["body"] = body + "\n" + comment
+						nextBody = body + "\n" + comment
 					}
+					fields["body"] = bodyWithCleanupPending(nextBody, cleanupIntentCompleted, "")
 					return fields, nil
 				},
 			)
@@ -982,16 +1195,23 @@ func handleNotify(deps *Deps) ToolHandler {
 			// here; it is preserved so archive_task can record it in the archive
 			// front matter and then delete it. If archive_task is never called the
 			// branch will be orphaned, but that matches the spec's deferred-deletion
-			// design for completed tasks.
+			// design for completed tasks. If cleanup fails, the task remains blocked
+			// with worker_id/branch/harness intact so notify(completed) or
+			// stop_worker can retry without hiding the orphaned resources.
 			wid := prevTask.WorkerID
 			if wid == "" {
 				wid = workerIDFor(toolDeps, taskID) // fallback
 			}
-			_ = tmux.KillWindow(toolDeps.Session, wid)
-			_ = worktree.Remove(toolDeps.Config.Project.RepoPath,
-				filepath.Join(toolDeps.Config.Project.WorktreeBase,
-					toolDeps.Config.Project.Slug+"-"+taskID))
-			toolDeps.Registry.Remove(wid)
+			result := cleanupWorkerResources(toolDeps, wid, prevTask.Branch, taskID, false)
+			if cleanupErr := result.Err(); cleanupErr != nil {
+				if err := markCleanupPending(toolDeps, taskID, wid, prevTask, cleanupIntentCompleted, "", cleanupErr); err != nil {
+					return nil, fmt.Errorf("%w; additionally failed to record cleanup state: %v", cleanupErr, err)
+				}
+				return nil, cleanupErr
+			}
+			if err := finishPendingCleanup(toolDeps, taskID, wid, cleanupIntentCompleted, ""); err != nil {
+				return nil, err
+			}
 
 		case "blocked":
 			reason, _ := payload["reason"].(string)
@@ -1000,6 +1220,10 @@ func handleNotify(deps *Deps) ToolHandler {
 					if current.WorkerID != callerWorkerID {
 						return nil, fmt.Errorf("worker %q is not assigned to task %s (assigned to %q)",
 							callerWorkerID, taskID, current.WorkerID)
+					}
+					if pendingIntent, _, ok := cleanupIntentFromTask(current); ok {
+						return nil, fmt.Errorf("task %s has %s cleanup pending; retry that cleanup before notify(blocked)",
+							taskID, pendingIntent)
 					}
 					fields := map[string]any{"status": "blocked"}
 					if reason != "" {
@@ -1013,6 +1237,45 @@ func handleNotify(deps *Deps) ToolHandler {
 
 		case "split_request":
 			reason, _ := payload["reason"].(string)
+			if pendingIntent, originalReason, ok := cleanupIntentFromTask(*task); ok && pendingIntent == cleanupIntentSplitRequest {
+				pendingTask, err := toolDeps.Ledger.UpdateIfStatusesReturnPrevWith(taskID, []string{"blocked"},
+					func(current ledger.Task) (map[string]any, error) {
+						if current.WorkerID != callerWorkerID {
+							return nil, fmt.Errorf("worker %q is not assigned to task %s (assigned to %q)",
+								callerWorkerID, taskID, current.WorkerID)
+						}
+						currentIntent, currentOriginalReason, ok := cleanupIntentFromTask(current)
+						if !ok {
+							return nil, fmt.Errorf("task %s is missing cleanup marker", taskID)
+						}
+						if currentIntent != cleanupIntentSplitRequest {
+							return nil, fmt.Errorf("task %s has %s cleanup pending, not %s",
+								taskID, currentIntent, cleanupIntentSplitRequest)
+						}
+						originalReason = currentOriginalReason
+						return map[string]any{
+							"reason": cleanupPendingReason(cleanupIntentSplitRequest, nil, originalReason),
+						}, nil
+					})
+				if err != nil {
+					return nil, err
+				}
+				wid := pendingTask.WorkerID
+				if wid == "" {
+					wid = workerIDFor(toolDeps, taskID)
+				}
+				result := cleanupWorkerResources(toolDeps, wid, pendingTask.Branch, taskID, true)
+				if cleanupErr := result.Err(); cleanupErr != nil {
+					if err := markCleanupPending(toolDeps, taskID, wid, pendingTask, cleanupIntentSplitRequest, originalReason, cleanupErr); err != nil {
+						return nil, fmt.Errorf("%w; additionally failed to record cleanup state: %v", cleanupErr, err)
+					}
+					return nil, cleanupErr
+				}
+				if err := finishPendingCleanup(toolDeps, taskID, wid, cleanupIntentSplitRequest, originalReason); err != nil {
+					return nil, err
+				}
+				break
+			}
 			proposedSlices, _ := payload["proposed_slices"].([]any)
 			if len(proposedSlices) == 0 {
 				return nil, fmt.Errorf("proposed_slices must not be empty for split_request")
@@ -1080,12 +1343,14 @@ func handleNotify(deps *Deps) ToolHandler {
 						return nil, fmt.Errorf("worker %q is not assigned to task %s (assigned to %q)",
 							callerWorkerID, taskID, current.WorkerID)
 					}
+					if pendingIntent, _, ok := cleanupIntentFromTask(current); ok {
+						return nil, fmt.Errorf("task %s has %s cleanup pending; retry that cleanup before notify(split_request)",
+							taskID, pendingIntent)
+					}
 					return map[string]any{
-						"status":    "split",
-						"worker_id": "",
-						"branch":    "",
-						"harness":   "",
-						"reason":    reason,
+						"status": "blocked",
+						"reason": cleanupPendingReason(cleanupIntentSplitRequest, nil, reason),
+						"body":   bodyWithCleanupPending(current.Body, cleanupIntentSplitRequest, reason),
 					}, nil
 				},
 			)
@@ -1105,12 +1370,13 @@ func handleNotify(deps *Deps) ToolHandler {
 				}
 			}
 			if err := toolDeps.Ledger.AddAll(childTasks); err != nil {
-				if _, rollbackErr := toolDeps.Ledger.UpdateIfStatusesReturnPrev(taskID, []string{"split"}, map[string]any{
+				if _, rollbackErr := toolDeps.Ledger.UpdateIfStatusesReturnPrev(taskID, []string{"blocked"}, map[string]any{
 					"status":    prevTask.Status,
 					"worker_id": prevTask.WorkerID,
 					"branch":    prevTask.Branch,
 					"harness":   prevTask.Harness,
 					"reason":    prevTask.Reason,
+					"body":      prevTask.Body,
 				}); rollbackErr != nil {
 					log.Printf("warn: split_request rollback failed for task %s after child creation error: %v", taskID, rollbackErr)
 				}
@@ -1120,18 +1386,23 @@ func handleNotify(deps *Deps) ToolHandler {
 			// Cleanup resources using prevTask snapshot (not stale task load) so that
 			// a concurrent stop_worker + spawn_worker that updated worker_id/branch
 			// between the initial load and UpdateReturnPrev is handled correctly.
+			// Parent state stays blocked until cleanup succeeds. The already-created
+			// child tasks make retry idempotent via stop_worker or notify(split_request)
+			// without allocating duplicate slices.
 			wid := prevTask.WorkerID
 			if wid == "" {
 				wid = workerIDFor(toolDeps, taskID)
 			}
-			_ = tmux.KillWindow(toolDeps.Session, wid)
-			_ = worktree.Remove(toolDeps.Config.Project.RepoPath,
-				filepath.Join(toolDeps.Config.Project.WorktreeBase,
-					toolDeps.Config.Project.Slug+"-"+taskID))
-			if prevTask.Branch != "" {
-				cleanupTaskBranch(toolDeps.Config.Project.RepoPath, prevTask.Branch, taskID)
+			result := cleanupWorkerResources(toolDeps, wid, prevTask.Branch, taskID, true)
+			if cleanupErr := result.Err(); cleanupErr != nil {
+				if err := markCleanupPending(toolDeps, taskID, wid, prevTask, cleanupIntentSplitRequest, reason, cleanupErr); err != nil {
+					return nil, fmt.Errorf("%w; additionally failed to record cleanup state: %v", cleanupErr, err)
+				}
+				return nil, cleanupErr
 			}
-			toolDeps.Registry.Remove(wid)
+			if err := finishPendingCleanup(toolDeps, taskID, wid, cleanupIntentSplitRequest, reason); err != nil {
+				return nil, err
+			}
 
 		}
 
@@ -1196,6 +1467,7 @@ func depsForProject(deps *Deps, slug string) (*Deps, error) {
 		Manager:       deps.Manager,
 		ProjectSlug:   project.Slug,
 		NotifyTrigger: notifyTrigger,
+		cleanup:       deps.cleanup,
 	}, nil
 }
 
@@ -1233,45 +1505,213 @@ func workerIDFor(deps *Deps, taskID string) string {
 	return "worker-" + taskID
 }
 
-func cleanupTaskBranch(repoPath, branch, taskID string) {
+func cleanupTaskBranch(repoPath, branch, taskID string) error {
 	absRepoPath, err := filepath.Abs(repoPath)
 	if err != nil {
 		log.Printf("warn: worker cleanup failed to resolve repo path %q for task %s: %v", repoPath, taskID, err)
-		return
+		return err
 	}
 	cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := worktree.DeleteTaskBranchIfSafeContext(cleanupCtx, absRepoPath, branch, taskID); err != nil {
 		if errors.Is(err, worktree.ErrUnsafeBranchDelete) {
 			log.Printf("warn: worker cleanup skipped unsafe branch delete for task %s: %v", taskID, err)
-			return
+			return nil
 		}
 		if errors.Is(err, worktree.ErrOriginUnavailable) {
 			log.Printf("warn: worker cleanup skipped branch delete for task %s (origin unavailable): %v", taskID, err)
-			return
+			return nil
 		}
 		log.Printf("warn: worker cleanup failed to delete branch %q for task %s: %v", branch, taskID, err)
+		return err
 	}
+	return nil
 }
 
-// stopWorkerCleanup is best-effort cleanup: it kills the tmux window,
-// removes the worktree, deletes the git branch when safe, and evicts the registry entry.
-// All errors are silently ignored; callers must not rely on this returning nil.
-func stopWorkerCleanup(deps *Deps, workerID, branch, taskID string) {
+func cleanupWorkerResources(deps *Deps, workerID, branch, taskID string, deleteBranch bool) workerCleanupResult {
+	ops := deps.cleanup.withDefaults()
+	result := workerCleanupResult{
+		WorkerID: workerID,
+		Branch:   branch,
+	}
 	if workerID != "" {
-		_ = tmux.KillWindow(deps.Session, workerID)
+		alive, err := ops.isWindowAlive(deps.Session, workerID)
+		if err != nil {
+			result.TmuxErr = fmt.Errorf("check tmux window %q: %w", workerID, err)
+		} else if alive {
+			if err := ops.killWindow(deps.Session, workerID); err != nil {
+				result.TmuxErr = fmt.Errorf("kill tmux window %q: %w", workerID, err)
+			}
+		}
 	}
 	if taskID != "" {
 		wPath := filepath.Join(deps.Config.Project.WorktreeBase,
 			deps.Config.Project.Slug+"-"+taskID)
-		_ = worktree.Remove(deps.Config.Project.RepoPath, wPath)
+		result.WorktreePath = wPath
+		if err := ops.removeWorktree(deps.Config.Project.RepoPath, wPath); err != nil {
+			if !worktreeRemoveAlreadyDone(err) {
+				result.WorktreeErr = fmt.Errorf("remove worktree %q: %w", wPath, err)
+			}
+		}
 	}
-	if branch != "" {
-		cleanupTaskBranch(deps.Config.Project.RepoPath, branch, taskID)
+	if deleteBranch && branch != "" {
+		if err := ops.deleteTaskBranch(deps.Config.Project.RepoPath, branch, taskID); err != nil {
+			result.BranchErr = fmt.Errorf("delete branch %q: %w", branch, err)
+		}
 	}
-	if workerID != "" {
+	if !result.Failed() && workerID != "" {
 		deps.Registry.Remove(workerID)
 	}
+	return result
+}
+
+func worktreeRemoveAlreadyDone(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "is not a working tree")
+}
+
+func bodyWithCleanupPending(body string, intent cleanupIntent, originalReason string) string {
+	body = removeCleanupPendingComment(body)
+	marker, err := json.Marshal(cleanupPendingMarker{
+		Intent:         string(intent),
+		OriginalReason: originalReason,
+	})
+	if err != nil {
+		return body
+	}
+	comment := cleanupPendingCommentStart + base64.StdEncoding.EncodeToString(marker) + cleanupPendingCommentEnd
+	if strings.TrimSpace(body) == "" {
+		return comment
+	}
+	return strings.TrimRight(body, "\n") + "\n" + comment
+}
+
+func removeCleanupPendingComment(body string) string {
+	return cleanupPendingCommentRE.ReplaceAllString(body, "")
+}
+
+func cleanupIntentFromTask(task ledger.Task) (cleanupIntent, string, bool) {
+	match := cleanupPendingCommentRE.FindStringSubmatch(task.Body)
+	if len(match) != 2 {
+		return "", "", false
+	}
+	decoded, err := base64.StdEncoding.DecodeString(match[1])
+	if err != nil {
+		return "", "", false
+	}
+	var marker cleanupPendingMarker
+	if err := json.Unmarshal(decoded, &marker); err != nil {
+		return "", "", false
+	}
+	intent := cleanupIntent(marker.Intent)
+	switch intent {
+	case cleanupIntentStopWorker, cleanupIntentCompleted, cleanupIntentSplitRequest:
+		return intent, marker.OriginalReason, true
+	default:
+		return "", "", false
+	}
+}
+
+func cleanupPendingReason(intent cleanupIntent, cleanupErr error, originalReason string) string {
+	detail := "cleanup in progress"
+	if cleanupErr != nil {
+		detail = cleanupErr.Error()
+	}
+	reason := fmt.Sprintf("cleanup pending after %s: %s", intent, detail)
+	if intent == cleanupIntentSplitRequest {
+		reason += cleanupOriginalSplitReasonPrefix + strconv.Quote(originalReason)
+	}
+	return reason
+}
+
+func cleanupIntentForNotifyType(notifyType string) (cleanupIntent, bool) {
+	switch notifyType {
+	case "completed":
+		return cleanupIntentCompleted, true
+	case "split_request":
+		return cleanupIntentSplitRequest, true
+	default:
+		return "", false
+	}
+}
+
+func notifyTypeForCleanupIntent(intent cleanupIntent) (string, bool) {
+	switch intent {
+	case cleanupIntentCompleted:
+		return "completed", true
+	case cleanupIntentSplitRequest:
+		return "split_request", true
+	default:
+		return "", false
+	}
+}
+
+func intentDeletesBranch(intent cleanupIntent) bool {
+	return intent != cleanupIntentCompleted
+}
+
+func markCleanupPending(deps *Deps, taskID, workerID string, prevTask ledger.Task, intent cleanupIntent, originalReason string, cleanupErr error) error {
+	_, err := deps.Ledger.UpdateIfStatusesReturnPrevWith(taskID, []string{"blocked"}, func(current ledger.Task) (map[string]any, error) {
+		if current.WorkerID != "" && workerID != "" && current.WorkerID != workerID {
+			return nil, fmt.Errorf("worker %q is not assigned to task %s (assigned to %q)",
+				workerID, taskID, current.WorkerID)
+		}
+		return map[string]any{
+			"status":    "blocked",
+			"worker_id": workerID,
+			"branch":    prevTask.Branch,
+			"harness":   prevTask.Harness,
+			"reason":    cleanupPendingReason(intent, cleanupErr, originalReason),
+		}, nil
+	})
+	return err
+}
+
+func finishPendingCleanup(deps *Deps, taskID, workerID string, intent cleanupIntent, originalReason string) error {
+	_, err := deps.Ledger.UpdateIfStatusesReturnPrevWith(taskID, []string{"blocked"}, func(current ledger.Task) (map[string]any, error) {
+		if current.WorkerID != "" && workerID != "" && current.WorkerID != workerID {
+			return nil, fmt.Errorf("worker %q is not assigned to task %s (assigned to %q)",
+				workerID, taskID, current.WorkerID)
+		}
+		if pendingIntent, pendingOriginalReason, ok := cleanupIntentFromTask(current); ok {
+			if pendingIntent != intent {
+				return nil, fmt.Errorf("task %s has %s cleanup pending, not %s", taskID, pendingIntent, intent)
+			}
+			if intent == cleanupIntentSplitRequest && pendingOriginalReason != originalReason {
+				return nil, fmt.Errorf("task %s split cleanup reason changed during retry", taskID)
+			}
+		} else if intent != cleanupIntentStopWorker {
+			return nil, fmt.Errorf("task %s is missing %s cleanup marker", taskID, intent)
+		}
+		switch intent {
+		case cleanupIntentCompleted:
+			return map[string]any{
+				"status":    "completed",
+				"worker_id": "",
+				"harness":   "",
+				"reason":    "",
+				"body":      removeCleanupPendingComment(current.Body),
+			}, nil
+		case cleanupIntentSplitRequest:
+			return map[string]any{
+				"status":    "split",
+				"worker_id": "",
+				"branch":    "",
+				"harness":   "",
+				"reason":    originalReason,
+				"body":      removeCleanupPendingComment(current.Body),
+			}, nil
+		default:
+			return map[string]any{
+				"status":    "unstarted",
+				"worker_id": "",
+				"branch":    "",
+				"harness":   "",
+				"reason":    "",
+				"body":      removeCleanupPendingComment(current.Body),
+			}, nil
+		}
+	})
+	return err
 }
 
 // extractMergeCommit reads the <!-- merge_commit: ... --> comment from a body.
@@ -1334,7 +1774,7 @@ func loadTaskByID(l *ledger.Ledger, taskID string) (*ledger.Task, error) {
 func rollbackSpawnAfterLedgerUpdate(deps *Deps, workerID, branch, taskID, repoPath, worktreePath string) {
 	_ = tmux.KillWindow(deps.Session, workerID)
 	_ = worktree.Remove(repoPath, worktreePath)
-	cleanupTaskBranch(repoPath, branch, taskID)
+	_ = cleanupTaskBranch(repoPath, branch, taskID)
 	// Reset lifecycle fields only — do not restore allowed/forbidden_files
 	// to avoid overwriting concurrent update_task edits. Use UpdateIfStatuses
 	// so a concurrent split_task that already committed (moving the parent to
