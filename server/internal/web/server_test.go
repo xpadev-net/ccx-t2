@@ -1671,6 +1671,51 @@ func TestWebSocketRejectsDisallowedOrigin(t *testing.T) {
 	}
 }
 
+func TestWebSocketAllowsEmptyOrigin(t *testing.T) {
+	server := httptest.NewServer(New(Deps{
+		Config:       testConfig(),
+		AuthDisabled: true,
+	}))
+	defer server.Close()
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(server.URL, "/ws/ledger"), nil)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	conn.Close()
+}
+
+func TestWebSocketAllowsSameOrigin(t *testing.T) {
+	server := httptest.NewServer(New(Deps{
+		Config:       testConfig(),
+		AuthDisabled: true,
+	}))
+	defer server.Close()
+	header := http.Header{"Origin": []string{server.URL}}
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(server.URL, "/ws/ledger"), header)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	conn.Close()
+}
+
+func TestWebSocketAllowsConfiguredOrigin(t *testing.T) {
+	server := httptest.NewServer(New(Deps{
+		Config:         testConfig(),
+		AuthDisabled:   true,
+		AllowedOrigins: []string{"http://allowed.example"},
+	}))
+	defer server.Close()
+	header := http.Header{"Origin": []string{"http://allowed.example"}}
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(server.URL, "/ws/ledger"), header)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	conn.Close()
+}
+
 func TestWorkerLogWebSocketRejectsSecondSubscriber(t *testing.T) {
 	lines := make(chan string)
 	server := httptest.NewServer(New(Deps{

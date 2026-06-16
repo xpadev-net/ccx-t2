@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -210,7 +211,22 @@ func (s *Server) isAllowedWSOrigin(r *http.Request) bool {
 	if origin == "" {
 		return true
 	}
-	return s.allowedOrigins[origin]
+	if s.allowedOrigins[origin] {
+		return true
+	}
+	originURL, err := url.Parse(origin)
+	if err != nil || originURL.Scheme == "" || originURL.Host == "" {
+		return false
+	}
+	return strings.EqualFold(originURL.Scheme, requestScheme(r)) &&
+		strings.EqualFold(originURL.Host, r.Host)
+}
+
+func requestScheme(r *http.Request) string {
+	if r.TLS != nil {
+		return "https"
+	}
+	return "http"
 }
 
 func writeWSJSON(conn *websocket.Conn, msg wsMessage) error {
