@@ -50,7 +50,36 @@ func RemoveContext(ctx context.Context, repoPath, worktreePath string) error {
 }
 
 var ErrUnsafeBranchDelete = errors.New("unsafe branch delete skipped")
+var ErrUnsafeBranchCreate = errors.New("unsafe branch create skipped")
 var ErrOriginUnavailable = errors.New("origin unavailable")
+
+// EnsureBranchCreationSafe verifies that creating branch would not collide with
+// protected/default branches, checked-out branches, upstreams, or remote refs.
+func EnsureBranchCreationSafe(repoPath, branch string) error {
+	return EnsureBranchCreationSafeContext(context.Background(), repoPath, branch)
+}
+
+// EnsureBranchCreationSafeContext is EnsureBranchCreationSafe with cancellation support.
+func EnsureBranchCreationSafeContext(ctx context.Context, repoPath, branch string) error {
+	if !filepath.IsAbs(repoPath) {
+		return fmt.Errorf("repoPath must be absolute, got: %s", repoPath)
+	}
+	branch = strings.TrimSpace(branch)
+	if branch == "" {
+		return fmt.Errorf("%w: branch must be non-empty", ErrUnsafeBranchCreate)
+	}
+	if exists, err := localBranchExists(ctx, repoPath, branch); err != nil {
+		return err
+	} else if exists {
+		return fmt.Errorf("%w: branch %q already exists", ErrUnsafeBranchCreate, branch)
+	}
+	if reason, safe, err := branchCreateSafety(ctx, repoPath, branch); err != nil {
+		return err
+	} else if !safe {
+		return fmt.Errorf("%w: %s", ErrUnsafeBranchCreate, reason)
+	}
+	return nil
+}
 
 // DeleteTaskBranchIfSafe deletes a local branch only when it is clearly scoped
 // to taskID and passes the normal branch deletion safety checks.
@@ -87,7 +116,32 @@ func DeleteTaskBranchIfSafeContext(ctx context.Context, repoPath, branch, taskID
 	return runContext(ctx, "git", "-C", repoPath, "branch", "-D", branch)
 }
 
+func branchCreateSafety(ctx context.Context, repoPath, branch string) (string, bool, error) {
+	return branchRemoteSafety(ctx, repoPath, branch)
+}
+
 func branchDeleteSafety(ctx context.Context, repoPath, branch string) (string, bool, error) {
+	if reason, safe, err := branchRemoteSafety(ctx, repoPath, branch); err != nil || !safe {
+		return reason, safe, err
+	}
+	checkedOut, err := branchCheckedOutInWorktree(ctx, repoPath, branch)
+	if err != nil {
+		return "", false, err
+	}
+	if checkedOut {
+		return fmt.Sprintf("%q is checked out in a worktree", branch), false, nil
+	}
+	hasUpstream, err := branchHasUpstream(ctx, repoPath, branch)
+	if err != nil {
+		return "", false, err
+	}
+	if hasUpstream {
+		return fmt.Sprintf("%q has an upstream ref and may have an open PR", branch), false, nil
+	}
+	return "", true, nil
+}
+
+func branchRemoteSafety(ctx context.Context, repoPath, branch string) (string, bool, error) {
 	if isCommonDefaultBranchName(branch) {
 		return fmt.Sprintf("%q is a protected default branch name", branch), false, nil
 	}
@@ -104,13 +158,6 @@ func branchDeleteSafety(ctx context.Context, repoPath, branch string) (string, b
 			return fmt.Sprintf("%q is the remote default branch", branch), false, nil
 		}
 	}
-	checkedOut, err := branchCheckedOutInWorktree(ctx, repoPath, branch)
-	if err != nil {
-		return "", false, err
-	}
-	if checkedOut {
-		return fmt.Sprintf("%q is checked out in a worktree", branch), false, nil
-	}
 	hasRemote, err := branchHasRemoteRef(ctx, repoPath, branch)
 	if err != nil {
 		return "", false, err
@@ -124,13 +171,6 @@ func branchDeleteSafety(ctx context.Context, repoPath, branch string) (string, b
 	}
 	if existsOnRemote {
 		return fmt.Sprintf("%q exists on a remote and may have an open PR", branch), false, nil
-	}
-	hasUpstream, err := branchHasUpstream(ctx, repoPath, branch)
-	if err != nil {
-		return "", false, err
-	}
-	if hasUpstream {
-		return fmt.Sprintf("%q has an upstream ref and may have an open PR", branch), false, nil
 	}
 	return "", true, nil
 }

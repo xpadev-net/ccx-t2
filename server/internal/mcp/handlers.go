@@ -631,12 +631,11 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 			return nil, fmt.Errorf("invalid mcp_args shell syntax: %w", err)
 		}
 
-		branchExists, err := gitBranchExists(toolDeps.Config.Project.RepoPath, branch)
-		if err != nil {
+		if err := worktree.EnsureBranchCreationSafeContext(ctx, toolDeps.Config.Project.RepoPath, branch); err != nil {
+			if errors.Is(err, worktree.ErrUnsafeBranchCreate) {
+				return nil, fmt.Errorf("branch %q is unsafe to create: %w", branch, err)
+			}
 			return nil, err
-		}
-		if branchExists {
-			return nil, fmt.Errorf("branch %q already exists", branch)
 		}
 
 		// Build paths.

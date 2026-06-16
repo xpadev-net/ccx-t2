@@ -52,6 +52,83 @@ func TestCreateRejectsDuplicateBranch(t *testing.T) {
 	}
 }
 
+func TestEnsureBranchCreationSafeAllowsNewWorkerBranch(t *testing.T) {
+	repoPath := initRepo(t)
+
+	if err := EnsureBranchCreationSafe(repoPath, "feature/task-001"); err != nil {
+		t.Fatalf("EnsureBranchCreationSafe(new branch): %v", err)
+	}
+}
+
+func TestEnsureBranchCreationSafeRejectsLocalBranch(t *testing.T) {
+	repoPath := initRepo(t)
+	runGit(t, repoPath, "branch", "feature/task-001")
+
+	err := EnsureBranchCreationSafe(repoPath, "feature/task-001")
+	if !errors.Is(err, ErrUnsafeBranchCreate) {
+		t.Fatalf("EnsureBranchCreationSafe(local branch) error = %v, want ErrUnsafeBranchCreate", err)
+	}
+}
+
+func TestEnsureBranchCreationSafeRejectsDefaultBranch(t *testing.T) {
+	repoPath := initRepo(t)
+
+	err := EnsureBranchCreationSafe(repoPath, "main")
+	if !errors.Is(err, ErrUnsafeBranchCreate) {
+		t.Fatalf("EnsureBranchCreationSafe(main) error = %v, want ErrUnsafeBranchCreate", err)
+	}
+}
+
+func TestEnsureBranchCreationSafeRejectsCustomRemoteDefaultBranch(t *testing.T) {
+	repoPath := initRepo(t)
+	remotePath := filepath.Join(t.TempDir(), "origin.git")
+	head := gitOutput(t, repoPath, "rev-parse", "HEAD")
+	runGitNoC(t, "init", "--bare", remotePath)
+	runGit(t, repoPath, "remote", "add", "origin", remotePath)
+	runGit(t, repoPath, "push", "origin", "main")
+	runGitNoC(t, "--git-dir", remotePath, "update-ref", "refs/heads/develop", head)
+	runGitNoC(t, "--git-dir", remotePath, "symbolic-ref", "HEAD", "refs/heads/develop")
+
+	err := EnsureBranchCreationSafe(repoPath, "develop")
+	if !errors.Is(err, ErrUnsafeBranchCreate) {
+		t.Fatalf("EnsureBranchCreationSafe(remote default) error = %v, want ErrUnsafeBranchCreate", err)
+	}
+	if !strings.Contains(err.Error(), "remote default branch") {
+		t.Fatalf("EnsureBranchCreationSafe(remote default) error = %v, want remote default branch reason", err)
+	}
+}
+
+func TestEnsureBranchCreationSafeRejectsRemoteBranchAsPullRequestRisk(t *testing.T) {
+	repoPath := initRepo(t)
+	remotePath := filepath.Join(t.TempDir(), "origin.git")
+	head := gitOutput(t, repoPath, "rev-parse", "HEAD")
+	runGitNoC(t, "init", "--bare", remotePath)
+	runGit(t, repoPath, "remote", "add", "origin", remotePath)
+	runGit(t, repoPath, "push", "origin", "main")
+	runGitNoC(t, "--git-dir", remotePath, "update-ref", "refs/heads/feature/task-001", head)
+
+	err := EnsureBranchCreationSafe(repoPath, "feature/task-001")
+	if !errors.Is(err, ErrUnsafeBranchCreate) {
+		t.Fatalf("EnsureBranchCreationSafe(remote branch) error = %v, want ErrUnsafeBranchCreate", err)
+	}
+	if !strings.Contains(err.Error(), "exists on a remote") {
+		t.Fatalf("EnsureBranchCreationSafe(remote branch) error = %v, want remote branch reason", err)
+	}
+}
+
+func TestEnsureBranchCreationSafeReportsOriginUnavailable(t *testing.T) {
+	repoPath := initRepo(t)
+	runGit(t, repoPath, "remote", "add", "origin", filepath.Join(t.TempDir(), "missing.git"))
+
+	err := EnsureBranchCreationSafe(repoPath, "feature/task-001")
+	if !errors.Is(err, ErrOriginUnavailable) {
+		t.Fatalf("EnsureBranchCreationSafe(missing origin) error = %v, want ErrOriginUnavailable", err)
+	}
+	if branchExists(t, repoPath, "feature/task-001") {
+		t.Fatal("feature/task-001 was created, want only preflight validation")
+	}
+}
+
 func TestDeleteTaskBranchIfSafeDeletesLocalOnlyWorkerBranch(t *testing.T) {
 	repoPath := initRepo(t)
 	runGit(t, repoPath, "branch", "feature/task-001")

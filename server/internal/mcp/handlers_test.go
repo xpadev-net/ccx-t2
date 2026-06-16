@@ -170,6 +170,56 @@ func TestHandleSpawnWorkerRejectsBranchWithoutTaskID(t *testing.T) {
 	}
 }
 
+func TestHandleSpawnWorkerRejectsRemoteBranchCollision(t *testing.T) {
+	dir := t.TempDir()
+	repoPath := initTestRepo(t)
+	remotePath := filepath.Join(t.TempDir(), "origin.git")
+	head := gitOutput(t, repoPath, "rev-parse", "HEAD")
+	runGitNoC(t, "init", "--bare", remotePath)
+	runGit(t, repoPath, "remote", "add", "origin", remotePath)
+	runGit(t, repoPath, "push", "origin", "main")
+	runGitNoC(t, "--git-dir", remotePath, "update-ref", "refs/heads/feature/task-001-work", head)
+
+	l := ledger.NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
+	if err := l.Add(ledger.Task{ID: "task-001", Title: "Task", Status: "unstarted"}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	deps := &Deps{
+		Ledger:   l,
+		Registry: worker.NewRegistry(),
+		Config: &config.Config{
+			Project: config.ProjectConfig{
+				Slug:         "proj",
+				RepoPath:     repoPath,
+				WorktreeBase: filepath.Join(dir, "worktrees"),
+			},
+			WorkerHarnesses: []string{"sh"},
+			Harnesses: map[string]config.HarnessConfig{
+				"sh": {Command: "sh", McpArgs: "--mcp-url {url}"},
+			},
+		},
+	}
+
+	_, err := handleSpawnWorker(deps)(context.Background(), map[string]any{
+		"task_id":       "task-001",
+		"branch":        "feature/task-001-work",
+		"allowed_files": []any{"server/internal/mcp"},
+	})
+	if err == nil {
+		t.Fatal("handleSpawnWorker error = nil, want remote branch collision error")
+	}
+	if !strings.Contains(err.Error(), "unsafe to create") || !strings.Contains(err.Error(), "exists on a remote") {
+		t.Fatalf("handleSpawnWorker error = %v, want remote branch collision error", err)
+	}
+	tasks, err := l.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(tasks) != 1 || tasks[0].Status != "unstarted" || tasks[0].Branch != "" {
+		t.Fatalf("task changed after remote branch collision rejection: %#v", tasks)
+	}
+}
+
 func TestHandleSpawnWorkerRejectsMalformedFileLists(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -1099,8 +1149,23 @@ func initTestRepo(t *testing.T) string {
 func runGit(t *testing.T, repoPath string, args ...string) {
 	t.Helper()
 	cmdArgs := append([]string{"-C", repoPath}, args...)
+	runGitNoC(t, cmdArgs...)
+}
+
+func runGitNoC(t *testing.T, args ...string) {
+	t.Helper()
+	out, err := exec.Command("git", args...).CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v failed: %v\n%s", args, err, string(out))
+	}
+}
+
+func gitOutput(t *testing.T, repoPath string, args ...string) string {
+	t.Helper()
+	cmdArgs := append([]string{"-C", repoPath}, args...)
 	out, err := exec.Command("git", cmdArgs...).CombinedOutput()
 	if err != nil {
 		t.Fatalf("git %v failed: %v\n%s", args, err, string(out))
 	}
+	return strings.TrimSpace(string(out))
 }
