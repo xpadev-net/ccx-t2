@@ -1552,6 +1552,8 @@ func cleanupWorkerResources(deps *Deps, workerID, branch, taskID string, deleteB
 	if taskID != "" {
 		wPath, err := config.ProjectWorktreePath(deps.Config.Project, taskID)
 		if err != nil {
+			// No safe path exists to report or remove when resolution fails.
+			// Keep WorktreePath empty and surface the failure via WorktreeErr.
 			result.WorktreeErr = fmt.Errorf("resolve worktree path: %w", err)
 		} else if err := ops.removeWorktree(deps.Config.Project.RepoPath, wPath); err != nil {
 			result.WorktreePath = wPath

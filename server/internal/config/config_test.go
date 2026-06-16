@@ -288,6 +288,27 @@ func TestPrepareAllowsValidProjectPaths(t *testing.T) {
 	}
 }
 
+func TestPrepareDefaultsProjectSlugFromMapKey(t *testing.T) {
+	repoPath := initConfigTestRepo(t)
+	cfg := &Config{
+		Runtime: RuntimeConfig{WorktreeBase: mkdirConfigTestDir(t, "worktrees")},
+		Projects: map[string]ProjectConfig{
+			"alpha": {
+				RepoPath:     repoPath,
+				WorktreeBase: mkdirConfigTestDir(t, "project-worktrees"),
+				LedgerPath:   filepath.Join(repoPath, "tasks", "ledger.md"),
+			},
+		},
+	}
+
+	if err := Prepare(cfg); err != nil {
+		t.Fatalf("Prepare() error = %v, want nil", err)
+	}
+	if got := cfg.Projects["alpha"].Slug; got != "alpha" {
+		t.Fatalf("projects.alpha.slug = %q, want alpha", got)
+	}
+}
+
 func TestPrepareRejectsInvalidProjectSlugs(t *testing.T) {
 	for _, slug := range []string{"alpha/beta", "..", "alpha beta", "alpha\nbeta"} {
 		t.Run(strconv.Quote(slug), func(t *testing.T) {

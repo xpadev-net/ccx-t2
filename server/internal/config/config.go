@@ -366,6 +366,9 @@ func validate(cfg *Config) error {
 		if err := validateProjectSlug("projects slug key", slug); err != nil {
 			return err
 		}
+		if project.Slug == "" {
+			project.Slug = slug
+		}
 		if err := validateProjectSlug("projects."+slug+".slug", project.Slug); err != nil {
 			return err
 		}
