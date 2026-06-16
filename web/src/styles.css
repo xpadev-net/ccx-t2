@@ -171,6 +171,55 @@ button:disabled {
   padding: 16px 18px;
 }
 
+.heading-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  min-width: 0;
+}
+
+.heading-status > span {
+  margin: 0;
+}
+
+.connection-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  max-width: 100%;
+  border: 1px solid #cbd5df;
+  border-radius: 6px;
+  background: #f8fafc;
+  color: #435364;
+  padding: 2px 7px;
+  overflow: hidden;
+  font-size: 12px;
+  font-weight: 680;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.connection-badge.open {
+  border-color: #99c7af;
+  background: #eaf7f0;
+  color: #286042;
+}
+
+.connection-badge.pending {
+  border-color: #b7cde4;
+  background: #eef6ff;
+  color: #245c8f;
+}
+
+.connection-badge.problem {
+  border-color: #dfa6a6;
+  background: #fff2f2;
+  color: #8f2d2d;
+}
+
 .task-editor .section-heading,
 .task-create .section-heading,
 .orchestrator-dashboard .section-heading,

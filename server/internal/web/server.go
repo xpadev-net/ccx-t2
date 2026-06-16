@@ -184,10 +184,14 @@ func (c defaultWorkerCleaner) CleanupWorker(ctx context.Context, task ledger.Tas
 		errs = append(errs, fmt.Errorf("resolve repo path: %w", err))
 		repoPath = deps.cfg.Project.RepoPath
 	}
-	worktreePath := filepath.Join(deps.cfg.Project.WorktreeBase, deps.cfg.Project.Slug+"-"+task.ID)
-	if err := worktree.RemoveContext(ctx, repoPath, worktreePath); err != nil {
-		if !isMissingWorktreeError(err) {
-			errs = append(errs, fmt.Errorf("remove worktree: %w", err))
+	worktreePath, err := config.ProjectWorktreePath(deps.cfg.Project, task.ID)
+	if err != nil {
+		errs = append(errs, fmt.Errorf("resolve worktree path: %w", err))
+	} else {
+		if err := worktree.RemoveContext(ctx, repoPath, worktreePath); err != nil {
+			if !isMissingWorktreeError(err) {
+				errs = append(errs, fmt.Errorf("remove worktree: %w", err))
+			}
 		}
 	}
 	if task.Branch != "" {

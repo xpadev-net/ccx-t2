@@ -531,9 +531,15 @@ func TestCleanupTaskBranchNormalizesRelativeRepoPath(t *testing.T) {
 
 func TestProjectScopedListTasksUsesSelectedProject(t *testing.T) {
 	dir := t.TempDir()
+	worktreeBase := filepath.Join(dir, "worktrees")
+	if err := os.MkdirAll(worktreeBase, 0o755); err != nil {
+		t.Fatalf("MkdirAll worktrees: %v", err)
+	}
+	alphaRepo := initTestRepo(t)
+	betaRepo := initTestRepo(t)
 	cfg := &config.Config{
 		Server:  config.ServerConfig{Port: 8080},
-		Runtime: config.RuntimeConfig{TmuxSession: "ccx-test", WorktreeBase: filepath.Join(dir, "worktrees")},
+		Runtime: config.RuntimeConfig{TmuxSession: "ccx-test", WorktreeBase: worktreeBase},
 		Orchestrator: config.OrchestratorConfig{
 			Harness:           "sh",
 			HeartbeatInterval: time.Minute,
@@ -545,14 +551,14 @@ func TestProjectScopedListTasksUsesSelectedProject(t *testing.T) {
 		},
 		Projects: map[string]config.ProjectConfig{
 			"alpha": {
-				RepoPath:     filepath.Join(dir, "alpha"),
-				LedgerPath:   filepath.Join(dir, "alpha", "tasks", "ledger.md"),
-				WorktreeBase: filepath.Join(dir, "worktrees"),
+				RepoPath:     alphaRepo,
+				LedgerPath:   filepath.Join(alphaRepo, "tasks", "ledger.md"),
+				WorktreeBase: worktreeBase,
 			},
 			"beta": {
-				RepoPath:     filepath.Join(dir, "beta"),
-				LedgerPath:   filepath.Join(dir, "beta", "tasks", "ledger.md"),
-				WorktreeBase: filepath.Join(dir, "worktrees"),
+				RepoPath:     betaRepo,
+				LedgerPath:   filepath.Join(betaRepo, "tasks", "ledger.md"),
+				WorktreeBase: worktreeBase,
 			},
 		},
 	}
@@ -591,9 +597,15 @@ func TestProjectScopedListTasksUsesSelectedProject(t *testing.T) {
 
 func TestRegisterWorkerToolsNotifyUsesSelectedProjectTrigger(t *testing.T) {
 	dir := t.TempDir()
+	worktreeBase := filepath.Join(dir, "worktrees")
+	if err := os.MkdirAll(worktreeBase, 0o755); err != nil {
+		t.Fatalf("MkdirAll worktrees: %v", err)
+	}
+	alphaRepo := initTestRepo(t)
+	betaRepo := initTestRepo(t)
 	cfg := &config.Config{
 		Server:  config.ServerConfig{Port: 8080},
-		Runtime: config.RuntimeConfig{TmuxSession: "ccx-test", WorktreeBase: filepath.Join(dir, "worktrees")},
+		Runtime: config.RuntimeConfig{TmuxSession: "ccx-test", WorktreeBase: worktreeBase},
 		Orchestrator: config.OrchestratorConfig{
 			Harness:           "sh",
 			HeartbeatInterval: time.Minute,
@@ -605,14 +617,14 @@ func TestRegisterWorkerToolsNotifyUsesSelectedProjectTrigger(t *testing.T) {
 		},
 		Projects: map[string]config.ProjectConfig{
 			"alpha": {
-				RepoPath:     filepath.Join(dir, "alpha"),
-				LedgerPath:   filepath.Join(dir, "alpha", "tasks", "ledger.md"),
-				WorktreeBase: filepath.Join(dir, "worktrees"),
+				RepoPath:     alphaRepo,
+				LedgerPath:   filepath.Join(alphaRepo, "tasks", "ledger.md"),
+				WorktreeBase: worktreeBase,
 			},
 			"beta": {
-				RepoPath:     filepath.Join(dir, "beta"),
-				LedgerPath:   filepath.Join(dir, "beta", "tasks", "ledger.md"),
-				WorktreeBase: filepath.Join(dir, "worktrees"),
+				RepoPath:     betaRepo,
+				LedgerPath:   filepath.Join(betaRepo, "tasks", "ledger.md"),
+				WorktreeBase: worktreeBase,
 			},
 		},
 	}
