@@ -50,7 +50,36 @@ func RemoveContext(ctx context.Context, repoPath, worktreePath string) error {
 }
 
 var ErrUnsafeBranchDelete = errors.New("unsafe branch delete skipped")
+var ErrUnsafeBranchCreate = errors.New("unsafe branch create skipped")
 var ErrOriginUnavailable = errors.New("origin unavailable")
+
+// EnsureBranchCreationSafe verifies that creating branch would not collide with
+// protected/default branches, checked-out branches, upstreams, or remote refs.
+func EnsureBranchCreationSafe(repoPath, branch string) error {
+	return EnsureBranchCreationSafeContext(context.Background(), repoPath, branch)
+}
+
+// EnsureBranchCreationSafeContext is EnsureBranchCreationSafe with cancellation support.
+func EnsureBranchCreationSafeContext(ctx context.Context, repoPath, branch string) error {
+	if !filepath.IsAbs(repoPath) {
+		return fmt.Errorf("repoPath must be absolute, got: %s", repoPath)
+	}
+	branch = strings.TrimSpace(branch)
+	if branch == "" {
+		return fmt.Errorf("%w: branch must be non-empty", ErrUnsafeBranchCreate)
+	}
+	if exists, err := localBranchExists(ctx, repoPath, branch); err != nil {
+		return err
+	} else if exists {
+		return fmt.Errorf("%w: branch %q already exists", ErrUnsafeBranchCreate, branch)
+	}
+	if reason, safe, err := branchSafety(ctx, repoPath, branch); err != nil {
+		return err
+	} else if !safe {
+		return fmt.Errorf("%w: %s", ErrUnsafeBranchCreate, reason)
+	}
+	return nil
+}
 
 // DeleteTaskBranchIfSafe deletes a local branch only when it is clearly scoped
 // to taskID and passes the normal branch deletion safety checks.
@@ -79,7 +108,7 @@ func DeleteTaskBranchIfSafeContext(ctx context.Context, repoPath, branch, taskID
 	} else if !exists {
 		return nil
 	}
-	if reason, safe, err := branchDeleteSafety(ctx, repoPath, branch); err != nil {
+	if reason, safe, err := branchSafety(ctx, repoPath, branch); err != nil {
 		return err
 	} else if !safe {
 		return fmt.Errorf("%w: %s", ErrUnsafeBranchDelete, reason)
@@ -87,7 +116,7 @@ func DeleteTaskBranchIfSafeContext(ctx context.Context, repoPath, branch, taskID
 	return runContext(ctx, "git", "-C", repoPath, "branch", "-D", branch)
 }
 
-func branchDeleteSafety(ctx context.Context, repoPath, branch string) (string, bool, error) {
+func branchSafety(ctx context.Context, repoPath, branch string) (string, bool, error) {
 	if isCommonDefaultBranchName(branch) {
 		return fmt.Sprintf("%q is a protected default branch name", branch), false, nil
 	}
