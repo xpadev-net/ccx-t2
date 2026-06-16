@@ -326,7 +326,7 @@ function App() {
       }
       return;
     }
-    if (showLoading) {
+    if (showLoading && isCurrentRefresh(projectSlug, authToken)) {
       setLoading(true);
     }
     setError("");
