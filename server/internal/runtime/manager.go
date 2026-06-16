@@ -25,16 +25,17 @@ type ProjectInfo struct {
 }
 
 type ProjectRuntime struct {
-	Slug         string
-	Config       *config.Config
-	Ledger       *ledger.Ledger
-	Registry     *worker.Registry
-	GitHub       *githubpkg.Client
-	Orchestrator *orchestrator.Orchestrator
-	Scheduler    *scheduler.Scheduler
-	Session      string
-	BaseURL      string
-	cancel       context.CancelFunc
+	Slug          string
+	Config        *config.Config
+	Ledger        *ledger.Ledger
+	Registry      *worker.Registry
+	GitHub        *githubpkg.Client
+	Orchestrator  *orchestrator.Orchestrator
+	NotifyTrigger scheduler.Triggerer
+	Scheduler     *scheduler.Scheduler
+	Session       string
+	BaseURL       string
+	cancel        context.CancelFunc
 }
 
 type Manager struct {
@@ -103,15 +104,16 @@ func buildProjectRuntime(cfg *config.Config, slug, session, baseURL string) (*Pr
 	workerCfg := config.CloneForWorkerRuntime(projectCfg)
 	o := orchestrator.NewProject(l, orchestratorCfg, session, baseURL, slug+"-orchestrator")
 	return &ProjectRuntime{
-		Slug:         slug,
-		Config:       workerCfg,
-		Ledger:       l,
-		Registry:     registry,
-		GitHub:       gh,
-		Orchestrator: o,
-		Scheduler:    scheduler.New(l, o, projectCfg.Orchestrator.HeartbeatInterval),
-		Session:      session,
-		BaseURL:      baseURL,
+		Slug:          slug,
+		Config:        workerCfg,
+		Ledger:        l,
+		Registry:      registry,
+		GitHub:        gh,
+		Orchestrator:  o,
+		NotifyTrigger: o,
+		Scheduler:     scheduler.New(l, o, projectCfg.Orchestrator.HeartbeatInterval),
+		Session:       session,
+		BaseURL:       baseURL,
 	}, nil
 }
 
