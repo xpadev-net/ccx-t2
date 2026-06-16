@@ -1272,14 +1272,26 @@ var errTaskDeletingConflict = errors.New("task delete is in progress")
 var errWorkerNotActive = errors.New("worker is not active")
 
 func validateTaskMutation(task ledger.Task) error {
-	if !validTaskStatus(task.Status) {
+	return validateTaskMutationFields(map[string]any{
+		"status":          task.Status,
+		"allowed_files":   task.AllowedFiles,
+		"forbidden_files": task.ForbiddenFiles,
+	})
+}
+
+func validateTaskMutationFields(fields map[string]any) error {
+	if status, ok := fields["status"].(string); ok && !validTaskStatus(status) {
 		return fmt.Errorf("status must be one of: unstarted, in_progress, blocked, completed, split")
 	}
-	if err := ledger.ValidatePaths(task.AllowedFiles); err != nil {
-		return fmt.Errorf("allowed_files: %w", err)
+	if allowedFiles, ok := fields["allowed_files"].([]string); ok {
+		if err := ledger.ValidatePaths(allowedFiles); err != nil {
+			return fmt.Errorf("allowed_files: %w", err)
+		}
 	}
-	if err := ledger.ValidatePaths(task.ForbiddenFiles); err != nil {
-		return fmt.Errorf("forbidden_files: %w", err)
+	if forbiddenFiles, ok := fields["forbidden_files"].([]string); ok {
+		if err := ledger.ValidatePaths(forbiddenFiles); err != nil {
+			return fmt.Errorf("forbidden_files: %w", err)
+		}
 	}
 	return nil
 }
@@ -1300,10 +1312,10 @@ func validateTaskUpdate(current ledger.Task, fields map[string]any) error {
 	if status, ok := fields["status"].(string); ok && strings.TrimSpace(status) == "" {
 		return fmt.Errorf("%w: status cannot be empty", errInvalidTaskMutation)
 	}
-	next := taskSnapshotWithFields(current, fields)
-	if err := validateTaskMutation(next); err != nil {
+	if err := validateTaskMutationFields(fields); err != nil {
 		return fmt.Errorf("%w: %w", errInvalidTaskMutation, err)
 	}
+	next := taskSnapshotWithFields(current, fields)
 	if strings.TrimSpace(next.Title) == "" && strings.TrimSpace(next.Body) == "" {
 		return fmt.Errorf("%w: title and body cannot both be empty", errInvalidTaskMutation)
 	}

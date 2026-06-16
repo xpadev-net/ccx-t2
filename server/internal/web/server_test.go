@@ -478,6 +478,24 @@ func TestPostTasksRejectsEscapingAllowedFile(t *testing.T) {
 	}
 }
 
+func TestPostTasksRejectsAbsoluteForbiddenFile(t *testing.T) {
+	l := newTestLedger(t)
+	resp := performJSONRequest(New(Deps{Ledger: l, AuthDisabled: true}), http.MethodPost, "/api/tasks", `{
+		"title": "New task",
+		"forbidden_files": ["/etc/passwd"]
+	}`)
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusBadRequest, resp.Body.String())
+	}
+	tasks, err := l.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(tasks) != 0 {
+		t.Fatalf("tasks = %#v, want invalid task rejected before persistence", tasks)
+	}
+}
+
 func TestPostTasksDuplicateIdempotencyKeyReturnsExistingTask(t *testing.T) {
 	l := newTestLedger(t)
 	if err := l.Add(ledger.Task{ID: "task-20260101-0001", Title: "Existing", Status: "unstarted"}); err != nil {
@@ -808,6 +826,30 @@ func TestPatchRejectsAbsoluteForbiddenFile(t *testing.T) {
 	}
 	if len(tasks) != 1 || len(tasks[0].ForbiddenFiles) != 0 {
 		t.Fatalf("tasks = %#v, want forbidden_files unchanged", tasks)
+	}
+}
+
+func TestPatchAllowsUnchangedLegacyInvalidPaths(t *testing.T) {
+	l := newTestLedger(t)
+	if err := l.Add(ledger.Task{
+		ID:           "task-001",
+		Title:        "Old",
+		Status:       "unstarted",
+		AllowedFiles: []string{"../legacy"},
+	}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	resp := performJSONRequest(New(Deps{Ledger: l, AuthDisabled: true}), http.MethodPatch, "/api/tasks/task-001", `{"title": "Updated"}`)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	tasks, err := l.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(tasks) != 1 || tasks[0].Title != "Updated" || len(tasks[0].AllowedFiles) != 1 || tasks[0].AllowedFiles[0] != "../legacy" {
+		t.Fatalf("tasks = %#v, want title update without rewriting legacy paths", tasks)
 	}
 }
 
