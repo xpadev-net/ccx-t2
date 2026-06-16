@@ -233,8 +233,14 @@ func handleCreateTask(deps *Deps) ToolHandler {
 		if strings.TrimSpace(title) == "" {
 			title = "Natural language intake"
 		}
-		allowedFiles, _ := stringSliceArg(args, "allowed_files")
-		forbiddenFiles, _ := stringSliceArg(args, "forbidden_files")
+		allowedFiles, err := fileListArg(args, "allowed_files")
+		if err != nil {
+			return nil, fmt.Errorf("allowed_files: %w", err)
+		}
+		forbiddenFiles, err := fileListArg(args, "forbidden_files")
+		if err != nil {
+			return nil, fmt.Errorf("forbidden_files: %w", err)
+		}
 
 		if err := ledger.ValidatePaths(allowedFiles); err != nil {
 			return nil, fmt.Errorf("allowed_files: %w", err)
@@ -288,7 +294,7 @@ func handleUpdateTask(deps *Deps) ToolHandler {
 		}
 		for _, key := range []string{"allowed_files", "forbidden_files"} {
 			if _, ok := args[key]; ok {
-				sl, err := stringSliceArg(args, key)
+				sl, err := fileListArg(args, key)
 				if err != nil {
 					return nil, err
 				}
@@ -367,13 +373,19 @@ func handleSplitTask(deps *Deps) ToolHandler {
 			allowed, forbidden []string
 		}
 		pending := make([]pendingSlice, 0, len(slicesAny))
-		for _, s := range slicesAny {
+		for i, s := range slicesAny {
 			sliceMap, ok := s.(map[string]any)
 			if !ok {
 				return nil, fmt.Errorf("each slice must be an object")
 			}
-			childAllowed, _ := stringSliceArg(sliceMap, "allowed_files")
-			childForbidden, _ := stringSliceArg(sliceMap, "forbidden_files")
+			childAllowed, err := fileListArg(sliceMap, "allowed_files")
+			if err != nil {
+				return nil, fmt.Errorf("slice %d allowed_files: %w", i, err)
+			}
+			childForbidden, err := fileListArg(sliceMap, "forbidden_files")
+			if err != nil {
+				return nil, fmt.Errorf("slice %d forbidden_files: %w", i, err)
+			}
 			if err := ledger.ValidatePaths(childAllowed); err != nil {
 				return nil, fmt.Errorf("slice allowed_files: %w", err)
 			}
@@ -558,14 +570,17 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 		if strings.TrimSpace(branch) == "" {
 			return nil, fmt.Errorf("branch must be a non-empty string")
 		}
-		allowedFiles, err := stringSliceArg(args, "allowed_files")
+		allowedFiles, err := fileListArg(args, "allowed_files")
 		if err != nil {
 			return nil, err
 		}
 		if len(allowedFiles) == 0 {
 			return nil, fmt.Errorf("allowed_files must have at least one entry")
 		}
-		forbiddenFiles, _ := stringSliceArg(args, "forbidden_files")
+		forbiddenFiles, err := fileListArg(args, "forbidden_files")
+		if err != nil {
+			return nil, fmt.Errorf("forbidden_files: %w", err)
+		}
 		harnessName := optionalStringArg(args, "harness")
 
 		// Preflight checks.
@@ -1013,8 +1028,14 @@ func handleNotify(deps *Deps) ToolHandler {
 				if !ok {
 					return nil, fmt.Errorf("proposed_slices[%d] must be an object", i)
 				}
-				childAllowed, _ := stringSliceArg(sliceMap, "allowed_files")
-				childForbidden, _ := stringSliceArg(sliceMap, "forbidden_files")
+				childAllowed, err := fileListArg(sliceMap, "allowed_files")
+				if err != nil {
+					return nil, fmt.Errorf("proposed_slices[%d] allowed_files: %w", i, err)
+				}
+				childForbidden, err := fileListArg(sliceMap, "forbidden_files")
+				if err != nil {
+					return nil, fmt.Errorf("proposed_slices[%d] forbidden_files: %w", i, err)
+				}
 				if err := ledger.ValidatePaths(childAllowed); err != nil {
 					return nil, fmt.Errorf("proposed_slices[%d] allowed_files: %w", i, err)
 				}
@@ -1160,6 +1181,13 @@ func depsForProject(deps *Deps, slug string) (*Deps, error) {
 		Manager:     deps.Manager,
 		ProjectSlug: project.Slug,
 	}, nil
+}
+
+func fileListArg(args map[string]any, key string) ([]string, error) {
+	if v, ok := args[key]; ok && v == nil {
+		return nil, fmt.Errorf("argument %q must be an array of strings", key)
+	}
+	return stringSliceArg(args, key)
 }
 
 func workerIDFor(deps *Deps, taskID string) string {
