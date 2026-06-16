@@ -5,12 +5,12 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"reflect"
 	"strings"
 	"testing"
 
 	gh "github.com/google/go-github/v60/github"
+	"github.com/xpadev/ccx-t2/internal/testutil"
 )
 
 func TestGetPRStatusFetchesPullRequestAndPaginatedChecks(t *testing.T) {
@@ -210,44 +210,11 @@ func TestNormalizeCheckStatusTreatsUnknownEmptyConclusionAsFailure(t *testing.T)
 
 func newTestClient(t *testing.T, srv *httptest.Server) *Client {
 	t.Helper()
-	client, err := NewClient("test-token", "octo", "hello", WithBaseURL(srv.URL), WithHTTPClient(localOnlyHTTPClient(t, srv)))
+	client, err := NewClient("test-token", "octo", "hello", WithBaseURL(srv.URL), WithHTTPClient(testutil.LocalOnlyHTTPClient(t, srv)))
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
 	return client
-}
-
-func localOnlyHTTPClient(t *testing.T, srv *httptest.Server) *http.Client {
-	t.Helper()
-	parsed, err := url.Parse(srv.URL)
-	if err != nil {
-		t.Fatalf("parse test server URL: %v", err)
-	}
-	client := *srv.Client()
-	client.Transport = onlyHostTransport{
-		t:           t,
-		allowedHost: parsed.Host,
-		base:        client.Transport,
-	}
-	return &client
-}
-
-type onlyHostTransport struct {
-	t           *testing.T
-	allowedHost string
-	base        http.RoundTripper
-}
-
-func (t onlyHostTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if req.URL.Host != t.allowedHost {
-		t.t.Errorf("unexpected outbound request host %q, want %q", req.URL.Host, t.allowedHost)
-		return nil, fmt.Errorf("unexpected outbound request host %q", req.URL.Host)
-	}
-	base := t.base
-	if base == nil {
-		base = http.DefaultTransport
-	}
-	return base.RoundTrip(req)
 }
 
 func assertBearerToken(t *testing.T, next http.Handler) http.Handler {

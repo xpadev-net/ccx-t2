@@ -7,7 +7,6 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,6 +21,7 @@ import (
 	githubpkg "github.com/xpadev/ccx-t2/internal/github"
 	"github.com/xpadev/ccx-t2/internal/ledger"
 	runtimepkg "github.com/xpadev/ccx-t2/internal/runtime"
+	"github.com/xpadev/ccx-t2/internal/testutil"
 	"github.com/xpadev/ccx-t2/internal/worker"
 )
 
@@ -137,7 +137,7 @@ func TestRegisterOrchestratorToolsGetPRStatusUsesConfiguredGitHubClient(t *testi
 		"octo",
 		"hello",
 		githubpkg.WithBaseURL(srv.URL),
-		githubpkg.WithHTTPClient(localOnlyHTTPClient(t, srv)),
+		githubpkg.WithHTTPClient(testutil.LocalOnlyHTTPClient(t, srv)),
 	)
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
@@ -2217,39 +2217,6 @@ func mcpToolTextForTest(t *testing.T, resp map[string]any) string {
 		t.Fatalf("content[0].text = %#v, want string", item["text"])
 	}
 	return text
-}
-
-func localOnlyHTTPClient(t *testing.T, srv *httptest.Server) *http.Client {
-	t.Helper()
-	parsed, err := url.Parse(srv.URL)
-	if err != nil {
-		t.Fatalf("parse test server URL: %v", err)
-	}
-	client := *srv.Client()
-	client.Transport = onlyHostTransport{
-		t:           t,
-		allowedHost: parsed.Host,
-		base:        client.Transport,
-	}
-	return &client
-}
-
-type onlyHostTransport struct {
-	t           *testing.T
-	allowedHost string
-	base        http.RoundTripper
-}
-
-func (t onlyHostTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if req.URL.Host != t.allowedHost {
-		t.t.Errorf("unexpected outbound request host %q, want %q", req.URL.Host, t.allowedHost)
-		return nil, errors.New("unexpected outbound request host")
-	}
-	base := t.base
-	if base == nil {
-		base = http.DefaultTransport
-	}
-	return base.RoundTrip(req)
 }
 
 func successfulCleanupOps() workerCleanupOps {
