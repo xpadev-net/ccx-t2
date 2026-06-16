@@ -1,7 +1,12 @@
 package mcp
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,6 +21,20 @@ import (
 	runtimepkg "github.com/xpadev/ccx-t2/internal/runtime"
 	"github.com/xpadev/ccx-t2/internal/worker"
 )
+
+type recordingNotifyTrigger struct {
+	reasons   []string
+	onTrigger func()
+	err       error
+}
+
+func (r *recordingNotifyTrigger) Trigger(_ context.Context, reason string) error {
+	r.reasons = append(r.reasons, reason)
+	if r.onTrigger != nil {
+		r.onTrigger()
+	}
+	return r.err
+}
 
 func TestBuildHarnessCommandPreservesExpandedMCPValuesAsSingleArgs(t *testing.T) {
 	tokens, err := buildMCPTokens(
@@ -75,6 +94,213 @@ func TestRegisterWorkerToolsNotifySchemaRequiresWorkerID(t *testing.T) {
 	want := []string{"task_id", "worker_id"}
 	if !reflect.DeepEqual(required, want) {
 		t.Fatalf("notify payload required = %#v, want %#v", required, want)
+	}
+}
+
+func TestRegisterWorkerToolsNotifyTriggersOrchestratorOnce(t *testing.T) {
+	cases := []struct {
+		name       string
+		notifyType string
+		extra      map[string]any
+		wantReason string
+	}{
+		{
+			name:       "completed",
+			notifyType: "completed",
+			extra: map[string]any{
+				"pr_url":       "https://example.test/pr/1",
+				"merge_commit": "abc123def456",
+			},
+			wantReason: "worker completed: task-001",
+		},
+		{
+			name:       "blocked",
+			notifyType: "blocked",
+			extra: map[string]any{
+				"reason": "blocked by dependency",
+			},
+			wantReason: "worker blocked: task-001",
+		},
+		{
+			name:       "split_request",
+			notifyType: "split_request",
+			extra: map[string]any{
+				"reason": "needs decomposition",
+				"proposed_slices": []any{
+					map[string]any{
+						"title":       "Child",
+						"description": "child body",
+					},
+				},
+			},
+			wantReason: "worker split_request: task-001",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			l := ledger.NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
+			if err := l.Add(ledger.Task{
+				ID:       "task-001",
+				Title:    "Task",
+				Status:   "in_progress",
+				WorkerID: "worker-current",
+				Body:     "current body",
+			}); err != nil {
+				t.Fatalf("Add: %v", err)
+			}
+
+			trigger := &recordingNotifyTrigger{}
+			trigger.onTrigger = func() {
+				t.Helper()
+				tasks, err := l.Load()
+				if err != nil {
+					t.Fatalf("Load during trigger: %v", err)
+				}
+				var parent *ledger.Task
+				for i := range tasks {
+					if tasks[i].ID == "task-001" {
+						parent = &tasks[i]
+						break
+					}
+				}
+				if parent == nil {
+					t.Fatalf("task-001 missing during trigger: %#v", tasks)
+				}
+				switch tc.notifyType {
+				case "completed":
+					if parent.Status != "completed" || parent.WorkerID != "" || parent.PrURL != "https://example.test/pr/1" {
+						t.Fatalf("task during completed trigger = %#v, want completed mutation applied", parent)
+					}
+				case "blocked":
+					if parent.Status != "blocked" || parent.WorkerID != "worker-current" || parent.Reason != "blocked by dependency" {
+						t.Fatalf("task during blocked trigger = %#v, want blocked mutation applied", parent)
+					}
+				case "split_request":
+					if parent.Status != "split" || parent.WorkerID != "" || len(tasks) != 2 {
+						t.Fatalf("tasks during split trigger = %#v, want split parent and one child", tasks)
+					}
+				}
+			}
+			deps := testMCPDeps(dir, l)
+			deps.NotifyTrigger = trigger
+			s := NewServer("worker", "")
+			RegisterWorkerTools(s, deps)
+
+			payload := map[string]any{
+				"project_slug": "proj",
+				"task_id":      "task-001",
+				"worker_id":    "worker-current",
+			}
+			for k, v := range tc.extra {
+				payload[k] = v
+			}
+			call := map[string]any{
+				"jsonrpc": "2.0",
+				"id":      tc.name,
+				"method":  "tools/call",
+				"params": map[string]any{
+					"name": "notify",
+					"arguments": map[string]any{
+						"type":    tc.notifyType,
+						"payload": payload,
+					},
+				},
+			}
+			body, err := json.Marshal(call)
+			if err != nil {
+				t.Fatalf("Marshal call: %v", err)
+			}
+			req := httptest.NewRequest(http.MethodPost, "/mcp/worker", bytes.NewReader(body))
+			rr := httptest.NewRecorder()
+
+			s.ServeHTTP(rr, req)
+
+			if rr.Code != http.StatusOK {
+				t.Fatalf("status = %d, want %d; body=%s", rr.Code, http.StatusOK, rr.Body.String())
+			}
+			var resp map[string]any
+			if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("response is not JSON: %v\n%s", err, rr.Body.String())
+			}
+			if errPayload, ok := resp["error"]; ok {
+				t.Fatalf("notify returned error: %#v", errPayload)
+			}
+			if len(trigger.reasons) != 1 {
+				t.Fatalf("trigger calls = %#v, want exactly one call", trigger.reasons)
+			}
+			if trigger.reasons[0] != tc.wantReason {
+				t.Fatalf("trigger reason = %q, want %q", trigger.reasons[0], tc.wantReason)
+			}
+		})
+	}
+}
+
+func TestRegisterWorkerToolsNotifySucceedsWhenPostMutationTriggerFails(t *testing.T) {
+	dir := t.TempDir()
+	l := ledger.NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
+	if err := l.Add(ledger.Task{
+		ID:       "task-001",
+		Title:    "Task",
+		Status:   "in_progress",
+		WorkerID: "worker-current",
+		Body:     "current body",
+	}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	trigger := &recordingNotifyTrigger{err: errors.New("trigger unavailable")}
+	deps := testMCPDeps(dir, l)
+	deps.NotifyTrigger = trigger
+	s := NewServer("worker", "")
+	RegisterWorkerTools(s, deps)
+
+	call := map[string]any{
+		"jsonrpc": "2.0",
+		"id":      "trigger-error",
+		"method":  "tools/call",
+		"params": map[string]any{
+			"name": "notify",
+			"arguments": map[string]any{
+				"type": "completed",
+				"payload": map[string]any{
+					"task_id":      "task-001",
+					"worker_id":    "worker-current",
+					"pr_url":       "https://example.test/pr/1",
+					"merge_commit": "abc123def456",
+				},
+			},
+		},
+	}
+	body, err := json.Marshal(call)
+	if err != nil {
+		t.Fatalf("Marshal call: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/mcp/worker", bytes.NewReader(body))
+	rr := httptest.NewRecorder()
+
+	s.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("response is not JSON: %v\n%s", err, rr.Body.String())
+	}
+	if errPayload, ok := resp["error"]; ok {
+		t.Fatalf("notify returned error after committed mutation: %#v", errPayload)
+	}
+	if len(trigger.reasons) != 1 || trigger.reasons[0] != "worker completed: task-001" {
+		t.Fatalf("trigger calls = %#v, want one attempted completion trigger", trigger.reasons)
+	}
+	tasks, err := l.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(tasks) != 1 || tasks[0].Status != "completed" || tasks[0].WorkerID != "" {
+		t.Fatalf("tasks = %#v, want completed mutation preserved", tasks)
 	}
 }
 
@@ -359,6 +585,135 @@ func TestProjectScopedListTasksUsesSelectedProject(t *testing.T) {
 		"project_slug": "missing",
 	}); err == nil {
 		t.Fatal("handleListTasks missing project error = nil")
+	}
+}
+
+func TestRegisterWorkerToolsNotifyUsesSelectedProjectTrigger(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.Config{
+		Server:  config.ServerConfig{Port: 8080},
+		Runtime: config.RuntimeConfig{TmuxSession: "ccx-test", WorktreeBase: filepath.Join(dir, "worktrees")},
+		Orchestrator: config.OrchestratorConfig{
+			Harness:           "sh",
+			HeartbeatInterval: time.Minute,
+			Timeout:           time.Minute,
+		},
+		WorkerHarnesses: []string{"sh"},
+		Harnesses: map[string]config.HarnessConfig{
+			"sh": {Command: "sh", McpArgs: "--mcp-url {url}"},
+		},
+		Projects: map[string]config.ProjectConfig{
+			"alpha": {
+				RepoPath:     filepath.Join(dir, "alpha"),
+				LedgerPath:   filepath.Join(dir, "alpha", "tasks", "ledger.md"),
+				WorktreeBase: filepath.Join(dir, "worktrees"),
+			},
+			"beta": {
+				RepoPath:     filepath.Join(dir, "beta"),
+				LedgerPath:   filepath.Join(dir, "beta", "tasks", "ledger.md"),
+				WorktreeBase: filepath.Join(dir, "worktrees"),
+			},
+		},
+	}
+	if err := config.Prepare(cfg); err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	manager, err := runtimepkg.NewManager(cfg, "http://127.0.0.1:8080")
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	alpha, err := manager.Project("alpha")
+	if err != nil {
+		t.Fatalf("Project alpha: %v", err)
+	}
+	beta, err := manager.Project("beta")
+	if err != nil {
+		t.Fatalf("Project beta: %v", err)
+	}
+	if err := alpha.Ledger.Add(ledger.Task{
+		ID:       "task-alpha",
+		Title:    "Alpha",
+		Status:   "in_progress",
+		WorkerID: "worker-alpha",
+	}); err != nil {
+		t.Fatalf("Add alpha: %v", err)
+	}
+	if err := beta.Ledger.Add(ledger.Task{
+		ID:       "task-beta",
+		Title:    "Beta",
+		Status:   "in_progress",
+		WorkerID: "worker-beta",
+	}); err != nil {
+		t.Fatalf("Add beta: %v", err)
+	}
+
+	alphaTrigger := &recordingNotifyTrigger{}
+	betaTrigger := &recordingNotifyTrigger{
+		onTrigger: func() {
+			t.Helper()
+			tasks, err := beta.Ledger.Load()
+			if err != nil {
+				t.Fatalf("Load beta during trigger: %v", err)
+			}
+			if len(tasks) != 1 || tasks[0].Status != "completed" || tasks[0].WorkerID != "" {
+				t.Fatalf("beta tasks during trigger = %#v, want completed beta task", tasks)
+			}
+		},
+	}
+	alpha.NotifyTrigger = alphaTrigger
+	beta.NotifyTrigger = betaTrigger
+
+	s := NewServer("worker", "")
+	RegisterWorkerTools(s, &Deps{Config: cfg, Manager: manager})
+	call := map[string]any{
+		"jsonrpc": "2.0",
+		"id":      "selected-project",
+		"method":  "tools/call",
+		"params": map[string]any{
+			"name": "notify",
+			"arguments": map[string]any{
+				"type": "completed",
+				"payload": map[string]any{
+					"project_slug": "beta",
+					"task_id":      "task-beta",
+					"worker_id":    "worker-beta",
+					"pr_url":       "https://example.test/pr/beta",
+					"merge_commit": "abc123def456",
+				},
+			},
+		},
+	}
+	body, err := json.Marshal(call)
+	if err != nil {
+		t.Fatalf("Marshal call: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/mcp/worker", bytes.NewReader(body))
+	rr := httptest.NewRecorder()
+
+	s.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("response is not JSON: %v\n%s", err, rr.Body.String())
+	}
+	if errPayload, ok := resp["error"]; ok {
+		t.Fatalf("notify returned error: %#v", errPayload)
+	}
+	if len(betaTrigger.reasons) != 1 || betaTrigger.reasons[0] != "worker completed: task-beta" {
+		t.Fatalf("beta trigger calls = %#v, want selected project completion trigger", betaTrigger.reasons)
+	}
+	if len(alphaTrigger.reasons) != 0 {
+		t.Fatalf("alpha trigger calls = %#v, want none", alphaTrigger.reasons)
+	}
+	alphaTasks, err := alpha.Ledger.Load()
+	if err != nil {
+		t.Fatalf("Load alpha: %v", err)
+	}
+	if len(alphaTasks) != 1 || alphaTasks[0].Status != "in_progress" || alphaTasks[0].WorkerID != "worker-alpha" {
+		t.Fatalf("alpha tasks = %#v, want untouched alpha task", alphaTasks)
 	}
 }
 
