@@ -691,5 +691,17 @@ func shellQuoteArgWithSecretEnv(s string) string {
 	if !strings.Contains(s, secretEnvToken) {
 		return shellQuoteArg(s)
 	}
-	return shellQuoteArg(strings.ReplaceAll(s, secretEnvToken, "$"+secretEnvName))
+	var quoted strings.Builder
+	for {
+		before, after, ok := strings.Cut(s, secretEnvToken)
+		if before != "" {
+			quoted.WriteString(shellQuoteArg(before))
+		}
+		if !ok {
+			break
+		}
+		quoted.WriteString(`"$` + secretEnvName + `"`)
+		s = after
+	}
+	return quoted.String()
 }
