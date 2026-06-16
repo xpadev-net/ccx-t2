@@ -790,17 +790,21 @@ function App() {
             </div>
           </div>
           <div className="project-list">
-            {projects.map((project) => (
-              <button
-                className={`project-row ${project.slug === selectedProjectSlug ? "selected" : ""}`}
-                key={project.slug}
-                type="button"
-                onClick={() => selectProject(project.slug)}
-              >
-                <span>{project.slug}</span>
-                <small>{project.repo_path}</small>
-              </button>
-            ))}
+            {projects.map((project) => {
+              const isSelected = project.slug === selectedProjectSlug;
+              return (
+                <button
+                  aria-current={isSelected ? "true" : undefined}
+                  className={`project-row ${isSelected ? "selected" : ""}`}
+                  key={project.slug}
+                  type="button"
+                  onClick={() => selectProject(project.slug)}
+                >
+                  <span>{project.slug}</span>
+                  <small>{project.repo_path}</small>
+                </button>
+              );
+            })}
             {projects.length === 0 && <div className="empty">No projects configured.</div>}
           </div>
           <div className="sidebar-project-actions">
@@ -836,17 +840,21 @@ function App() {
             <span>{loading ? "Loading" : `${tasks.length} total`}</span>
           </div>
           <div className="rows">
-            {tasks.map((task) => (
-              <button
-                className={`task-row ${task.id === selectedTask?.id ? "selected" : ""}`}
-                key={task.id}
-                type="button"
-                onClick={() => setSelectedID(task.id)}
-              >
-                <span className="task-title">{task.title || task.body || task.id}</span>
-                <span className={`status ${task.status || "unstarted"}`}>{task.status || "unstarted"}</span>
-              </button>
-            ))}
+            {tasks.map((task) => {
+              const isSelected = task.id === selectedTask?.id;
+              return (
+                <button
+                  aria-current={isSelected ? "true" : undefined}
+                  className={`task-row ${isSelected ? "selected" : ""}`}
+                  key={task.id}
+                  type="button"
+                  onClick={() => setSelectedID(task.id)}
+                >
+                  <span className="task-title">{task.title || task.body || task.id}</span>
+                  <span className={`status ${task.status || "unstarted"}`}>{task.status || "unstarted"}</span>
+                </button>
+              );
+            })}
             {!loading && tasks.length === 0 && <div className="empty">No active tasks.</div>}
           </div>
         </aside>
@@ -937,17 +945,21 @@ function App() {
           </div>
           <div className="worker-layout">
             <div className="worker-list">
-              {workers.map((worker) => (
-                <button
-                  className={`worker-row ${worker.worker_id === selectedWorker?.worker_id ? "selected" : ""}`}
-                  key={worker.worker_id}
-                  type="button"
-                  onClick={() => setSelectedWorkerID(worker.worker_id)}
-                >
-                  <span className="task-title">{worker.worker_id}</span>
-                  <span>{worker.harness || "worker"}</span>
-                </button>
-              ))}
+              {workers.map((worker) => {
+                const isSelected = worker.worker_id === selectedWorker?.worker_id;
+                return (
+                  <button
+                    aria-current={isSelected ? "true" : undefined}
+                    className={`worker-row ${isSelected ? "selected" : ""}`}
+                    key={worker.worker_id}
+                    type="button"
+                    onClick={() => setSelectedWorkerID(worker.worker_id)}
+                  >
+                    <span className="task-title">{worker.worker_id}</span>
+                    <span>{worker.harness || "worker"}</span>
+                  </button>
+                );
+              })}
               {workers.length === 0 && <div className="empty">No active workers.</div>}
             </div>
             <div className="log-panel">
