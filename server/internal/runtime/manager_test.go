@@ -52,12 +52,12 @@ func TestManagerReloadUsesWorkerMCPSecretForProjectRuntime(t *testing.T) {
 func TestRuntimeConfigClonesUseRoleSpecificMCPSecrets(t *testing.T) {
 	cfg := testManagerConfig(t, "orchestrator")
 
-	orchestratorCfg := orchestratorRuntimeConfig(cfg)
+	orchestratorCfg := config.CloneForOrchestratorRuntime(cfg)
 	if got := orchestratorCfg.Server.McpSecret; got != "orchestrator" {
 		t.Fatalf("orchestrator runtime mcp_secret = %q, want orchestrator", got)
 	}
 
-	workerCfg := workerRuntimeConfig(cfg)
+	workerCfg := config.CloneForWorkerRuntime(cfg)
 	if got := workerCfg.Server.McpSecret; got != "worker" {
 		t.Fatalf("worker runtime mcp_secret = %q, want worker", got)
 	}

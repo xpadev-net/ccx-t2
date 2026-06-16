@@ -68,7 +68,7 @@ func serve(args []string) error {
 	orchestratorMCP := mcp.NewServer("orchestrator", cfg.Server.EffectiveOrchestratorSecret())
 	workerMCP := mcp.NewServer("worker", cfg.Server.EffectiveWorkerSecret())
 	mcpDeps := &mcp.Deps{
-		Config:  workerRuntimeConfig(cfg),
+		Config:  config.CloneForWorkerRuntime(cfg),
 		Session: cfg.Runtime.TmuxSession,
 		BaseURL: baseURL,
 		Manager: manager,
@@ -146,12 +146,6 @@ func baseURLHost(host string) string {
 	default:
 		return strings.Trim(host, "[]")
 	}
-}
-
-func workerRuntimeConfig(cfg *config.Config) *config.Config {
-	out := config.Clone(cfg)
-	out.Server.McpSecret = cfg.Server.EffectiveWorkerSecret()
-	return out
 }
 
 func ensureConfig(path string) error {

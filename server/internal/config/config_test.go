@@ -19,7 +19,7 @@ func TestValidateHarnessRejectsInvalidMCPArgsShellSyntax(t *testing.T) {
 		},
 	}
 
-	err := validateHarness(cfg, "worker", false)
+	err := validateHarness(cfg, "worker", false, "")
 	if err == nil {
 		t.Fatal("validateHarness() error = nil, want invalid mcp_args shell syntax error")
 	}
@@ -99,6 +99,21 @@ func TestPrepareRejectsNonLoopbackListenAddressWithoutAuth(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "server.allow_unsafe_no_auth") {
 		t.Fatalf("Prepare() error = %v, want allow_unsafe_no_auth guidance", err)
+	}
+}
+
+func TestPrepareRejectsBareBracketListenAddressWithoutAuth(t *testing.T) {
+	cfg := &Config{
+		Server:  ServerConfig{Host: "[]"},
+		Runtime: RuntimeConfig{TmuxSession: "ccx-t2-test"},
+	}
+
+	err := Prepare(cfg)
+	if err == nil {
+		t.Fatal("Prepare() error = nil, want invalid listen host error")
+	}
+	if !strings.Contains(err.Error(), "not loopback") {
+		t.Fatalf("Prepare() error = %v, want non-loopback guidance", err)
 	}
 }
 

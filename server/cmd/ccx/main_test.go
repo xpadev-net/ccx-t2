@@ -95,13 +95,13 @@ runtime:
 	}
 }
 
-func TestWorkerRuntimeConfigUsesWorkerMCPSecret(t *testing.T) {
+func TestCloneForWorkerRuntimeUsesWorkerMCPSecret(t *testing.T) {
 	cfg := &config.Config{Server: config.ServerConfig{
 		McpSecret:    "legacy",
 		WorkerSecret: "worker",
 	}}
 
-	workerCfg := workerRuntimeConfig(cfg)
+	workerCfg := config.CloneForWorkerRuntime(cfg)
 	if got := workerCfg.Server.McpSecret; got != "worker" {
 		t.Fatalf("worker runtime mcp_secret = %q, want worker", got)
 	}

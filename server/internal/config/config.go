@@ -328,14 +328,14 @@ func validate(cfg *Config) error {
 	}
 
 	if cfg.Orchestrator.Harness != "" {
-		if err := validateHarness(cfg, cfg.Orchestrator.Harness, true); err != nil {
+		if err := validateHarness(cfg, cfg.Orchestrator.Harness, true, cfg.Server.EffectiveOrchestratorSecret()); err != nil {
 			return fmt.Errorf("config: orchestrator harness %q: %w", cfg.Orchestrator.Harness, err)
 		}
 	}
 
 	// Validate worker harnesses (binary check deferred to spawn time).
 	for _, name := range cfg.WorkerHarnesses {
-		if err := validateHarness(cfg, name, false); err != nil {
+		if err := validateHarness(cfg, name, false, cfg.Server.EffectiveWorkerSecret()); err != nil {
 			return fmt.Errorf("config: worker harness %q: %w", name, err)
 		}
 	}
@@ -359,7 +359,7 @@ func validate(cfg *Config) error {
 			return fmt.Errorf("config: projects.%s.orchestrator.timeout must be positive", slug)
 		}
 		if project.Orchestrator.Harness != "" {
-			if err := validateHarness(cfg, project.Orchestrator.Harness, true); err != nil {
+			if err := validateHarness(cfg, project.Orchestrator.Harness, true, cfg.Server.EffectiveOrchestratorSecret()); err != nil {
 				return fmt.Errorf("config: project %q orchestrator harness %q: %w", slug, project.Orchestrator.Harness, err)
 			}
 		}
@@ -402,12 +402,43 @@ func allServerSecretsConfigured(s ServerConfig) bool {
 }
 
 func isLoopbackListenHost(host string) bool {
-	host = strings.TrimSpace(strings.Trim(host, "[]"))
+	host = strings.TrimSpace(host)
 	if host == "" || strings.EqualFold(host, "localhost") {
 		return true
 	}
+	if strings.HasPrefix(host, "[") || strings.HasSuffix(host, "]") {
+		if !strings.HasPrefix(host, "[") || !strings.HasSuffix(host, "]") {
+			return false
+		}
+		host = strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
+		if host == "" {
+			return false
+		}
+	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
+}
+
+// CloneForOrchestratorRuntime returns cfg with the legacy MCP secret slot set
+// to the effective orchestrator MCP secret for existing harness code paths.
+func CloneForOrchestratorRuntime(cfg *Config) *Config {
+	if cfg == nil {
+		return nil
+	}
+	out := Clone(cfg)
+	out.Server.McpSecret = cfg.Server.EffectiveOrchestratorSecret()
+	return out
+}
+
+// CloneForWorkerRuntime returns cfg with the legacy MCP secret slot set to the
+// effective worker MCP secret for existing harness code paths.
+func CloneForWorkerRuntime(cfg *Config) *Config {
+	if cfg == nil {
+		return nil
+	}
+	out := Clone(cfg)
+	out.Server.McpSecret = cfg.Server.EffectiveWorkerSecret()
+	return out
 }
 
 // Project returns a project-scoped copy of cfg. Shared harness/server/runtime
@@ -428,7 +459,7 @@ func Project(cfg *Config, slug string) (*Config, bool) {
 	return out, true
 }
 
-func validateHarness(cfg *Config, name string, checkBinary bool) error {
+func validateHarness(cfg *Config, name string, checkBinary bool, secret string) error {
 	h, ok := cfg.Harnesses[name]
 	if !ok {
 		return fmt.Errorf("not found in harnesses")
@@ -447,10 +478,6 @@ func validateHarness(cfg *Config, name string, checkBinary bool) error {
 	}
 	if _, err := shellquote.Split(h.McpArgs); err != nil {
 		return fmt.Errorf("mcp_args has invalid shell syntax: %w", err)
-	}
-	secret := cfg.Server.EffectiveWorkerSecret()
-	if checkBinary {
-		secret = cfg.Server.EffectiveOrchestratorSecret()
 	}
 	if secret != "" && !strings.Contains(h.McpArgs, "{secret}") {
 		return fmt.Errorf("MCP secret is configured but mcp_args does not contain {secret}; the harness will receive 401 on every MCP call")

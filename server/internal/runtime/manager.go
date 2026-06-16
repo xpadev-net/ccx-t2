@@ -99,8 +99,8 @@ func buildProjectRuntime(cfg *config.Config, slug, session, baseURL string) (*Pr
 		}
 		gh = client
 	}
-	orchestratorCfg := orchestratorRuntimeConfig(projectCfg)
-	workerCfg := workerRuntimeConfig(projectCfg)
+	orchestratorCfg := config.CloneForOrchestratorRuntime(projectCfg)
+	workerCfg := config.CloneForWorkerRuntime(projectCfg)
 	o := orchestrator.NewProject(l, orchestratorCfg, session, baseURL, slug+"-orchestrator")
 	return &ProjectRuntime{
 		Slug:         slug,
@@ -198,18 +198,6 @@ func (m *Manager) Reload(cfg *config.Config, onLedgerChange func()) error {
 		}
 	}
 	return nil
-}
-
-func orchestratorRuntimeConfig(cfg *config.Config) *config.Config {
-	out := config.Clone(cfg)
-	out.Server.McpSecret = cfg.Server.EffectiveOrchestratorSecret()
-	return out
-}
-
-func workerRuntimeConfig(cfg *config.Config) *config.Config {
-	out := config.Clone(cfg)
-	out.Server.McpSecret = cfg.Server.EffectiveWorkerSecret()
-	return out
 }
 
 func (m *Manager) Close() {
