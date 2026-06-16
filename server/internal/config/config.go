@@ -320,6 +320,13 @@ func validate(cfg *Config) error {
 	if strings.TrimSpace(cfg.Runtime.WorktreeBase) == "" && strings.TrimSpace(cfg.Project.WorktreeBase) != "" {
 		cfg.Runtime.WorktreeBase = cfg.Project.WorktreeBase
 	}
+	if strings.TrimSpace(cfg.Runtime.WorktreeBase) != "" {
+		worktreeBase, err := canonicalWorktreeBase(cfg.Runtime.WorktreeBase)
+		if err != nil {
+			return fmt.Errorf("config: runtime.worktree_base %q: %w", cfg.Runtime.WorktreeBase, err)
+		}
+		cfg.Runtime.WorktreeBase = worktreeBase
+	}
 	if cfg.Orchestrator.HeartbeatInterval <= 0 {
 		return fmt.Errorf("config: orchestrator.heartbeat_interval must be positive")
 	}
@@ -352,6 +359,11 @@ func validate(cfg *Config) error {
 				return fmt.Errorf("config: required field %q is empty", f.name)
 			}
 		}
+		normalizedProject, err := validateProjectPaths("projects."+slug, project)
+		if err != nil {
+			return err
+		}
+		project = normalizedProject
 		if project.Orchestrator.HeartbeatInterval <= 0 {
 			return fmt.Errorf("config: projects.%s.orchestrator.heartbeat_interval must be positive", slug)
 		}
@@ -363,6 +375,25 @@ func validate(cfg *Config) error {
 				return fmt.Errorf("config: project %q orchestrator harness %q: %w", slug, project.Orchestrator.Harness, err)
 			}
 		}
+		cfg.Projects[slug] = project
+		if cfg.Project.Slug == project.Slug {
+			cfg.Project = project
+			cfg.GitHub = project.GitHub
+		}
+	}
+	if projectHasPathOverride(cfg.Project) {
+		project := cfg.Project
+		if strings.TrimSpace(project.WorktreeBase) == "" {
+			project.WorktreeBase = cfg.Runtime.WorktreeBase
+		}
+		if strings.TrimSpace(project.LedgerPath) == "" && strings.TrimSpace(project.RepoPath) != "" {
+			project.LedgerPath = filepath.Join(project.RepoPath, "tasks", "ledger.md")
+		}
+		normalizedProject, err := validateProjectPaths("project", project)
+		if err != nil {
+			return err
+		}
+		cfg.Project = normalizedProject
 	}
 
 	return nil
@@ -420,6 +451,195 @@ func isLoopbackListenHost(host string) bool {
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
+}
+
+// ProjectWorktreePath returns the worktree path generated for a task and
+// verifies the resolved path stays inside the configured worktree base.
+func ProjectWorktreePath(project ProjectConfig, taskID string) (string, error) {
+	base, err := canonicalWorktreeBase(project.WorktreeBase)
+	if err != nil {
+		return "", fmt.Errorf("worktree_base: %w", err)
+	}
+	name := project.Slug + "-" + taskID
+	worktreePath, err := resolvePathWithExistingSymlinks(filepath.Join(base, name))
+	if err != nil {
+		return "", fmt.Errorf("generated worktree path: %w", err)
+	}
+	if err := requirePathContained(base, worktreePath); err != nil {
+		return "", fmt.Errorf("generated worktree path %q must stay under worktree_base %q", worktreePath, base)
+	}
+	return worktreePath, nil
+}
+
+func validateProjectPaths(prefix string, project ProjectConfig) (ProjectConfig, error) {
+	repoRoot, err := canonicalGitRepoRoot(project.RepoPath)
+	if err != nil {
+		return project, fmt.Errorf("config: %s.repo_path %q: %w", prefix, project.RepoPath, err)
+	}
+	project.RepoPath = repoRoot
+
+	worktreeBase, err := canonicalWorktreeBase(project.WorktreeBase)
+	if err != nil {
+		return project, fmt.Errorf("config: %s.worktree_base %q: %w", prefix, project.WorktreeBase, err)
+	}
+	project.WorktreeBase = worktreeBase
+
+	ledgerPath, err := canonicalLedgerPath(project.LedgerPath)
+	if err != nil {
+		return project, fmt.Errorf("config: %s.ledger_path %q: %w", prefix, project.LedgerPath, err)
+	}
+	if err := requirePathContained(repoRoot, ledgerPath); err != nil {
+		return project, fmt.Errorf("config: %s.ledger_path %q must resolve under repo_path %q", prefix, project.LedgerPath, repoRoot)
+	}
+	defaultLedgerPath := filepath.Clean(filepath.Join(repoRoot, "tasks", "ledger.md"))
+	if err := requireSamePath(defaultLedgerPath, ledgerPath); err != nil {
+		return project, fmt.Errorf("config: %s.ledger_path %q must resolve to the default repo ledger %q; custom ledger paths require an explicit unsafe override, which is not supported by this config", prefix, project.LedgerPath, defaultLedgerPath)
+	}
+	project.LedgerPath = ledgerPath
+
+	if _, err := ProjectWorktreePath(project, "task-00000000-0000"); err != nil {
+		return project, fmt.Errorf("config: %s.%w", prefix, err)
+	}
+	return project, nil
+}
+
+func projectHasPathOverride(project ProjectConfig) bool {
+	return strings.TrimSpace(project.RepoPath) != "" ||
+		strings.TrimSpace(project.WorktreeBase) != "" ||
+		strings.TrimSpace(project.LedgerPath) != ""
+}
+
+func canonicalGitRepoRoot(path string) (string, error) {
+	resolved, err := canonicalExistingDir(path)
+	if err != nil {
+		return "", err
+	}
+	out, err := exec.Command("git", "-C", resolved, "rev-parse", "--show-toplevel").CombinedOutput()
+	if err != nil {
+		msg := strings.TrimSpace(string(out))
+		if msg == "" {
+			msg = err.Error()
+		}
+		return "", fmt.Errorf("must be an existing git repository root: %s", msg)
+	}
+	root := strings.TrimSpace(string(out))
+	if root == "" {
+		return "", fmt.Errorf("git repository root was empty")
+	}
+	root, err = filepath.Abs(root)
+	if err != nil {
+		return "", fmt.Errorf("resolve git repository root: %w", err)
+	}
+	root, err = filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", fmt.Errorf("resolve git repository root symlinks: %w", err)
+	}
+	if err := requireSamePath(root, resolved); err != nil {
+		return "", fmt.Errorf("must be the git repository root %q", root)
+	}
+	return root, nil
+}
+
+func canonicalWorktreeBase(path string) (string, error) {
+	if !filepath.IsAbs(strings.TrimSpace(path)) {
+		return "", fmt.Errorf("must be an absolute directory")
+	}
+	return canonicalExistingDir(path)
+}
+
+func canonicalExistingDir(path string) (string, error) {
+	resolved, err := resolvePathWithExistingSymlinks(path)
+	if err != nil {
+		return "", err
+	}
+	st, err := os.Stat(resolved)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", fmt.Errorf("must be an existing directory")
+		}
+		return "", err
+	}
+	if !st.IsDir() {
+		return "", fmt.Errorf("must be a directory")
+	}
+	return resolved, nil
+}
+
+func canonicalLedgerPath(path string) (string, error) {
+	abs, err := filepath.Abs(strings.TrimSpace(path))
+	if err != nil {
+		return "", err
+	}
+	dir, base := filepath.Dir(abs), filepath.Base(abs)
+	resolvedDir, err := resolvePathWithExistingSymlinks(dir)
+	if err != nil {
+		return "", err
+	}
+	ledgerPath := filepath.Clean(filepath.Join(resolvedDir, base))
+	info, err := os.Lstat(ledgerPath)
+	if err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			return "", fmt.Errorf("must not be a symlink")
+		}
+		if info.IsDir() {
+			return "", fmt.Errorf("must be a file, not a directory")
+		}
+	} else if err != nil && !os.IsNotExist(err) {
+		return "", err
+	}
+	return ledgerPath, nil
+}
+
+func resolvePathWithExistingSymlinks(path string) (string, error) {
+	abs, err := filepath.Abs(strings.TrimSpace(path))
+	if err != nil {
+		return "", err
+	}
+	current := filepath.Clean(abs)
+	missing := []string{}
+	for {
+		resolved, err := filepath.EvalSymlinks(current)
+		if err == nil {
+			for i := len(missing) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, missing[i])
+			}
+			return filepath.Clean(resolved), nil
+		}
+		if !os.IsNotExist(err) {
+			return "", err
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return "", err
+		}
+		missing = append(missing, filepath.Base(current))
+		current = parent
+	}
+}
+
+func requireSamePath(expected, actual string) error {
+	rel, err := filepath.Rel(expected, actual)
+	if err != nil {
+		return err
+	}
+	if rel != "." {
+		return fmt.Errorf("resolved path %q differs from %q", actual, expected)
+	}
+	return nil
+}
+
+func requirePathContained(base, child string) error {
+	rel, err := filepath.Rel(base, child)
+	if err != nil {
+		return err
+	}
+	if rel == "." {
+		return nil
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return fmt.Errorf("path %q is outside %q", child, base)
+	}
+	return nil
 }
 
 // CloneForOrchestratorRuntime returns cfg with the legacy MCP secret slot set
