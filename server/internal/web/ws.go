@@ -49,7 +49,12 @@ func (s *Server) handleWorkerLogWS(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "worker window is required")
 		return
 	}
-	if projectServer, ok := s.selectedProjectWorkerLogServer(); ok {
+	projectServer, ok, err := s.selectedProjectWorkerLogServer()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "selected project is not configured")
+		return
+	}
+	if ok {
 		r2 := r.Clone(r.Context())
 		r2.URL.Path = "/ws/worker/" + window
 		projectServer.handleWorkerLogWS(w, r2)
@@ -63,23 +68,23 @@ func (s *Server) handleWorkerLogWS(w http.ResponseWriter, r *http.Request) {
 	s.handleTmuxLogWS(w, r, window, "worker")
 }
 
-func (s *Server) selectedProjectWorkerLogServer() (*Server, bool) {
+func (s *Server) selectedProjectWorkerLogServer() (*Server, bool, error) {
 	if s.projectScoped || s.manager == nil {
-		return nil, false
+		return nil, false, nil
 	}
 	cfg, ok := s.configSnapshot()
 	if !ok {
-		return nil, false
+		return nil, false, nil
 	}
 	slug := strings.TrimSpace(cfg.Project.Slug)
 	if slug == "" {
-		return nil, false
+		return nil, false, nil
 	}
 	projectServer, err := s.projectServer(slug)
 	if err != nil {
-		return nil, false
+		return nil, false, err
 	}
-	return projectServer, true
+	return projectServer, true, nil
 }
 
 func (s *Server) authorizeWorkerLogWindow(window string) (int, string) {
@@ -117,7 +122,7 @@ func (s *Server) hasActiveLedgerWorker(workerID string) (bool, error) {
 
 func (s *Server) hasProjectWorkerPrefix(window string) bool {
 	prefix := s.projectWorkerPrefix()
-	return prefix == "" || strings.HasPrefix(window, prefix)
+	return prefix != "" && strings.HasPrefix(window, prefix)
 }
 
 func (s *Server) projectWorkerPrefix() string {

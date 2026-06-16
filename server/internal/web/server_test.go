@@ -1657,6 +1657,40 @@ func TestWorkerLogWebSocketStreamsSelectedProjectWorker(t *testing.T) {
 	}
 }
 
+func TestWorkerLogWebSocketReportsSelectedProjectResolutionFailure(t *testing.T) {
+	cfg, _ := newTestProjectManager(t, "alpha")
+	_, manager := newTestProjectManager(t, "beta")
+	server := httptest.NewServer(New(Deps{
+		Config:  cfg,
+		Manager: manager,
+		PipeOutput: func(session, window string) (<-chan string, func(), error) {
+			t.Fatalf("PipeOutput called when selected project could not be resolved")
+			return nil, nil, nil
+		},
+		AuthDisabled: true,
+	}))
+	defer server.Close()
+
+	_, resp, err := websocket.DefaultDialer.Dial(wsURL(server.URL, "/ws/worker/alpha-worker-task-20260101-0001"), nil)
+	if err == nil {
+		t.Fatal("Dial error = nil, want selected project failure")
+	}
+	if resp == nil || resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("response = %#v, want 500", resp)
+	}
+}
+
+func TestAuthorizeWorkerLogWindowFailsClosedWithoutProjectPrefix(t *testing.T) {
+	registry := worker.NewRegistry()
+	registry.Register(worker.Info{WorkerID: "worker-task-001", TaskID: "task-001"})
+	server := &Server{projectScoped: true, registry: registry}
+
+	status, message := server.authorizeWorkerLogWindow("worker-task-001")
+	if status != http.StatusForbidden {
+		t.Fatalf("status = %d message = %q, want 403", status, message)
+	}
+}
+
 func TestProjectWorkerLogWebSocketRejectsCrossProjectWorker(t *testing.T) {
 	cfg, manager := newTestProjectManager(t, "alpha", "beta")
 	beta, err := manager.Project("beta")
