@@ -54,6 +54,30 @@ func TestBuildMCPTokensRejectsInvalidTemplateShellSyntax(t *testing.T) {
 	}
 }
 
+func TestRegisterWorkerToolsNotifySchemaRequiresWorkerID(t *testing.T) {
+	s := NewServer("worker", "")
+	RegisterWorkerTools(s, &Deps{})
+
+	var notifyDef *ToolDef
+	for i := range s.toolDefs {
+		if s.toolDefs[i].Name == "notify" {
+			notifyDef = &s.toolDefs[i]
+			break
+		}
+	}
+	if notifyDef == nil {
+		t.Fatal("notify tool not registered")
+	}
+	schema := notifyDef.InputSchema.(map[string]any)
+	props := schema["properties"].(map[string]any)
+	payload := props["payload"].(map[string]any)
+	required := payload["required"].([]string)
+	want := []string{"task_id", "worker_id"}
+	if !reflect.DeepEqual(required, want) {
+		t.Fatalf("notify payload required = %#v, want %#v", required, want)
+	}
+}
+
 func TestValidateGitBranchNameRejectsInvalidBranch(t *testing.T) {
 	if err := validateGitBranchName("feature/ok"); err != nil {
 		t.Fatalf("validateGitBranchName(valid) error = %v", err)
@@ -298,8 +322,124 @@ func TestEnsureWorkerTaskActiveRejectsTerminalOrMissingWorker(t *testing.T) {
 func TestHandleNotifyCompletedRejectsStaleWorkerIDUnderLedgerLock(t *testing.T) {
 	testHandleNotifyRejectsStaleWorkerID(t, "completed", map[string]any{
 		"pr_url":       "https://example.test/pr/1",
-		"merge_commit": "abc123",
+		"merge_commit": "abc123def456",
 	})
+}
+
+func TestHandleNotifyRejectsMissingOrEmptyWorkerID(t *testing.T) {
+	cases := []struct {
+		name       string
+		notifyType string
+		workerID   any
+		includeID  bool
+		extra      map[string]any
+		wantErr    string
+	}{
+		{
+			name:       "completed missing worker",
+			notifyType: "completed",
+			extra: map[string]any{
+				"pr_url":       "https://example.test/pr/1",
+				"merge_commit": "abc123def456",
+			},
+			wantErr: "missing required argument \"worker_id\"",
+		},
+		{
+			name:       "completed empty worker",
+			notifyType: "completed",
+			workerID:   "",
+			includeID:  true,
+			extra: map[string]any{
+				"pr_url":       "https://example.test/pr/1",
+				"merge_commit": "abc123def456",
+			},
+			wantErr: "worker_id is required",
+		},
+		{
+			name:       "blocked missing worker",
+			notifyType: "blocked",
+			extra: map[string]any{
+				"reason": "blocked",
+			},
+			wantErr: "missing required argument \"worker_id\"",
+		},
+		{
+			name:       "blocked empty worker",
+			notifyType: "blocked",
+			workerID:   " ",
+			includeID:  true,
+			extra: map[string]any{
+				"reason": "blocked",
+			},
+			wantErr: "worker_id is required",
+		},
+		{
+			name:       "split missing worker",
+			notifyType: "split_request",
+			extra: map[string]any{
+				"reason": "split",
+				"proposed_slices": []any{
+					map[string]any{"title": "Child"},
+				},
+			},
+			wantErr: "missing required argument \"worker_id\"",
+		},
+		{
+			name:       "split empty worker",
+			notifyType: "split_request",
+			workerID:   "",
+			includeID:  true,
+			extra: map[string]any{
+				"reason": "split",
+				"proposed_slices": []any{
+					map[string]any{"title": "Child"},
+				},
+			},
+			wantErr: "worker_id is required",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			l := ledger.NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
+			if err := l.Add(ledger.Task{
+				ID:       "task-001",
+				Title:    "Task",
+				Status:   "in_progress",
+				WorkerID: "worker-current",
+				Body:     "current body",
+			}); err != nil {
+				t.Fatalf("Add: %v", err)
+			}
+			deps := testMCPDeps(dir, l)
+			payload := map[string]any{"task_id": "task-001"}
+			if tc.includeID {
+				payload["worker_id"] = tc.workerID
+			}
+			for k, v := range tc.extra {
+				payload[k] = v
+			}
+
+			_, err := handleNotify(deps)(context.Background(), map[string]any{
+				"type":    tc.notifyType,
+				"payload": payload,
+			})
+			if err == nil {
+				t.Fatalf("handleNotify(%s) error = nil, want worker_id error", tc.notifyType)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("handleNotify(%s) error = %v, want %q", tc.notifyType, err, tc.wantErr)
+			}
+			tasks, err := l.Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if len(tasks) != 1 || tasks[0].Status != "in_progress" || tasks[0].WorkerID != "worker-current" || tasks[0].Body != "current body" {
+				t.Fatalf("task changed after invalid worker_id rejection: %#v", tasks)
+			}
+		})
+	}
 }
 
 func TestHandleNotifyCompletedRejectsMissingCompletionEvidence(t *testing.T) {
@@ -422,6 +562,126 @@ func TestHandleNotifySplitRequestRejectsStaleWorkerIDUnderLedgerLock(t *testing.
 			},
 		},
 	})
+}
+
+func TestHandleNotifyValidOwnerMutatesTask(t *testing.T) {
+	cases := []struct {
+		name       string
+		notifyType string
+		extra      map[string]any
+		verify     func(t *testing.T, tasks []ledger.Task)
+	}{
+		{
+			name:       "completed",
+			notifyType: "completed",
+			extra: map[string]any{
+				"pr_url":       "https://example.test/pr/1",
+				"merge_commit": "abc123def456",
+			},
+			verify: func(t *testing.T, tasks []ledger.Task) {
+				t.Helper()
+				if len(tasks) != 1 {
+					t.Fatalf("len(tasks) = %d, want 1", len(tasks))
+				}
+				if tasks[0].Status != "completed" || tasks[0].WorkerID != "" || tasks[0].PrURL != "https://example.test/pr/1" {
+					t.Fatalf("completed task = %#v, want completed with cleared worker and PR URL", tasks[0])
+				}
+				if !strings.Contains(tasks[0].Body, "<!-- merge_commit: abc123def456 -->") {
+					t.Fatalf("completed body = %q, want merge commit marker", tasks[0].Body)
+				}
+			},
+		},
+		{
+			name:       "blocked",
+			notifyType: "blocked",
+			extra: map[string]any{
+				"reason": "blocked by dependency",
+			},
+			verify: func(t *testing.T, tasks []ledger.Task) {
+				t.Helper()
+				if len(tasks) != 1 {
+					t.Fatalf("len(tasks) = %d, want 1", len(tasks))
+				}
+				if tasks[0].Status != "blocked" || tasks[0].WorkerID != "worker-current" || tasks[0].Reason != "blocked by dependency" {
+					t.Fatalf("blocked task = %#v, want blocked task owned by worker-current with reason", tasks[0])
+				}
+			},
+		},
+		{
+			name:       "split_request",
+			notifyType: "split_request",
+			extra: map[string]any{
+				"reason": "needs decomposition",
+				"proposed_slices": []any{
+					map[string]any{
+						"title":         "Child",
+						"description":   "child body",
+						"allowed_files": []any{"server/internal/mcp"},
+					},
+				},
+			},
+			verify: func(t *testing.T, tasks []ledger.Task) {
+				t.Helper()
+				if len(tasks) != 2 {
+					t.Fatalf("len(tasks) = %d, want parent and child", len(tasks))
+				}
+				var parent, child *ledger.Task
+				for i := range tasks {
+					switch tasks[i].ID {
+					case "task-001":
+						parent = &tasks[i]
+					default:
+						child = &tasks[i]
+					}
+				}
+				if parent == nil || child == nil {
+					t.Fatalf("tasks after split = %#v, want parent and child", tasks)
+				}
+				if parent.Status != "split" || parent.WorkerID != "" || parent.Reason != "needs decomposition" {
+					t.Fatalf("split parent = %#v, want split with cleared worker and reason", parent)
+				}
+				if child.Status != "unstarted" || child.Title != "Child" || child.Body != "child body" {
+					t.Fatalf("split child = %#v, want unstarted child", child)
+				}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			l := ledger.NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
+			if err := l.Add(ledger.Task{
+				ID:       "task-001",
+				Title:    "Task",
+				Status:   "in_progress",
+				WorkerID: "worker-current",
+				Body:     "current body",
+			}); err != nil {
+				t.Fatalf("Add: %v", err)
+			}
+			deps := testMCPDeps(dir, l)
+			payload := map[string]any{
+				"task_id":   "task-001",
+				"worker_id": "worker-current",
+			}
+			for k, v := range tc.extra {
+				payload[k] = v
+			}
+
+			if _, err := handleNotify(deps)(context.Background(), map[string]any{
+				"type":    tc.notifyType,
+				"payload": payload,
+			}); err != nil {
+				t.Fatalf("handleNotify(%s): %v", tc.notifyType, err)
+			}
+			tasks, err := l.Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			tc.verify(t, tasks)
+		})
+	}
 }
 
 func TestHandleArchiveTaskAlreadyArchivedIsIdempotent(t *testing.T) {
@@ -570,9 +830,20 @@ func testHandleNotifyRejectsStaleWorkerID(t *testing.T, notifyType string, extra
 		Session: "missing-session",
 	}
 
+	notifyAfterOwnershipPreflightForTest = func() {
+		if _, err := l.UpdateIfStatusesReturnPrev("task-001", []string{"in_progress", "blocked"}, map[string]any{
+			"worker_id": "worker-new",
+		}); err != nil {
+			t.Fatalf("stale worker setup update: %v", err)
+		}
+	}
+	defer func() {
+		notifyAfterOwnershipPreflightForTest = nil
+	}()
+
 	payload := map[string]any{
 		"task_id":   "task-001",
-		"worker_id": "worker-stale",
+		"worker_id": "worker-current",
 	}
 	for k, v := range extraPayload {
 		payload[k] = v
@@ -584,7 +855,7 @@ func testHandleNotifyRejectsStaleWorkerID(t *testing.T, notifyType string, extra
 	if err == nil {
 		t.Fatalf("handleNotify(%s) error = nil, want stale worker ownership error", notifyType)
 	}
-	if !strings.Contains(err.Error(), "worker \"worker-stale\" is not assigned") {
+	if !strings.Contains(err.Error(), "worker \"worker-current\" is not assigned") {
 		t.Fatalf("handleNotify(%s) error = %v, want stale worker ownership error", notifyType, err)
 	}
 
@@ -592,7 +863,7 @@ func testHandleNotifyRejectsStaleWorkerID(t *testing.T, notifyType string, extra
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if tasks[0].Status != "in_progress" || tasks[0].Body != "current body" || tasks[0].WorkerID != "worker-current" {
+	if tasks[0].Status != "in_progress" || tasks[0].Body != "current body" || tasks[0].WorkerID != "worker-new" {
 		t.Fatalf("task changed after stale notify rejection: %#v", tasks[0])
 	}
 	if len(tasks) != 1 {
