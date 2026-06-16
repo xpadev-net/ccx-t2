@@ -170,6 +170,54 @@ func TestHandleSpawnWorkerRejectsBranchWithoutTaskID(t *testing.T) {
 	}
 }
 
+func TestHandleSpawnWorkerRejectsMalformedFileLists(t *testing.T) {
+	cases := []struct {
+		name  string
+		field string
+		value any
+	}{
+		{name: "allowed string", field: "allowed_files", value: "server/internal/mcp"},
+		{name: "allowed non-string item", field: "allowed_files", value: []any{float64(1)}},
+		{name: "allowed null", field: "allowed_files", value: nil},
+		{name: "forbidden string", field: "forbidden_files", value: "server/internal/mcp"},
+		{name: "forbidden non-string item", field: "forbidden_files", value: []any{float64(1)}},
+		{name: "forbidden null", field: "forbidden_files", value: nil},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			l := ledger.NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
+			if err := l.Add(ledger.Task{ID: "task-001", Title: "Task", Status: "unstarted"}); err != nil {
+				t.Fatalf("Add: %v", err)
+			}
+			deps := testMCPDeps(dir, l)
+			args := map[string]any{
+				"task_id":         "task-001",
+				"branch":          "feature/task-001-work",
+				"allowed_files":   []any{"server/internal/mcp"},
+				"forbidden_files": []any{"server/internal/mcp/old.go"},
+			}
+			args[tc.field] = tc.value
+
+			_, err := handleSpawnWorker(deps)(context.Background(), args)
+			if err == nil {
+				t.Fatal("handleSpawnWorker error = nil, want file-list type error")
+			}
+			if !strings.Contains(err.Error(), tc.field) || !strings.Contains(err.Error(), "array of strings") {
+				t.Fatalf("handleSpawnWorker error = %v, want %s array-of-strings error", err, tc.field)
+			}
+			tasks, err := l.Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if len(tasks) != 1 || tasks[0].Status != "unstarted" || len(tasks[0].AllowedFiles) != 0 || len(tasks[0].ForbiddenFiles) != 0 {
+				t.Fatalf("task changed after malformed %s rejection: %#v", tc.field, tasks)
+			}
+		})
+	}
+}
+
 func TestCleanupTaskBranchNormalizesRelativeRepoPath(t *testing.T) {
 	dir := t.TempDir()
 	repoPath := filepath.Join(dir, "repo")
@@ -295,6 +343,100 @@ func TestHandleCreateTaskAcceptsNaturalLanguageRequestWithoutTitle(t *testing.T)
 	}
 	if len(tasks[0].AllowedFiles) != 0 {
 		t.Fatalf("allowed_files = %#v, want none for raw intake", tasks[0].AllowedFiles)
+	}
+}
+
+func TestHandleCreateTaskRejectsMalformedFileLists(t *testing.T) {
+	cases := []struct {
+		name  string
+		field string
+		value any
+	}{
+		{name: "allowed string", field: "allowed_files", value: "server/internal/mcp"},
+		{name: "allowed non-string item", field: "allowed_files", value: []any{float64(1)}},
+		{name: "allowed null", field: "allowed_files", value: nil},
+		{name: "forbidden string", field: "forbidden_files", value: "server/internal/mcp"},
+		{name: "forbidden non-string item", field: "forbidden_files", value: []any{float64(1)}},
+		{name: "forbidden null", field: "forbidden_files", value: nil},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			l := ledger.NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
+			args := map[string]any{
+				"title":           "Task",
+				"description":     "Task body",
+				"allowed_files":   []any{"server/internal/mcp"},
+				"forbidden_files": []any{"server/internal/mcp/old.go"},
+			}
+			args[tc.field] = tc.value
+
+			_, err := handleCreateTask(&Deps{Ledger: l})(context.Background(), args)
+			if err == nil {
+				t.Fatal("handleCreateTask error = nil, want file-list type error")
+			}
+			if !strings.Contains(err.Error(), tc.field) || !strings.Contains(err.Error(), "array of strings") {
+				t.Fatalf("handleCreateTask error = %v, want %s array-of-strings error", err, tc.field)
+			}
+			tasks, err := l.Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if len(tasks) != 0 {
+				t.Fatalf("created task after malformed %s rejection: %#v", tc.field, tasks)
+			}
+		})
+	}
+}
+
+func TestHandleSplitTaskRejectsMalformedFileLists(t *testing.T) {
+	cases := []struct {
+		name  string
+		field string
+		value any
+	}{
+		{name: "allowed string", field: "allowed_files", value: "server/internal/mcp"},
+		{name: "allowed non-string item", field: "allowed_files", value: []any{float64(1)}},
+		{name: "allowed null", field: "allowed_files", value: nil},
+		{name: "forbidden string", field: "forbidden_files", value: "server/internal/mcp"},
+		{name: "forbidden non-string item", field: "forbidden_files", value: []any{float64(1)}},
+		{name: "forbidden null", field: "forbidden_files", value: nil},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			l := ledger.NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
+			if err := l.Add(ledger.Task{ID: "task-001", Title: "Task", Status: "unstarted", Body: "current body"}); err != nil {
+				t.Fatalf("Add: %v", err)
+			}
+			slice := map[string]any{
+				"title":           "Child",
+				"description":     "child body",
+				"allowed_files":   []any{"server/internal/mcp"},
+				"forbidden_files": []any{"server/internal/mcp/old.go"},
+			}
+			slice[tc.field] = tc.value
+
+			_, err := handleSplitTask(&Deps{Ledger: l})(context.Background(), map[string]any{
+				"id":     "task-001",
+				"slices": []any{slice},
+			})
+			if err == nil {
+				t.Fatal("handleSplitTask error = nil, want file-list type error")
+			}
+			if !strings.Contains(err.Error(), tc.field) || !strings.Contains(err.Error(), "array of strings") {
+				t.Fatalf("handleSplitTask error = %v, want %s array-of-strings error", err, tc.field)
+			}
+			tasks, err := l.Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if len(tasks) != 1 || tasks[0].Status != "unstarted" || tasks[0].Body != "current body" {
+				t.Fatalf("task changed after malformed %s rejection: %#v", tc.field, tasks)
+			}
+		})
 	}
 }
 
@@ -562,6 +704,67 @@ func TestHandleNotifySplitRequestRejectsStaleWorkerIDUnderLedgerLock(t *testing.
 			},
 		},
 	})
+}
+
+func TestHandleNotifySplitRequestRejectsMalformedFileLists(t *testing.T) {
+	cases := []struct {
+		name  string
+		field string
+		value any
+	}{
+		{name: "allowed string", field: "allowed_files", value: "server/internal/mcp"},
+		{name: "allowed non-string item", field: "allowed_files", value: []any{float64(1)}},
+		{name: "allowed null", field: "allowed_files", value: nil},
+		{name: "forbidden string", field: "forbidden_files", value: "server/internal/mcp"},
+		{name: "forbidden non-string item", field: "forbidden_files", value: []any{float64(1)}},
+		{name: "forbidden null", field: "forbidden_files", value: nil},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			l := ledger.NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
+			if err := l.Add(ledger.Task{
+				ID:       "task-001",
+				Title:    "Task",
+				Status:   "in_progress",
+				WorkerID: "worker-current",
+				Body:     "current body",
+			}); err != nil {
+				t.Fatalf("Add: %v", err)
+			}
+			slice := map[string]any{
+				"title":           "Child",
+				"description":     "child body",
+				"allowed_files":   []any{"server/internal/mcp"},
+				"forbidden_files": []any{"server/internal/mcp/old.go"},
+			}
+			slice[tc.field] = tc.value
+
+			_, err := handleNotify(testMCPDeps(dir, l))(context.Background(), map[string]any{
+				"type": "split_request",
+				"payload": map[string]any{
+					"task_id":         "task-001",
+					"worker_id":       "worker-current",
+					"reason":          "needs split",
+					"proposed_slices": []any{slice},
+				},
+			})
+			if err == nil {
+				t.Fatal("handleNotify split_request error = nil, want file-list type error")
+			}
+			if !strings.Contains(err.Error(), tc.field) || !strings.Contains(err.Error(), "array of strings") {
+				t.Fatalf("handleNotify split_request error = %v, want %s array-of-strings error", err, tc.field)
+			}
+			tasks, err := l.Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if len(tasks) != 1 || tasks[0].Status != "in_progress" || tasks[0].WorkerID != "worker-current" || tasks[0].Body != "current body" {
+				t.Fatalf("task changed after malformed %s rejection: %#v", tc.field, tasks)
+			}
+		})
+	}
 }
 
 func TestHandleNotifyValidOwnerMutatesTask(t *testing.T) {
