@@ -72,6 +72,45 @@ func TestBaseURLHostForWildcardListenAddress(t *testing.T) {
 	}
 }
 
+func TestServeRejectsPublicNoAuthConfigAtStartup(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	data := []byte(`
+server:
+  host: 0.0.0.0
+  port: 18080
+runtime:
+  tmux_session: ccx-t2-test
+`)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	err := serve([]string{"--config", path})
+	if err == nil {
+		t.Fatal("serve() error = nil, want unsafe no-auth config error")
+	}
+	if !strings.Contains(err.Error(), "allow_unsafe_no_auth") {
+		t.Fatalf("serve() error = %v, want allow_unsafe_no_auth guidance", err)
+	}
+}
+
+func TestCloneForWorkerRuntimeUsesWorkerMCPSecret(t *testing.T) {
+	cfg := &config.Config{Server: config.ServerConfig{
+		McpSecret:    "legacy",
+		WorkerSecret: "worker",
+	}}
+
+	workerCfg := config.CloneForWorkerRuntime(cfg)
+	if got := workerCfg.Server.McpSecret; got != "worker" {
+		t.Fatalf("worker runtime mcp_secret = %q, want worker", got)
+	}
+
+	if got := cfg.Server.McpSecret; got != "legacy" {
+		t.Fatalf("source mcp_secret = %q, want legacy", got)
+	}
+}
+
 func TestDefaultConfigAllowsNoDetectedHarnesses(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("PATH", dir)

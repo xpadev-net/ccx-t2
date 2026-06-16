@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -34,9 +35,13 @@ type ProjectConfig struct {
 
 // ServerConfig holds HTTP server settings.
 type ServerConfig struct {
-	Host      string `yaml:"host"`
-	Port      int    `yaml:"port"`
-	McpSecret string `yaml:"mcp_secret"` // optional Bearer token for MCP endpoints
+	Host               string `yaml:"host"`
+	Port               int    `yaml:"port"`
+	McpSecret          string `yaml:"mcp_secret"` // legacy Bearer token; seeds role-specific secrets when they are unset
+	WebAdminSecret     string `yaml:"web_admin_secret"`
+	OrchestratorSecret string `yaml:"orchestrator_mcp_secret"`
+	WorkerSecret       string `yaml:"worker_mcp_secret"`
+	AllowUnsafeNoAuth  bool   `yaml:"allow_unsafe_no_auth"`
 }
 
 // RuntimeConfig holds process-wide runtime settings.
@@ -195,6 +200,9 @@ func expandEnv(cfg *Config) {
 	cfg.Project.GitHub.Owner = expand(cfg.Project.GitHub.Owner)
 	cfg.Project.GitHub.Repo = expand(cfg.Project.GitHub.Repo)
 	cfg.Server.Host = expand(cfg.Server.Host)
+	cfg.Server.WebAdminSecret = expand(cfg.Server.WebAdminSecret)
+	cfg.Server.OrchestratorSecret = expand(cfg.Server.OrchestratorSecret)
+	cfg.Server.WorkerSecret = expand(cfg.Server.WorkerSecret)
 	cfg.Runtime.TmuxSession = expand(cfg.Runtime.TmuxSession)
 	cfg.Runtime.WorktreeBase = expand(cfg.Runtime.WorktreeBase)
 	cfg.Orchestrator.Harness = expand(cfg.Orchestrator.Harness)
@@ -303,6 +311,9 @@ func validate(cfg *Config) error {
 	if strings.ContainsAny(cfg.Server.Host, " \t\r\n") {
 		return fmt.Errorf("config: server.host must not contain whitespace")
 	}
+	if !cfg.Server.AllowUnsafeNoAuth && !isLoopbackListenHost(cfg.Server.Host) && !allServerSecretsConfigured(cfg.Server) {
+		return fmt.Errorf("config: server.host %q is not loopback and one or more Web/MCP auth secrets are empty; set server.web_admin_secret, server.orchestrator_mcp_secret, server.worker_mcp_secret, or legacy server.mcp_secret, or explicitly set server.allow_unsafe_no_auth: true", cfg.Server.Host)
+	}
 	if strings.TrimSpace(cfg.Runtime.TmuxSession) == "" {
 		return fmt.Errorf("config: required field %q is empty", "runtime.tmux_session")
 	}
@@ -317,14 +328,14 @@ func validate(cfg *Config) error {
 	}
 
 	if cfg.Orchestrator.Harness != "" {
-		if err := validateHarness(cfg, cfg.Orchestrator.Harness, true); err != nil {
+		if err := validateHarness(cfg, cfg.Orchestrator.Harness, true, cfg.Server.EffectiveOrchestratorSecret()); err != nil {
 			return fmt.Errorf("config: orchestrator harness %q: %w", cfg.Orchestrator.Harness, err)
 		}
 	}
 
 	// Validate worker harnesses (binary check deferred to spawn time).
 	for _, name := range cfg.WorkerHarnesses {
-		if err := validateHarness(cfg, name, false); err != nil {
+		if err := validateHarness(cfg, name, false, cfg.Server.EffectiveWorkerSecret()); err != nil {
 			return fmt.Errorf("config: worker harness %q: %w", name, err)
 		}
 	}
@@ -348,13 +359,89 @@ func validate(cfg *Config) error {
 			return fmt.Errorf("config: projects.%s.orchestrator.timeout must be positive", slug)
 		}
 		if project.Orchestrator.Harness != "" {
-			if err := validateHarness(cfg, project.Orchestrator.Harness, true); err != nil {
+			if err := validateHarness(cfg, project.Orchestrator.Harness, true, cfg.Server.EffectiveOrchestratorSecret()); err != nil {
 				return fmt.Errorf("config: project %q orchestrator harness %q: %w", slug, project.Orchestrator.Harness, err)
 			}
 		}
 	}
 
 	return nil
+}
+
+// EffectiveWebAdminSecret returns the browser/admin API secret, falling back to
+// the legacy shared MCP secret for existing configs.
+func (s ServerConfig) EffectiveWebAdminSecret() string {
+	if s.WebAdminSecret != "" {
+		return s.WebAdminSecret
+	}
+	return s.McpSecret
+}
+
+// EffectiveOrchestratorSecret returns the orchestrator MCP secret, falling back
+// to the legacy shared MCP secret for existing configs.
+func (s ServerConfig) EffectiveOrchestratorSecret() string {
+	if s.OrchestratorSecret != "" {
+		return s.OrchestratorSecret
+	}
+	return s.McpSecret
+}
+
+// EffectiveWorkerSecret returns the worker MCP secret, falling back to the
+// legacy shared MCP secret for existing configs.
+func (s ServerConfig) EffectiveWorkerSecret() string {
+	if s.WorkerSecret != "" {
+		return s.WorkerSecret
+	}
+	return s.McpSecret
+}
+
+func allServerSecretsConfigured(s ServerConfig) bool {
+	return s.EffectiveWebAdminSecret() != "" &&
+		s.EffectiveOrchestratorSecret() != "" &&
+		s.EffectiveWorkerSecret() != ""
+}
+
+func isLoopbackListenHost(host string) bool {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	if strings.HasPrefix(host, "[") || strings.HasSuffix(host, "]") {
+		if !strings.HasPrefix(host, "[") || !strings.HasSuffix(host, "]") {
+			return false
+		}
+		host = strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
+		if host == "" {
+			return false
+		}
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// CloneForOrchestratorRuntime returns cfg with the legacy MCP secret slot set
+// to the effective orchestrator MCP secret for existing harness code paths.
+func CloneForOrchestratorRuntime(cfg *Config) *Config {
+	if cfg == nil {
+		return nil
+	}
+	out := Clone(cfg)
+	out.Server.McpSecret = cfg.Server.EffectiveOrchestratorSecret()
+	return out
+}
+
+// CloneForWorkerRuntime returns cfg with the legacy MCP secret slot set to the
+// effective worker MCP secret for existing harness code paths.
+func CloneForWorkerRuntime(cfg *Config) *Config {
+	if cfg == nil {
+		return nil
+	}
+	out := Clone(cfg)
+	out.Server.McpSecret = cfg.Server.EffectiveWorkerSecret()
+	return out
 }
 
 // Project returns a project-scoped copy of cfg. Shared harness/server/runtime
@@ -375,7 +462,7 @@ func Project(cfg *Config, slug string) (*Config, bool) {
 	return out, true
 }
 
-func validateHarness(cfg *Config, name string, checkBinary bool) error {
+func validateHarness(cfg *Config, name string, checkBinary bool, secret string) error {
 	h, ok := cfg.Harnesses[name]
 	if !ok {
 		return fmt.Errorf("not found in harnesses")
@@ -395,11 +482,11 @@ func validateHarness(cfg *Config, name string, checkBinary bool) error {
 	if _, err := shellquote.Split(h.McpArgs); err != nil {
 		return fmt.Errorf("mcp_args has invalid shell syntax: %w", err)
 	}
-	if cfg.Server.McpSecret != "" && !strings.Contains(h.McpArgs, "{secret}") {
-		return fmt.Errorf("mcp_secret is configured but mcp_args does not contain {secret}; the harness will receive 401 on every MCP call")
+	if secret != "" && !strings.Contains(h.McpArgs, "{secret}") {
+		return fmt.Errorf("MCP secret is configured but mcp_args does not contain {secret}; the harness will receive 401 on every MCP call")
 	}
-	if cfg.Server.McpSecret == "" && strings.Contains(h.McpArgs, "{secret}") {
-		return fmt.Errorf("mcp_args contains {secret} placeholder but mcp_secret is not configured; {secret} will expand to empty string")
+	if secret == "" && strings.Contains(h.McpArgs, "{secret}") {
+		return fmt.Errorf("mcp_args contains {secret} placeholder but MCP secret is not configured; {secret} will expand to empty string")
 	}
 	if checkBinary {
 		if _, err := exec.LookPath(h.Command); err != nil {

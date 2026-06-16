@@ -99,10 +99,12 @@ func buildProjectRuntime(cfg *config.Config, slug, session, baseURL string) (*Pr
 		}
 		gh = client
 	}
-	o := orchestrator.NewProject(l, projectCfg, session, baseURL, slug+"-orchestrator")
+	orchestratorCfg := config.CloneForOrchestratorRuntime(projectCfg)
+	workerCfg := config.CloneForWorkerRuntime(projectCfg)
+	o := orchestrator.NewProject(l, orchestratorCfg, session, baseURL, slug+"-orchestrator")
 	return &ProjectRuntime{
 		Slug:         slug,
-		Config:       projectCfg,
+		Config:       workerCfg,
 		Ledger:       l,
 		Registry:     registry,
 		GitHub:       gh,
