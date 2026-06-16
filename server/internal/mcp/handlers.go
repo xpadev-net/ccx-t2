@@ -709,9 +709,12 @@ func cleanupArchivedTaskResources(deps *Deps, taskID, branch string) {
 	workerID := workerIDFor(deps, taskID)
 	_ = tmux.KillWindow(deps.Session, workerID)
 	deps.Registry.Remove(workerID)
-	wPath := filepath.Join(deps.Config.Project.WorktreeBase,
-		deps.Config.Project.Slug+"-"+taskID)
-	_ = worktree.Remove(deps.Config.Project.RepoPath, wPath)
+	wPath, err := config.ProjectWorktreePath(deps.Config.Project, taskID)
+	if err != nil {
+		log.Printf("warn: archived task cleanup skipped unsafe worktree path for task %s: %v", taskID, err)
+	} else {
+		_ = worktree.Remove(deps.Config.Project.RepoPath, wPath)
+	}
 	if branch != "" {
 		_ = cleanupTaskBranch(deps.Config.Project.RepoPath, branch, taskID)
 	}
@@ -821,8 +824,10 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 
 		// Build paths.
 		repoPath := toolDeps.Config.Project.RepoPath
-		worktreePath := filepath.Join(toolDeps.Config.Project.WorktreeBase,
-			toolDeps.Config.Project.Slug+"-"+taskID)
+		worktreePath, err := config.ProjectWorktreePath(toolDeps.Config.Project, taskID)
+		if err != nil {
+			return nil, fmt.Errorf("resolve worktree path: %w", err)
+		}
 
 		// Get current HEAD as base ref.
 		headOut, err := exec.Command("git", "-C", repoPath, "rev-parse", "HEAD").Output()
@@ -1545,13 +1550,18 @@ func cleanupWorkerResources(deps *Deps, workerID, branch, taskID string, deleteB
 		}
 	}
 	if taskID != "" {
-		wPath := filepath.Join(deps.Config.Project.WorktreeBase,
-			deps.Config.Project.Slug+"-"+taskID)
-		result.WorktreePath = wPath
-		if err := ops.removeWorktree(deps.Config.Project.RepoPath, wPath); err != nil {
+		wPath, err := config.ProjectWorktreePath(deps.Config.Project, taskID)
+		if err != nil {
+			// No safe path exists to report or remove when resolution fails.
+			// Keep WorktreePath empty and surface the failure via WorktreeErr.
+			result.WorktreeErr = fmt.Errorf("resolve worktree path: %w", err)
+		} else if err := ops.removeWorktree(deps.Config.Project.RepoPath, wPath); err != nil {
+			result.WorktreePath = wPath
 			if !worktreeRemoveAlreadyDone(err) {
 				result.WorktreeErr = fmt.Errorf("remove worktree %q: %w", wPath, err)
 			}
+		} else {
+			result.WorktreePath = wPath
 		}
 	}
 	if deleteBranch && branch != "" {

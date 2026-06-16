@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1472,6 +1473,57 @@ func TestPatchConfigRejectsInvalidDuration(t *testing.T) {
 	}
 }
 
+func TestPatchConfigRejectsInvalidProjectSlug(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body map[string]any
+	}{
+		{
+			name: "top level whitespace",
+			body: map[string]any{"project": map[string]any{"slug": "alpha beta"}},
+		},
+		{
+			name: "project map slash",
+			body: map[string]any{"projects": map[string]any{"alpha/beta": map[string]any{"repo_path": "/unused"}}},
+		},
+		{
+			name: "project rename parent traversal",
+			body: map[string]any{"projects": map[string]any{"ccx-t2": map[string]any{"slug": ".."}}},
+		},
+		{
+			name: "project rename control character",
+			body: map[string]any{"projects": map[string]any{"ccx-t2": map[string]any{"slug": "alpha\nbeta"}}},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			configPath := filepath.Join(dir, "config.yaml")
+			cfg := testConfig()
+			makeWebConfigPathsValid(t, cfg)
+			cfg.Projects = map[string]config.ProjectConfig{cfg.Project.Slug: cfg.Project}
+			if err := config.Save(configPath, cfg); err != nil {
+				t.Fatalf("Save config: %v", err)
+			}
+			loaded, err := config.Load(configPath)
+			if err != nil {
+				t.Fatalf("Load config: %v", err)
+			}
+			body, err := json.Marshal(tc.body)
+			if err != nil {
+				t.Fatalf("Marshal body: %v", err)
+			}
+
+			resp := performJSONRequest(New(Deps{Config: loaded, ConfigPath: configPath, AuthDisabled: true}), http.MethodPatch, "/api/config", string(body))
+			if resp.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusBadRequest, resp.Body.String())
+			}
+			if !strings.Contains(resp.Body.String(), "slug") || !strings.Contains(resp.Body.String(), "must match") {
+				t.Fatalf("body = %s, want project slug guidance", resp.Body.String())
+			}
+		})
+	}
+}
+
 func TestPatchConfigRejectsUnsafeProjectLedgerPath(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.yaml")
@@ -1614,6 +1666,44 @@ func TestCreateProjectPersistsAndReloadsManager(t *testing.T) {
 	tasks := performRequest(server, http.MethodGet, "/api/projects/alpha/tasks")
 	if tasks.Code != http.StatusOK {
 		t.Fatalf("project tasks status = %d, want %d; body=%s", tasks.Code, http.StatusOK, tasks.Body.String())
+	}
+}
+
+func TestCreateProjectRejectsInvalidSlug(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	cfg := testConfig()
+	cfg.Runtime.WorktreeBase = mkdirWebTestDir(t, "worktrees")
+	cfg.Project = config.ProjectConfig{}
+	cfg.Projects = map[string]config.ProjectConfig{}
+	if err := config.Save(configPath, cfg); err != nil {
+		t.Fatalf("Save config: %v", err)
+	}
+	loaded, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("Load config: %v", err)
+	}
+	server := New(Deps{Config: loaded, ConfigPath: configPath, AuthDisabled: true})
+	repoPath := initWebTestRepo(t)
+
+	for _, slug := range []string{"alpha/beta", "..", "alpha beta", "alpha\nbeta"} {
+		t.Run(strconv.Quote(slug), func(t *testing.T) {
+			body, err := json.Marshal(map[string]string{
+				"slug":      slug,
+				"repo_path": repoPath,
+			})
+			if err != nil {
+				t.Fatalf("Marshal body: %v", err)
+			}
+
+			resp := performJSONRequest(server, http.MethodPost, "/api/projects", string(body))
+			if resp.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusBadRequest, resp.Body.String())
+			}
+			if !strings.Contains(resp.Body.String(), "slug") || !strings.Contains(resp.Body.String(), "must match") {
+				t.Fatalf("body = %s, want project slug guidance", resp.Body.String())
+			}
+		})
 	}
 }
 

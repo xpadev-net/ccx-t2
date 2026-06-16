@@ -167,6 +167,22 @@ func Clone(cfg *Config) *Config {
 	return &out
 }
 
+const projectSlugPatternText = `^[A-Za-z0-9][A-Za-z0-9_-]*$`
+
+var reProjectSlug = regexp.MustCompile(projectSlugPatternText)
+
+// ValidateProjectSlug verifies that slug is safe to use in routes, tmux
+// window names, and generated filesystem paths.
+func ValidateProjectSlug(slug string) error {
+	if slug == "" {
+		return fmt.Errorf("cannot be empty")
+	}
+	if !reProjectSlug.MatchString(slug) {
+		return fmt.Errorf("must match %s", projectSlugPatternText)
+	}
+	return nil
+}
+
 // reEnvVar matches ${VAR} placeholders only (not bare $VAR).
 // Restricting to the braced form prevents accidental expansion of shell
 // special variables like $@, $1, $2 that may appear in validation_command.
@@ -339,7 +355,6 @@ func validate(cfg *Config) error {
 			return fmt.Errorf("config: orchestrator harness %q: %w", cfg.Orchestrator.Harness, err)
 		}
 	}
-
 	// Validate worker harnesses (binary check deferred to spawn time).
 	for _, name := range cfg.WorkerHarnesses {
 		if err := validateHarness(cfg, name, false, cfg.Server.EffectiveWorkerSecret()); err != nil {
@@ -348,8 +363,17 @@ func validate(cfg *Config) error {
 	}
 	projectPathsNormalized := false
 	for slug, project := range cfg.Projects {
-		if strings.TrimSpace(slug) == "" {
-			return fmt.Errorf("config: project slug cannot be empty")
+		if err := validateProjectSlug("projects slug key", slug); err != nil {
+			return err
+		}
+		if project.Slug == "" {
+			project.Slug = slug
+		}
+		if err := validateProjectSlug("projects."+slug+".slug", project.Slug); err != nil {
+			return err
+		}
+		if project.Slug != slug {
+			return fmt.Errorf("config: projects.%s.slug %q must match project key %q", slug, project.Slug, slug)
 		}
 		for _, f := range []struct{ name, val string }{
 			{"projects." + slug + ".repo_path", project.RepoPath},
@@ -381,6 +405,11 @@ func validate(cfg *Config) error {
 			cfg.Project = project
 			cfg.GitHub = project.GitHub
 			projectPathsNormalized = true
+		}
+	}
+	if cfg.Project.Slug != "" {
+		if err := validateProjectSlug("project.slug", cfg.Project.Slug); err != nil {
+			return err
 		}
 	}
 	if !projectPathsNormalized && projectHasPathOverride(cfg.Project) {
@@ -458,6 +487,9 @@ func isLoopbackListenHost(host string) bool {
 // ProjectWorktreePath returns the worktree path generated for a task and
 // verifies the resolved path stays inside the configured worktree base.
 func ProjectWorktreePath(project ProjectConfig, taskID string) (string, error) {
+	if err := ValidateProjectSlug(project.Slug); err != nil {
+		return "", fmt.Errorf("project slug %q: %w", project.Slug, err)
+	}
 	base, err := canonicalWorktreeBase(project.WorktreeBase)
 	if err != nil {
 		return "", fmt.Errorf("worktree_base: %w", err)
@@ -471,6 +503,13 @@ func ProjectWorktreePath(project ProjectConfig, taskID string) (string, error) {
 		return "", fmt.Errorf("generated worktree path %q must stay under worktree_base %q", worktreePath, base)
 	}
 	return worktreePath, nil
+}
+
+func validateProjectSlug(field, slug string) error {
+	if err := ValidateProjectSlug(slug); err != nil {
+		return fmt.Errorf("config: %s %q: %w", field, slug, err)
+	}
+	return nil
 }
 
 func validateProjectPaths(prefix string, project ProjectConfig) (ProjectConfig, error) {

@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -86,6 +87,38 @@ func TestServerRoleSecretsOverrideLegacyMCPSecret(t *testing.T) {
 	}
 	if got := server.EffectiveWorkerSecret(); got != "worker" {
 		t.Fatalf("EffectiveWorkerSecret() = %q, want worker", got)
+	}
+}
+
+func TestValidateProjectSlug(t *testing.T) {
+	valid := []string{
+		"alpha",
+		"Alpha_01",
+		"project-2026",
+		"p",
+	}
+	for _, slug := range valid {
+		t.Run("valid "+slug, func(t *testing.T) {
+			if err := ValidateProjectSlug(slug); err != nil {
+				t.Fatalf("ValidateProjectSlug(%q) error = %v, want nil", slug, err)
+			}
+		})
+	}
+
+	invalid := []string{
+		"",
+		"alpha/beta",
+		"..",
+		"alpha beta",
+		"alpha\nbeta",
+		"-alpha",
+	}
+	for _, slug := range invalid {
+		t.Run("invalid "+strconv.Quote(slug), func(t *testing.T) {
+			if err := ValidateProjectSlug(slug); err == nil {
+				t.Fatalf("ValidateProjectSlug(%q) error = nil, want invalid slug", slug)
+			}
+		})
 	}
 }
 
@@ -255,6 +288,89 @@ func TestPrepareAllowsValidProjectPaths(t *testing.T) {
 	}
 }
 
+func TestPrepareDefaultsProjectSlugFromMapKey(t *testing.T) {
+	repoPath := initConfigTestRepo(t)
+	cfg := &Config{
+		Runtime: RuntimeConfig{WorktreeBase: mkdirConfigTestDir(t, "worktrees")},
+		Projects: map[string]ProjectConfig{
+			"alpha": {
+				RepoPath:     repoPath,
+				WorktreeBase: mkdirConfigTestDir(t, "project-worktrees"),
+				LedgerPath:   filepath.Join(repoPath, "tasks", "ledger.md"),
+			},
+		},
+	}
+
+	if err := Prepare(cfg); err != nil {
+		t.Fatalf("Prepare() error = %v, want nil", err)
+	}
+	if got := cfg.Projects["alpha"].Slug; got != "alpha" {
+		t.Fatalf("projects.alpha.slug = %q, want alpha", got)
+	}
+}
+
+func TestPrepareRejectsInvalidProjectSlugs(t *testing.T) {
+	for _, slug := range []string{"alpha/beta", "..", "alpha beta", "alpha\nbeta"} {
+		t.Run(strconv.Quote(slug), func(t *testing.T) {
+			repoPath := initConfigTestRepo(t)
+			cfg := configWithProjectPaths(t, slug, repoPath, mkdirConfigTestDir(t, "worktrees"), filepath.Join(repoPath, "tasks", "ledger.md"))
+
+			err := Prepare(cfg)
+			if err == nil {
+				t.Fatal("Prepare() error = nil, want invalid project slug")
+			}
+			if !strings.Contains(err.Error(), "slug") || !strings.Contains(err.Error(), "must match") {
+				t.Fatalf("Prepare() error = %v, want project slug guidance", err)
+			}
+		})
+	}
+}
+
+func TestPrepareRejectsInvalidProjectMapKey(t *testing.T) {
+	repoPath := initConfigTestRepo(t)
+	cfg := &Config{
+		Runtime: RuntimeConfig{WorktreeBase: mkdirConfigTestDir(t, "worktrees")},
+		Projects: map[string]ProjectConfig{
+			"alpha/beta": {
+				RepoPath:     repoPath,
+				WorktreeBase: mkdirConfigTestDir(t, "project-worktrees"),
+				LedgerPath:   filepath.Join(repoPath, "tasks", "ledger.md"),
+			},
+		},
+	}
+
+	err := Prepare(cfg)
+	if err == nil {
+		t.Fatal("Prepare() error = nil, want invalid project map key")
+	}
+	if !strings.Contains(err.Error(), "projects slug key") || !strings.Contains(err.Error(), "must match") {
+		t.Fatalf("Prepare() error = %v, want project map key guidance", err)
+	}
+}
+
+func TestPrepareRejectsProjectSlugKeyMismatch(t *testing.T) {
+	repoPath := initConfigTestRepo(t)
+	cfg := &Config{
+		Runtime: RuntimeConfig{WorktreeBase: mkdirConfigTestDir(t, "worktrees")},
+		Projects: map[string]ProjectConfig{
+			"alpha": {
+				Slug:         "beta",
+				RepoPath:     repoPath,
+				WorktreeBase: mkdirConfigTestDir(t, "project-worktrees"),
+				LedgerPath:   filepath.Join(repoPath, "tasks", "ledger.md"),
+			},
+		},
+	}
+
+	err := Prepare(cfg)
+	if err == nil {
+		t.Fatal("Prepare() error = nil, want project slug key mismatch")
+	}
+	if !strings.Contains(err.Error(), "must match project key") {
+		t.Fatalf("Prepare() error = %v, want project slug key mismatch guidance", err)
+	}
+}
+
 func TestPrepareRejectsNonGitRepoPath(t *testing.T) {
 	repoPath := mkdirConfigTestDir(t, "not-git")
 	cfg := configWithProjectPaths(t, "alpha", repoPath, mkdirConfigTestDir(t, "worktrees"), filepath.Join(repoPath, "tasks", "ledger.md"))
@@ -368,16 +484,18 @@ func TestPrepareRejectsRelativeWorktreeBase(t *testing.T) {
 	}
 }
 
-func TestPrepareRejectsGeneratedWorktreeTraversal(t *testing.T) {
-	repoPath := initConfigTestRepo(t)
-	cfg := configWithProjectPaths(t, "../escape", repoPath, mkdirConfigTestDir(t, "worktrees"), filepath.Join(repoPath, "tasks", "ledger.md"))
+func TestProjectWorktreePathRejectsGeneratedTraversal(t *testing.T) {
+	project := ProjectConfig{
+		Slug:         "alpha",
+		WorktreeBase: mkdirConfigTestDir(t, "worktrees"),
+	}
 
-	err := Prepare(cfg)
+	_, err := ProjectWorktreePath(project, "task-000/../../escape")
 	if err == nil {
-		t.Fatal("Prepare() error = nil, want generated worktree containment rejection")
+		t.Fatal("ProjectWorktreePath() error = nil, want generated worktree containment rejection")
 	}
 	if !strings.Contains(err.Error(), "generated worktree path") || !strings.Contains(err.Error(), "worktree_base") {
-		t.Fatalf("Prepare() error = %v, want generated worktree containment guidance", err)
+		t.Fatalf("ProjectWorktreePath() error = %v, want generated worktree containment guidance", err)
 	}
 }
 
@@ -495,6 +613,47 @@ projects:
 	}
 	if got, want := cfg.Projects["beta"].LedgerPath, filepath.Join(canonicalConfigTestPath(t, betaRepo), "tasks", "ledger.md"); got != want {
 		t.Fatalf("beta LedgerPath = %q, want %q", got, want)
+	}
+}
+
+func TestLoadRejectsInvalidProjectSlug(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	repoPath := initConfigTestRepo(t)
+	worktreeBase := mkdirConfigTestDir(t, "worktrees")
+	yaml := fmt.Sprintf(`
+server:
+  allow_unsafe_no_auth: true
+runtime:
+  tmux_session: ccx-t2-test
+  worktree_base: %s
+project:
+  slug: alpha/beta
+  repo_path: %s
+`, worktreeBase, repoPath)
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("Load() error = nil, want invalid project slug")
+	}
+	if !strings.Contains(err.Error(), "slug") || !strings.Contains(err.Error(), "must match") {
+		t.Fatalf("Load() error = %v, want project slug guidance", err)
+	}
+}
+
+func TestSaveRejectsInvalidProjectSlug(t *testing.T) {
+	repoPath := initConfigTestRepo(t)
+	cfg := configWithProjectPaths(t, "alpha beta", repoPath, mkdirConfigTestDir(t, "worktrees"), filepath.Join(repoPath, "tasks", "ledger.md"))
+
+	err := Save(filepath.Join(t.TempDir(), "config.yaml"), cfg)
+	if err == nil {
+		t.Fatal("Save() error = nil, want invalid project slug")
+	}
+	if !strings.Contains(err.Error(), "slug") || !strings.Contains(err.Error(), "must match") {
+		t.Fatalf("Save() error = %v, want project slug guidance", err)
 	}
 }
 
