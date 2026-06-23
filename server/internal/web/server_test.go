@@ -250,7 +250,9 @@ func TestProjectLedgerWebSocketNotificationsStayProjectScoped(t *testing.T) {
 		if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
 			t.Fatalf("%s SetReadDeadline: %v", label, err)
 		}
-		defer conn.SetReadDeadline(time.Time{})
+		defer func() {
+			_ = conn.SetReadDeadline(time.Time{})
+		}()
 		var changed wsMessage
 		if err := conn.ReadJSON(&changed); err != nil {
 			t.Fatalf("%s ReadJSON changed: %v", label, err)
