@@ -1086,6 +1086,31 @@ func TestBuildHarnessLaunchCommandExpandsSecretEnvInHarnessArg(t *testing.T) {
 	}
 }
 
+func TestBuildPromptInstructsExplicitHarnessWhenMultipleWorkersConfigured(t *testing.T) {
+	l, cfg := newTestDeps(t)
+	cfg.WorkerHarnesses = []string{"worker", "alt"}
+	cfg.Harnesses["alt"] = config.HarnessConfig{
+		Command: "sh",
+		McpArgs: "-c {url} {secret}",
+	}
+	o := New(l, cfg, "proj", "http://localhost:8080")
+
+	prompt, err := o.buildPrompt("test")
+	if err != nil {
+		t.Fatalf("buildPrompt: %v", err)
+	}
+	for _, want := range []string{
+		"Before calling spawn_worker, call list_harnesses",
+		"if it returns multiple worker harnesses, pass the selected harness explicitly in spawn_worker",
+		`"name": "worker"`,
+		`"name": "alt"`,
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt missing %q:\n%s", want, prompt)
+		}
+	}
+}
+
 func newTestDeps(t *testing.T) (*ledger.Ledger, *config.Config) {
 	t.Helper()
 	dir := t.TempDir()
