@@ -464,6 +464,10 @@ func TestHandleSpawnWorkerRejectsBranchWithoutTaskID(t *testing.T) {
 				RepoPath:     dir,
 				WorktreeBase: filepath.Join(dir, "worktrees"),
 			},
+			WorkerHarnesses: []string{"sh"},
+			Harnesses: map[string]config.HarnessConfig{
+				"sh": {Command: "sh", McpArgs: "--mcp-url {url}"},
+			},
 		},
 	}
 
@@ -623,6 +627,192 @@ func TestHandleSpawnWorkerRejectsMalformedFileLists(t *testing.T) {
 				t.Fatalf("task changed after malformed %s rejection: %#v", tc.field, tasks)
 			}
 		})
+	}
+}
+
+func TestHandleSpawnWorkerDefaultsOmittedSingleHarness(t *testing.T) {
+	dir := t.TempDir()
+	l := ledger.NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
+	if err := l.Add(ledger.Task{ID: "task-001", Title: "Task", Status: "unstarted"}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	deps := testMCPDeps(dir, l)
+	var createWindowCalled bool
+	var sentKeys []string
+	deps.spawn = spawnWorkerOps{
+		validateBranchName:       func(context.Context, string) error { return nil },
+		ensureBranchCreationSafe: func(context.Context, string, string) error { return nil },
+		headRef:                  func(context.Context, string) (string, error) { return "abc123", nil },
+		createWorktree:           func(context.Context, string, string, string, string) error { return nil },
+		createWindow: func(context.Context, string, string, string) error {
+			createWindowCalled = true
+			return nil
+		},
+		sendKeys: func(_ context.Context, _, _ string, keys string) error {
+			sentKeys = append(sentKeys, keys)
+			return nil
+		},
+		waitForHarnessProcess: func(context.Context, string, string, time.Duration) error { return nil },
+	}
+
+	if _, err := handleSpawnWorker(deps)(context.Background(), map[string]any{
+		"task_id":       "task-001",
+		"branch":        "feature/task-001-work",
+		"allowed_files": []any{"server/internal/mcp"},
+	}); err != nil {
+		t.Fatalf("handleSpawnWorker: %v", err)
+	}
+	if !createWindowCalled || len(sentKeys) != 2 {
+		t.Fatalf("createWindow=%v sentKeys=%d, want true/2", createWindowCalled, len(sentKeys))
+	}
+	tasks, err := l.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(tasks) != 1 || tasks[0].Status != "in_progress" || tasks[0].Harness != "sh" {
+		t.Fatalf("task after spawn = %#v, want in_progress sh", tasks)
+	}
+	info, ok := deps.Registry.Get("worker-task-001")
+	if !ok || info.Harness != "sh" {
+		t.Fatalf("registry info = %#v/%v, want sh harness", info, ok)
+	}
+}
+
+func TestHandleSpawnWorkerFailedHarnessSelectionDoesNotMutateResources(t *testing.T) {
+	cases := []struct {
+		name      string
+		configure func(*config.Config)
+		harness   any
+		wantErr   []string
+	}{
+		{
+			name: "missing with multiple harnesses",
+			configure: func(cfg *config.Config) {
+				cfg.WorkerHarnesses = []string{"sh", "alt"}
+				cfg.Harnesses["alt"] = config.HarnessConfig{Command: "sh", McpArgs: "--mcp-url {url}"}
+			},
+			wantErr: []string{"harness argument required", "list_harnesses", "spawn_worker"},
+		},
+		{
+			name: "explicit unavailable harness",
+			configure: func(cfg *config.Config) {
+				cfg.WorkerHarnesses = []string{"missing"}
+				cfg.Harnesses = map[string]config.HarnessConfig{
+					"missing": {Command: "/definitely/missing/ccx-t2-harness", McpArgs: "--mcp-url {url}"},
+				}
+			},
+			harness: "missing",
+			wantErr: []string{"harness \"missing\" binary", "not found in PATH"},
+		},
+		{
+			name: "explicit non-allowlisted harness",
+			configure: func(cfg *config.Config) {
+				cfg.Harnesses["other"] = config.HarnessConfig{Command: "sh", McpArgs: "--mcp-url {url}"}
+			},
+			harness: "other",
+			wantErr: []string{`harness "other" is not in worker_harnesses`},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			l := ledger.NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
+			if err := l.Add(ledger.Task{ID: "task-001", Title: "Task", Status: "unstarted"}); err != nil {
+				t.Fatalf("Add: %v", err)
+			}
+			deps := testMCPDeps(dir, l)
+			tc.configure(deps.Config)
+			called := false
+			recordCall := func(string) error {
+				called = true
+				return nil
+			}
+			deps.spawn = spawnWorkerOps{
+				validateBranchName: func(context.Context, string) error {
+					return recordCall("validateBranchName")
+				},
+				ensureBranchCreationSafe: func(context.Context, string, string) error {
+					return recordCall("ensureBranchCreationSafe")
+				},
+				headRef: func(context.Context, string) (string, error) {
+					called = true
+					return "", nil
+				},
+				createWorktree: func(context.Context, string, string, string, string) error {
+					return recordCall("createWorktree")
+				},
+				createWindow: func(context.Context, string, string, string) error {
+					return recordCall("createWindow")
+				},
+				sendKeys: func(context.Context, string, string, string) error {
+					return recordCall("sendKeys")
+				},
+			}
+			args := map[string]any{
+				"task_id":       "task-001",
+				"branch":        "feature/task-001-work",
+				"allowed_files": []any{"server/internal/mcp"},
+			}
+			if tc.harness != nil {
+				args["harness"] = tc.harness
+			}
+
+			_, err := handleSpawnWorker(deps)(context.Background(), args)
+			if err == nil {
+				t.Fatal("handleSpawnWorker error = nil, want harness selection error")
+			}
+			for _, want := range tc.wantErr {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("handleSpawnWorker error = %q, want %q", err, want)
+				}
+			}
+			if called {
+				t.Fatal("spawn_worker touched branch/worktree/tmux resources before harness selection failed")
+			}
+			tasks, err := l.Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if len(tasks) != 1 || tasks[0].Status != "unstarted" || tasks[0].Branch != "" || tasks[0].WorkerID != "" || tasks[0].Harness != "" {
+				t.Fatalf("task changed after harness selection rejection: %#v", tasks)
+			}
+			if _, ok := deps.Registry.Get("worker-task-001"); ok {
+				t.Fatal("worker registered after harness selection rejection")
+			}
+		})
+	}
+}
+
+func TestHandleSpawnWorkerRejectsMalformedHarnessWithoutMutation(t *testing.T) {
+	dir := t.TempDir()
+	l := ledger.NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
+	if err := l.Add(ledger.Task{ID: "task-001", Title: "Task", Status: "unstarted"}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	deps := testMCPDeps(dir, l)
+	deps.spawn = spawnWorkerOps{
+		validateBranchName: func(context.Context, string) error {
+			t.Fatal("validateBranchName called after malformed harness")
+			return nil
+		},
+	}
+
+	_, err := handleSpawnWorker(deps)(context.Background(), map[string]any{
+		"task_id":       "task-001",
+		"branch":        "feature/task-001-work",
+		"allowed_files": []any{"server/internal/mcp"},
+		"harness":       float64(123),
+	})
+	if err == nil || !strings.Contains(err.Error(), `argument "harness" must be a string`) {
+		t.Fatalf("handleSpawnWorker error = %v, want harness string error", err)
+	}
+	tasks, err := l.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(tasks) != 1 || tasks[0].Status != "unstarted" || tasks[0].Branch != "" || tasks[0].WorkerID != "" || tasks[0].Harness != "" {
+		t.Fatalf("task changed after malformed harness rejection: %#v", tasks)
 	}
 }
 
@@ -2161,6 +2351,10 @@ func testMCPDeps(dir string, l *ledger.Ledger) *Deps {
 				Slug:         "proj",
 				RepoPath:     dir,
 				WorktreeBase: dir,
+			},
+			WorkerHarnesses: []string{"sh"},
+			Harnesses: map[string]config.HarnessConfig{
+				"sh": {Command: "sh", McpArgs: "--mcp-url {url}"},
 			},
 		},
 		Session: "missing-session",

@@ -278,7 +278,7 @@ func RegisterOrchestratorTools(s *Server, deps *Deps) {
 			"branch":          prop("string", "Git branch name"),
 			"allowed_files":   arrayProp("string", "Paths the worker may edit (required, >= 1)"),
 			"forbidden_files": arrayProp("string", "Paths the worker must not edit"),
-			"harness":         prop("string", "Harness name (optional if only one worker_harness)"),
+			"harness":         prop("string", "Harness name. Required when list_harnesses returns multiple worker harnesses; optional only when exactly one worker_harness is configured."),
 		}), []string{"task_id", "branch", "allowed_files"}),
 	}, handleSpawnWorker(deps))
 
@@ -821,7 +821,26 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 		if err != nil {
 			return nil, fmt.Errorf("forbidden_files: %w", err)
 		}
-		harnessName := optionalStringArg(args, "harness")
+		harnessName, err := optionalHarnessArg(args)
+		if err != nil {
+			return nil, err
+		}
+
+		// Resolve harness before branch/worktree/tmux/ledger mutation so a
+		// missing or invalid harness argument leaves no external resources behind.
+		resolvedHarness, hCfg, err := harness.Resolve(toolDeps.Config, harnessName)
+		if err != nil {
+			return nil, err
+		}
+
+		// Validate mcp_args shell syntax and split into tokens before any state mutation.
+		// Split the *template* before expanding {url}/{secret} so that the expanded
+		// values (which may contain spaces or other shell metacharacters) are treated
+		// as atomic tokens. Each token then has its placeholders substituted individually.
+		mcpTokens, err := buildMCPTokens(hCfg.McpArgs, toolDeps.BaseURL+"/mcp/worker", toolDeps.Config.Server.McpSecret)
+		if err != nil {
+			return nil, fmt.Errorf("invalid mcp_args shell syntax: %w", err)
+		}
 
 		// Preflight checks.
 		tasks, err := toolDeps.Ledger.Load()
@@ -854,21 +873,6 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 		}
 		if !worktree.BranchMatchesTaskID(branch, taskID) {
 			return nil, fmt.Errorf("branch %q must include task_id %q as a path or delimiter-bounded segment", branch, taskID)
-		}
-
-		// Resolve harness.
-		resolvedHarness, hCfg, err := harness.Resolve(toolDeps.Config, harnessName)
-		if err != nil {
-			return nil, err
-		}
-
-		// Validate mcp_args shell syntax and split into tokens before any state mutation.
-		// Split the *template* before expanding {url}/{secret} so that the expanded
-		// values (which may contain spaces or other shell metacharacters) are treated
-		// as atomic tokens. Each token then has its placeholders substituted individually.
-		mcpTokens, err := buildMCPTokens(hCfg.McpArgs, toolDeps.BaseURL+"/mcp/worker", toolDeps.Config.Server.McpSecret)
-		if err != nil {
-			return nil, fmt.Errorf("invalid mcp_args shell syntax: %w", err)
 		}
 
 		if err := ops.ensureBranchCreationSafe(spawnCtx, toolDeps.Config.Project.RepoPath, branch); err != nil {
@@ -1562,6 +1566,18 @@ func fileListArg(args map[string]any, key string) ([]string, error) {
 		return nil, fmt.Errorf("argument %q must be an array of strings", key)
 	}
 	return stringSliceArg(args, key)
+}
+
+func optionalHarnessArg(args map[string]any) (string, error) {
+	v, ok := args["harness"]
+	if !ok {
+		return "", nil
+	}
+	s, ok := v.(string)
+	if !ok {
+		return "", fmt.Errorf("argument %q must be a string", "harness")
+	}
+	return s, nil
 }
 
 func workerIDFor(deps *Deps, taskID string) string {

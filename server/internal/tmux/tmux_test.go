@@ -5,7 +5,9 @@ import (
 	"errors"
 	"os/exec"
 	"reflect"
+	"strings"
 	"testing"
+	"time"
 )
 
 type tmuxTestContextKey struct{}
@@ -31,9 +33,29 @@ func TestCreateWindowContextUsesCommandContext(t *testing.T) {
 	if gotCtx != ctx {
 		t.Fatal("CreateWindowContext did not pass caller context to tmux command")
 	}
-	wantArgs := []string{"new-window", "-t", "session", "-n", "worker-task-001", "-c", "/tmp/worktree"}
+	wantArgs := []string{"new-window", "-t", "session:", "-n", "worker-task-001", "-c", "/tmp/worktree"}
 	if gotName != "tmux" || !reflect.DeepEqual(gotArgs, wantArgs) {
 		t.Fatalf("command = %s %#v, want tmux %#v", gotName, gotArgs, wantArgs)
+	}
+}
+
+func TestCreateWindowContextUsesNextAvailableIndexWithOccupiedAdjacentWindows(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skipf("tmux not installed: %v", err)
+	}
+	session := "ccx-tmux-create-window-" + strings.ReplaceAll(time.Now().Format("150405.000000000"), ".", "")
+	if err := exec.Command("tmux", "new-session", "-d", "-s", session, "-n", "occupied-0").Run(); err != nil {
+		t.Fatalf("create test session: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = exec.Command("tmux", "kill-session", "-t", session).Run()
+	})
+	if err := exec.Command("tmux", "new-window", "-t", session+":1", "-n", "occupied-1").Run(); err != nil {
+		t.Fatalf("create occupied adjacent window: %v", err)
+	}
+
+	if err := CreateWindowContext(context.Background(), session, "worker-task-001", t.TempDir()); err != nil {
+		t.Fatalf("CreateWindowContext with occupied adjacent indexes: %v", err)
 	}
 }
 
