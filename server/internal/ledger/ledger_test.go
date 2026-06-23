@@ -116,6 +116,48 @@ Body without closing separator`
 	}
 }
 
+func TestPathMatchesSupportsDoubleStarDirectorySuffix(t *testing.T) {
+	cases := []struct {
+		name    string
+		pattern string
+		file    string
+		want    bool
+	}{
+		{
+			name:    "matches child file",
+			pattern: "server/internal/mcp/**",
+			file:    "server/internal/mcp/handlers.go",
+			want:    true,
+		},
+		{
+			name:    "matches nested child file",
+			pattern: "server/internal/mcp/**",
+			file:    "server/internal/mcp/testdata/input.json",
+			want:    true,
+		},
+		{
+			name:    "keeps directory boundary",
+			pattern: "server/internal/mcp/**",
+			file:    "server/internal/mcpfoo/handlers.go",
+			want:    false,
+		},
+		{
+			name:    "normalizes backslashes",
+			pattern: `server\internal\mcp\**`,
+			file:    "server/internal/mcp/handlers.go",
+			want:    true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := PathMatches(tc.pattern, tc.file); got != tc.want {
+				t.Fatalf("PathMatches(%q, %q) = %v, want %v", tc.pattern, tc.file, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestParseUnclosedFrontMatterReturnsError(t *testing.T) {
 	content := `---
 id: task-001

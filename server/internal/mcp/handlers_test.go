@@ -1708,6 +1708,257 @@ func TestHandleNotifyCompletedRejectsMissingCompletionEvidence(t *testing.T) {
 	}
 }
 
+func TestHandleNotifyCompletedAcceptsAllowedGitHubFiles(t *testing.T) {
+	dir := t.TempDir()
+	l := ledger.NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
+	if err := l.Add(ledger.Task{
+		ID:             "task-001",
+		Title:          "Task",
+		Status:         "in_progress",
+		Branch:         "feature/task-001",
+		WorkerID:       "worker-current",
+		AllowedFiles:   []string{"server/internal/mcp/**"},
+		ForbiddenFiles: []string{"server/internal/mcp/legacy.go"},
+		Body:           "current body",
+	}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	deps := testMCPDeps(dir, l)
+	deps.GitHub = githubFilesClientForTest(t, []string{"server/internal/mcp/handlers.go"})
+
+	if _, err := handleNotify(deps)(context.Background(), map[string]any{
+		"type": "completed",
+		"payload": map[string]any{
+			"task_id":      "task-001",
+			"worker_id":    "worker-current",
+			"pr_url":       "https://github.com/octo/hello/pull/123",
+			"merge_commit": "abc123def456",
+		},
+	}); err != nil {
+		t.Fatalf("handleNotify completed: %v", err)
+	}
+	tasks, err := l.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(tasks) != 1 || tasks[0].Status != "completed" || tasks[0].WorkerID != "" {
+		t.Fatalf("task after allowed completion = %#v, want completed with cleared worker", tasks)
+	}
+}
+
+func TestHandleNotifyCompletedRejectsForbiddenGitHubFiles(t *testing.T) {
+	dir := t.TempDir()
+	l := ledger.NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
+	if err := l.Add(ledger.Task{
+		ID:             "task-001",
+		Title:          "Task",
+		Status:         "in_progress",
+		Branch:         "feature/task-001",
+		WorkerID:       "worker-current",
+		AllowedFiles:   []string{"server/internal/mcp/**"},
+		ForbiddenFiles: []string{"server/internal/mcp/legacy.go"},
+		Body:           "current body",
+	}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	deps := testMCPDeps(dir, l)
+	deps.GitHub = githubFilesClientForTest(t, []string{"server/internal/mcp/legacy.go"})
+
+	_, err := handleNotify(deps)(context.Background(), map[string]any{
+		"type": "completed",
+		"payload": map[string]any{
+			"task_id":      "task-001",
+			"worker_id":    "worker-current",
+			"pr_url":       "https://github.com/octo/hello/pull/123",
+			"merge_commit": "abc123def456",
+		},
+	})
+	if err == nil {
+		t.Fatal("handleNotify completed error = nil, want forbidden file contract error")
+	}
+	if !strings.Contains(err.Error(), "forbidden files changed: server/internal/mcp/legacy.go") {
+		t.Fatalf("handleNotify completed error = %v, want forbidden file path", err)
+	}
+	tasks, err := l.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(tasks) != 1 || tasks[0].Status != "in_progress" || tasks[0].PrURL != "" || strings.Contains(tasks[0].Body, "merge_commit") {
+		t.Fatalf("task changed after forbidden contract rejection: %#v", tasks)
+	}
+}
+
+func TestHandleNotifyCompletedRejectsOutsideAllowedGitHubFilesWithoutMutationOrCleanup(t *testing.T) {
+	dir := t.TempDir()
+	l := ledger.NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
+	if err := l.Add(ledger.Task{
+		ID:           "task-001",
+		Title:        "Task",
+		Status:       "in_progress",
+		Branch:       "feature/task-001",
+		WorkerID:     "worker-current",
+		Harness:      "codex",
+		AllowedFiles: []string{"server/internal/mcp/**"},
+		Body:         "current body",
+	}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	deps := testMCPDeps(dir, l)
+	deps.GitHub = githubFilesClientForTest(t, []string{"server/internal/github/github.go"})
+	deps.Registry.Register(worker.Info{TaskID: "task-001", WorkerID: "worker-current", Harness: "codex"})
+	var cleanupCalls int
+	deps.cleanup = workerCleanupOps{
+		isWindowAlive:    func(_, _ string) (bool, error) { cleanupCalls++; return false, nil },
+		killWindow:       func(_, _ string) error { cleanupCalls++; return nil },
+		removeWorktree:   func(_, _ string) error { cleanupCalls++; return nil },
+		deleteTaskBranch: func(_, _, _ string) error { cleanupCalls++; return nil },
+	}
+
+	_, err := handleNotify(deps)(context.Background(), map[string]any{
+		"type": "completed",
+		"payload": map[string]any{
+			"task_id":      "task-001",
+			"worker_id":    "worker-current",
+			"pr_url":       "https://github.com/octo/hello/pull/123",
+			"merge_commit": "abc123def456",
+		},
+	})
+	if err == nil {
+		t.Fatal("handleNotify completed error = nil, want outside allowed file contract error")
+	}
+	if !strings.Contains(err.Error(), "files outside allowed_files: server/internal/github/github.go") {
+		t.Fatalf("handleNotify completed error = %v, want outside allowed path", err)
+	}
+	if cleanupCalls != 0 {
+		t.Fatalf("cleanup calls = %d, want 0 before contract rejection", cleanupCalls)
+	}
+	if _, ok := deps.Registry.Get("worker-current"); !ok {
+		t.Fatal("registry entry removed after contract rejection")
+	}
+	tasks, err := l.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("tasks = %#v, want one task", tasks)
+	}
+	got := tasks[0]
+	if got.Status != "in_progress" || got.WorkerID != "worker-current" || got.Harness != "codex" ||
+		got.PrURL != "" || got.Reason != "" || got.Body != "current body" {
+		t.Fatalf("task changed after outside allowed contract rejection: %#v", got)
+	}
+}
+
+func TestHandleNotifyCompletedRejectsContractChangeUnderLedgerLock(t *testing.T) {
+	dir := t.TempDir()
+	l := ledger.NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
+	if err := l.Add(ledger.Task{
+		ID:           "task-001",
+		Title:        "Task",
+		Status:       "in_progress",
+		Branch:       "feature/task-001",
+		WorkerID:     "worker-current",
+		AllowedFiles: []string{"server/internal/mcp/**"},
+		Body:         "current body",
+	}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	deps := testMCPDeps(dir, l)
+	deps.GitHub = githubFilesClientForTest(t, []string{"server/internal/mcp/handlers.go"})
+	var cleanupCalls int
+	deps.cleanup = workerCleanupOps{
+		isWindowAlive:    func(_, _ string) (bool, error) { cleanupCalls++; return false, nil },
+		killWindow:       func(_, _ string) error { cleanupCalls++; return nil },
+		removeWorktree:   func(_, _ string) error { cleanupCalls++; return nil },
+		deleteTaskBranch: func(_, _, _ string) error { cleanupCalls++; return nil },
+	}
+	deps.notifyAfterOwnershipPreflight = func() {
+		if _, err := l.UpdateIfStatusesReturnPrev("task-001", []string{"in_progress", "blocked"}, map[string]any{
+			"allowed_files": []string{"server/internal/github/**"},
+		}); err != nil {
+			t.Fatalf("contract-change setup update: %v", err)
+		}
+	}
+
+	_, err := handleNotify(deps)(context.Background(), map[string]any{
+		"type": "completed",
+		"payload": map[string]any{
+			"task_id":      "task-001",
+			"worker_id":    "worker-current",
+			"pr_url":       "https://github.com/octo/hello/pull/123",
+			"merge_commit": "abc123def456",
+		},
+	})
+	if err == nil {
+		t.Fatal("handleNotify completed error = nil, want contract changed error")
+	}
+	if !strings.Contains(err.Error(), "file contract changed during notify(completed)") {
+		t.Fatalf("handleNotify completed error = %v, want contract changed error", err)
+	}
+	if cleanupCalls != 0 {
+		t.Fatalf("cleanup calls = %d, want 0 after contract change rejection", cleanupCalls)
+	}
+	tasks, err := l.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	got := tasks[0]
+	if got.Status != "in_progress" || got.WorkerID != "worker-current" || got.PrURL != "" ||
+		got.Body != "current body" || !reflect.DeepEqual(got.AllowedFiles, []string{"server/internal/github/**"}) {
+		t.Fatalf("task after contract change rejection = %#v, want in-progress task with updated contract only", got)
+	}
+}
+
+func TestHandleNotifyCompletedAcceptsAllowedLocalBranchDiff(t *testing.T) {
+	repoPath := initTestRepo(t)
+	runGit(t, repoPath, "checkout", "-b", "feature/task-001")
+	if err := os.MkdirAll(filepath.Join(repoPath, "server", "internal", "mcp"), 0o755); err != nil {
+		t.Fatalf("MkdirAll mcp dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoPath, "server", "internal", "mcp", "handlers.go"), []byte("package mcp\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	runGit(t, repoPath, "add", "server/internal/mcp/handlers.go")
+	runGit(t, repoPath, "commit", "-m", "task change")
+	runGit(t, repoPath, "checkout", "main")
+
+	dir := t.TempDir()
+	l := ledger.NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
+	if err := l.Add(ledger.Task{
+		ID:           "task-001",
+		Title:        "Task",
+		Status:       "in_progress",
+		Branch:       "feature/task-001",
+		WorkerID:     "worker-current",
+		AllowedFiles: []string{"server/internal/mcp/**"},
+		Body:         "current body",
+	}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	deps := testMCPDeps(dir, l)
+	deps.Config.Project.RepoPath = repoPath
+	deps.Config.Project.WorktreeBase = dir
+
+	if _, err := handleNotify(deps)(context.Background(), map[string]any{
+		"type": "completed",
+		"payload": map[string]any{
+			"task_id":      "task-001",
+			"worker_id":    "worker-current",
+			"pr_url":       "https://example.test/pull/123",
+			"merge_commit": "abc123def456",
+		},
+	}); err != nil {
+		t.Fatalf("handleNotify completed: %v", err)
+	}
+	tasks, err := l.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(tasks) != 1 || tasks[0].Status != "completed" || tasks[0].WorkerID != "" {
+		t.Fatalf("task after local fallback completion = %#v, want completed with cleared worker", tasks)
+	}
+}
+
 func TestHandleNotifyBlockedRejectsStaleWorkerIDUnderLedgerLock(t *testing.T) {
 	testHandleNotifyRejectsStaleWorkerID(t, "blocked", map[string]any{
 		"reason": "blocked",
@@ -2368,6 +2619,51 @@ func testMCPDeps(dir string, l *ledger.Ledger) *Deps {
 		Session: "missing-session",
 		cleanup: successfulCleanupOps(),
 	}
+}
+
+func githubFilesClientForTest(t *testing.T, files []string) *githubpkg.Client {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer test-token" {
+			t.Errorf("Authorization = %q, want Bearer test-token", got)
+			http.Error(w, "bad auth", http.StatusUnauthorized)
+			return
+		}
+		if r.URL.Path != "/repos/octo/hello/pulls/123/files" {
+			t.Errorf("unexpected path %s", r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method != http.MethodGet {
+			t.Errorf("files method = %s, want GET", r.Method)
+			http.Error(w, "bad method", http.StatusMethodNotAllowed)
+			return
+		}
+		if got := r.URL.Query().Get("per_page"); got != "100" {
+			t.Errorf("per_page = %q, want 100", got)
+			http.Error(w, "bad per_page", http.StatusBadRequest)
+			return
+		}
+		resp := make([]map[string]string, 0, len(files))
+		for _, file := range files {
+			resp = append(resp, map[string]string{"filename": file})
+		}
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			t.Fatalf("Encode files response: %v", err)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	client, err := githubpkg.NewClient(
+		"test-token",
+		"octo",
+		"hello",
+		githubpkg.WithBaseURL(srv.URL),
+		githubpkg.WithHTTPClient(testutil.LocalOnlyHTTPClient(t, srv)),
+	)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	return client
 }
 
 func callMCPToolForTest(t *testing.T, s *Server, name string, args map[string]any) map[string]any {

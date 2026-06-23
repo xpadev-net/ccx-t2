@@ -161,6 +161,29 @@ func (c *Client) GetPRStatus(ctx context.Context, prNumber int) (*PRStatus, erro
 	}, nil
 }
 
+// ListPRFiles returns the repository paths changed by a pull request.
+func (c *Client) ListPRFiles(ctx context.Context, prNumber int) ([]string, error) {
+	opts := &gh.ListOptions{PerPage: 100}
+	var files []string
+	for {
+		page, resp, err := c.client.PullRequests.ListFiles(ctx, c.owner, c.repo, prNumber, opts)
+		if err != nil {
+			return nil, fmt.Errorf("list PR files: %w", err)
+		}
+		for _, file := range page {
+			files = append(files, file.GetFilename())
+			if previous := file.GetPreviousFilename(); previous != "" {
+				files = append(files, previous)
+			}
+		}
+		if resp.NextPage == 0 {
+			break
+		}
+		opts.Page = resp.NextPage
+	}
+	return files, nil
+}
+
 func normalizeCheckStatus(run *gh.CheckRun) CheckStatus {
 	conclusion := run.GetConclusion()
 	status := run.GetStatus()

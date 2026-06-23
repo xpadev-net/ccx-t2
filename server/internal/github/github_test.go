@@ -189,6 +189,78 @@ func TestGetPRStatusWrapsCheckRunAPIError(t *testing.T) {
 	}
 }
 
+func TestListPRFilesFetchesPaginatedFiles(t *testing.T) {
+	var fileRequests []string
+	var srv *httptest.Server
+	srv = httptest.NewServer(assertBearerToken(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repos/octo/hello/pulls/42/files" {
+			t.Errorf("unexpected path %s", r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method != http.MethodGet {
+			t.Errorf("files method = %s, want GET", r.Method)
+			http.Error(w, "bad method", http.StatusMethodNotAllowed)
+			return
+		}
+		if got := r.URL.Query().Get("per_page"); got != "100" {
+			t.Errorf("per_page = %q, want 100", got)
+			http.Error(w, "bad per_page", http.StatusBadRequest)
+			return
+		}
+		fileRequests = append(fileRequests, r.URL.RawQuery)
+		switch r.URL.Query().Get("page") {
+		case "":
+			w.Header().Set("Link", fmt.Sprintf(`<%s/repos/octo/hello/pulls/42/files?per_page=100&page=2>; rel="next"`, srv.URL))
+			fmt.Fprint(w, `[
+				{"filename": "server/internal/mcp/handlers.go"}
+			]`)
+		case "2":
+			fmt.Fprint(w, `[
+				{
+					"filename": "server/internal/github/github.go",
+					"previous_filename": "server/internal/github/old.go"
+				}
+			]`)
+		default:
+			t.Errorf("unexpected files page query %q", r.URL.RawQuery)
+			http.Error(w, "bad page", http.StatusBadRequest)
+		}
+	})))
+	t.Cleanup(srv.Close)
+
+	client := newTestClient(t, srv)
+	files, err := client.ListPRFiles(context.Background(), 42)
+	if err != nil {
+		t.Fatalf("ListPRFiles() error = %v", err)
+	}
+	if len(fileRequests) != 2 {
+		t.Fatalf("file requests = %#v, want 2 paginated requests", fileRequests)
+	}
+	want := []string{"server/internal/mcp/handlers.go", "server/internal/github/github.go", "server/internal/github/old.go"}
+	if !reflect.DeepEqual(files, want) {
+		t.Fatalf("files = %#v, want %#v", files, want)
+	}
+}
+
+func TestListPRFilesWrapsAPIError(t *testing.T) {
+	srv := httptest.NewServer(assertBearerToken(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repos/octo/hello/pulls/99/files" {
+			t.Errorf("unexpected path %s", r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+		http.Error(w, `{"message":"files unavailable"}`, http.StatusServiceUnavailable)
+	})))
+	t.Cleanup(srv.Close)
+
+	client := newTestClient(t, srv)
+	_, err := client.ListPRFiles(context.Background(), 99)
+	if err == nil || !strings.Contains(err.Error(), "list PR files") {
+		t.Fatalf("ListPRFiles() error = %v, want list PR files context", err)
+	}
+}
+
 func TestNormalizeCheckStatusTreatsNonTerminalStatusesAsPending(t *testing.T) {
 	for _, status := range []string{"queued", "in_progress", "waiting", "requested", "pending"} {
 		t.Run(status, func(t *testing.T) {
