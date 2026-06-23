@@ -56,7 +56,11 @@ func CreateWindow(session, name, startDir string) error {
 // CreateWindowContext creates a new window and aborts command execution when
 // ctx is canceled.
 func CreateWindowContext(ctx context.Context, session, name, startDir string) error {
-	return runCtx(ctx, "tmux", "new-window", "-t", session, "-n", name, "-c", startDir)
+	return runCtx(ctx, "tmux", "new-window", "-t", sessionTarget(session), "-n", name, "-c", startDir)
+}
+
+func sessionTarget(session string) string {
+	return session + ":"
 }
 
 // SendKeys sends keys to a window's pane. The text is sent literally via -l,

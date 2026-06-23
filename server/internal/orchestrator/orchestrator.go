@@ -570,6 +570,7 @@ func (o *Orchestrator) buildPrompt(reason string) (string, error) {
 	}
 	sb.WriteString("Use the MCP tools at /mcp/orchestrator to inspect and mutate state. ")
 	sb.WriteString("Always pass project_slug=\"" + promptLine(o.cfg.Project.Slug) + "\" to project-scoped MCP tools. ")
+	sb.WriteString("Before calling spawn_worker, call list_harnesses; if it returns multiple worker harnesses, pass the selected harness explicitly in spawn_worker. ")
 	sb.WriteString("Decide which unstarted, blocked, or in-progress tasks need action. ")
 	sb.WriteString("Spawn workers for actionable unstarted tasks, archive completed tasks, ")
 	sb.WriteString("stop or follow up workers when appropriate, and create/split/update tasks only through MCP tools.\n\n")
