@@ -215,6 +215,87 @@ func TestProjectPostTaskUsesSelectedProjectRuntimeAndNotifiesLedger(t *testing.T
 	}
 }
 
+func TestProjectLedgerWebSocketNotificationsStayProjectScoped(t *testing.T) {
+	cfg, manager := newTestProjectManager(t, "alpha", "beta")
+	alpha, err := manager.Project("alpha")
+	if err != nil {
+		t.Fatalf("Project alpha: %v", err)
+	}
+	beta, err := manager.Project("beta")
+	if err != nil {
+		t.Fatalf("Project beta: %v", err)
+	}
+	server := httptest.NewServer(New(Deps{Config: cfg, Manager: manager, AuthDisabled: true}))
+	defer server.Close()
+
+	dialProjectLedger := func(slug string) *websocket.Conn {
+		t.Helper()
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL(server.URL, "/ws/projects/"+slug+"/ledger"), nil)
+		if err != nil {
+			t.Fatalf("Dial %s ledger: %v", slug, err)
+		}
+		var ready wsMessage
+		if err := conn.ReadJSON(&ready); err != nil {
+			_ = conn.Close()
+			t.Fatalf("ReadJSON %s ready: %v", slug, err)
+		}
+		if ready.Type != "ready" {
+			_ = conn.Close()
+			t.Fatalf("%s ready message = %#v, want ready", slug, ready)
+		}
+		return conn
+	}
+	assertLedgerChanged := func(conn *websocket.Conn, label string) {
+		t.Helper()
+		if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+			t.Fatalf("%s SetReadDeadline: %v", label, err)
+		}
+		defer conn.SetReadDeadline(time.Time{})
+		var changed wsMessage
+		if err := conn.ReadJSON(&changed); err != nil {
+			t.Fatalf("%s ReadJSON changed: %v", label, err)
+		}
+		if changed.Type != "ledger_changed" {
+			t.Fatalf("%s message = %#v, want ledger_changed", label, changed)
+		}
+	}
+	assertNoLedgerChanged := func(conn *websocket.Conn, label string) {
+		t.Helper()
+		if err := conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond)); err != nil {
+			t.Fatalf("%s SetReadDeadline: %v", label, err)
+		}
+		var msg wsMessage
+		err := conn.ReadJSON(&msg)
+		if err == nil {
+			t.Fatalf("%s received %#v, want no message", label, msg)
+		}
+		var timeoutErr interface{ Timeout() bool }
+		if !errors.As(err, &timeoutErr) || !timeoutErr.Timeout() {
+			t.Fatalf("%s ReadJSON = %v, want timeout", label, err)
+		}
+	}
+
+	alphaConn := dialProjectLedger("alpha")
+	betaConn := dialProjectLedger("beta")
+	if err := alpha.Ledger.Add(ledger.Task{ID: "task-20260101-0001", Title: "Alpha change", Status: "unstarted"}); err != nil {
+		t.Fatalf("Add alpha: %v", err)
+	}
+	assertLedgerChanged(alphaConn, "alpha subscriber after alpha change")
+	assertNoLedgerChanged(betaConn, "beta subscriber after alpha change")
+	_ = alphaConn.Close()
+	_ = betaConn.Close()
+
+	alphaConn = dialProjectLedger("alpha")
+	betaConn = dialProjectLedger("beta")
+	if err := beta.Ledger.Add(ledger.Task{ID: "task-20260101-0002", Title: "Beta change", Status: "unstarted"}); err != nil {
+		t.Fatalf("Add beta: %v", err)
+	}
+	assertLedgerChanged(betaConn, "beta subscriber after beta change")
+	assertNoLedgerChanged(alphaConn, "alpha subscriber after beta change")
+	_ = alphaConn.Close()
+	_ = betaConn.Close()
+}
+
 func TestProjectPostTaskAcceptsNaturalLanguageRequest(t *testing.T) {
 	dir := t.TempDir()
 	cfg := testConfig()
