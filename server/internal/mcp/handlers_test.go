@@ -686,6 +686,14 @@ func TestHandleSpawnWorkerFailedHarnessSelectionDoesNotMutateResources(t *testin
 		wantErr   []string
 	}{
 		{
+			name: "no worker harnesses",
+			configure: func(cfg *config.Config) {
+				cfg.WorkerHarnesses = nil
+				cfg.Harnesses = map[string]config.HarnessConfig{}
+			},
+			wantErr: []string{"no worker_harnesses configured"},
+		},
+		{
 			name: "missing with multiple harnesses",
 			configure: func(cfg *config.Config) {
 				cfg.WorkerHarnesses = []string{"sh", "alt"}

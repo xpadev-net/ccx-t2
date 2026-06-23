@@ -50,12 +50,28 @@ func TestCreateWindowContextUsesNextAvailableIndexWithOccupiedAdjacentWindows(t 
 	t.Cleanup(func() {
 		_ = exec.Command("tmux", "kill-session", "-t", session).Run()
 	})
+	indexOut, err := exec.Command("tmux", "display-message", "-t", session+":", "-p", "#{window_index}").CombinedOutput()
+	if err != nil {
+		t.Fatalf("read initial window index: %v\n%s", err, indexOut)
+	}
+	if strings.TrimSpace(string(indexOut)) != "0" {
+		if err := exec.Command("tmux", "move-window", "-s", session+":", "-t", session+":0").Run(); err != nil {
+			t.Fatalf("move initial window to index 0: %v", err)
+		}
+	}
 	if err := exec.Command("tmux", "new-window", "-t", session+":1", "-n", "occupied-1").Run(); err != nil {
 		t.Fatalf("create occupied adjacent window: %v", err)
 	}
 
 	if err := CreateWindowContext(context.Background(), session, "worker-task-001", t.TempDir()); err != nil {
 		t.Fatalf("CreateWindowContext with occupied adjacent indexes: %v", err)
+	}
+	out, err := exec.Command("tmux", "list-windows", "-t", session, "-F", "#{window_index}:#{window_name}").CombinedOutput()
+	if err != nil {
+		t.Fatalf("list windows: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "2:worker-task-001\n") {
+		t.Fatalf("created window index/name not found in tmux windows:\n%s", out)
 	}
 }
 

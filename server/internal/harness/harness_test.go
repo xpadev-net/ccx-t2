@@ -21,6 +21,18 @@ func TestResolveDefaultsSingleWorkerHarness(t *testing.T) {
 	}
 }
 
+func TestResolveRejectsNoWorkerHarnesses(t *testing.T) {
+	cfg := testConfig(nil, map[string]config.HarnessConfig{})
+
+	_, _, err := Resolve(cfg, "")
+	if err == nil {
+		t.Fatal("Resolve error = nil, want no worker_harnesses error")
+	}
+	if !strings.Contains(err.Error(), "no worker_harnesses configured") {
+		t.Fatalf("Resolve error = %q, want no worker_harnesses error", err)
+	}
+}
+
 func TestResolveRequiresHarnessWhenMultipleWorkerHarnesses(t *testing.T) {
 	cfg := testConfig([]string{"sh", "alt"}, map[string]config.HarnessConfig{
 		"sh":  {Command: "sh", McpArgs: "--mcp-url {url}"},
