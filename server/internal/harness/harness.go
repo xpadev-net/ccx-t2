@@ -44,10 +44,13 @@ func List(cfg *config.Config) []Info {
 // If there are multiple worker harnesses and harnessName is empty, an error is returned.
 func Resolve(cfg *config.Config, harnessName string) (string, config.HarnessConfig, error) {
 	if harnessName == "" {
-		if len(cfg.WorkerHarnesses) == 1 {
+		switch len(cfg.WorkerHarnesses) {
+		case 0:
+			return "", config.HarnessConfig{}, fmt.Errorf("no worker_harnesses configured; configure at least one worker harness before calling spawn_worker")
+		case 1:
 			harnessName = cfg.WorkerHarnesses[0]
-		} else {
-			return "", config.HarnessConfig{}, fmt.Errorf("harness argument required when multiple worker_harnesses are configured")
+		default:
+			return "", config.HarnessConfig{}, fmt.Errorf("harness argument required when multiple worker_harnesses are configured; call list_harnesses and pass the selected harness to spawn_worker")
 		}
 	}
 
