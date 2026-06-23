@@ -135,11 +135,14 @@ func (s *Server) configureProjectLedgerCallbacks() {
 	for _, info := range s.manager.Projects() {
 		project, err := s.manager.Project(info.Slug)
 		if err == nil && project.Ledger != nil {
-			slug := info.Slug
-			project.Ledger.SetOnChange(func() {
-				s.broadcastLedgerChangeForScope(slug)
-			})
+			project.Ledger.SetOnChange(s.projectLedgerChangeCallback(info.Slug))
 		}
+	}
+}
+
+func (s *Server) projectLedgerChangeCallback(slug string) func() {
+	return func() {
+		s.broadcastLedgerChangeForScope(slug)
 	}
 }
 
@@ -1236,10 +1239,9 @@ func (s *Server) saveReloadConfigLocked(raw *config.Config) (*config.Config, err
 		return nil, fmt.Errorf("reload config: %w", err)
 	}
 	if s.manager != nil {
-		if err := s.manager.Reload(updated, nil); err != nil {
+		if err := s.manager.Reload(updated, s.projectLedgerChangeCallback); err != nil {
 			return nil, err
 		}
-		s.configureProjectLedgerCallbacks()
 	}
 	s.cfg = config.Clone(updated)
 	s.harnesses = harnessResponsesFromConfig(s.cfg)
