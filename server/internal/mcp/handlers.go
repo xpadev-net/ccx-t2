@@ -383,9 +383,16 @@ func handleCreateTask(deps *Deps) ToolHandler {
 				return nil, err
 			}
 		}
-		description := optionalStringArg(args, "description")
+		description, err := optionalStringArg(args, "description")
+		if err != nil {
+			return nil, err
+		}
+		request, err := optionalStringArg(args, "request")
+		if err != nil {
+			return nil, err
+		}
 		if strings.TrimSpace(description) == "" {
-			if request := optionalStringArg(args, "request"); strings.TrimSpace(request) != "" {
+			if strings.TrimSpace(request) != "" {
 				description = request
 			}
 		}
@@ -441,18 +448,25 @@ func handleUpdateTask(deps *Deps) ToolHandler {
 
 		fields := make(map[string]any)
 		for _, key := range []string{"title", "reason"} {
-			if v, ok := args[key]; ok {
+			if _, ok := args[key]; ok {
+				s, err := stringArg(args, key)
+				if err != nil {
+					return nil, err
+				}
 				if key == "title" {
-					s, ok := v.(string)
-					if !ok || strings.TrimSpace(s) == "" {
+					if strings.TrimSpace(s) == "" {
 						return nil, fmt.Errorf("title must be a non-empty string")
 					}
 				}
-				fields[key] = v
+				fields[key] = s
 			}
 		}
-		if v, ok := args["description"]; ok {
-			fields["body"] = v
+		if _, ok := args["description"]; ok {
+			body, err := stringArg(args, "description")
+			if err != nil {
+				return nil, err
+			}
+			fields["body"] = body
 		}
 		for _, key := range []string{"allowed_files", "forbidden_files"} {
 			if _, ok := args[key]; ok {
@@ -504,7 +518,10 @@ func handleSplitTask(deps *Deps) ToolHandler {
 		if err != nil {
 			return nil, err
 		}
-		reason := optionalStringArg(args, "reason")
+		reason, err := optionalStringArg(args, "reason")
+		if err != nil {
+			return nil, err
+		}
 
 		// Parse slices.
 		slicesRaw, ok := args["slices"]
@@ -610,7 +627,10 @@ func handleSplitTask(deps *Deps) ToolHandler {
 			if childTitle == "" {
 				return nil, fmt.Errorf("slice %d: title is required", len(pending))
 			}
-			childDesc, _ := sliceMap["description"].(string)
+			childDesc, err := optionalStringArg(sliceMap, "description")
+			if err != nil {
+				return nil, fmt.Errorf("slice %d: %w", i, err)
+			}
 			pending = append(pending, pendingSlice{
 				title:   childTitle,
 				desc:    childDesc,
@@ -1213,7 +1233,10 @@ func handleNotify(deps *Deps) ToolHandler {
 
 		switch notifyType {
 		case "completed":
-			rawPRURL := optionalStringArg(payload, "pr_url")
+			rawPRURL, err := optionalStringArg(payload, "pr_url")
+			if err != nil {
+				return nil, err
+			}
 			if strings.ContainsAny(rawPRURL, "\r\n") {
 				return nil, fmt.Errorf("pr_url must be a single line")
 			}
@@ -1221,7 +1244,10 @@ func handleNotify(deps *Deps) ToolHandler {
 			if prURL == "" {
 				return nil, fmt.Errorf("pr_url is required for completed notifications")
 			}
-			rawMergeCommit := optionalStringArg(payload, "merge_commit")
+			rawMergeCommit, err := optionalStringArg(payload, "merge_commit")
+			if err != nil {
+				return nil, err
+			}
 			if strings.ContainsAny(rawMergeCommit, "\r\n") {
 				return nil, fmt.Errorf("merge_commit must be a single-line value")
 			}
@@ -1302,7 +1328,10 @@ func handleNotify(deps *Deps) ToolHandler {
 			}
 
 		case "blocked":
-			reason, _ := payload["reason"].(string)
+			reason, err := optionalStringArg(payload, "reason")
+			if err != nil {
+				return nil, err
+			}
 			if _, err := toolDeps.Ledger.UpdateIfStatusesReturnPrevWith(taskID, []string{"in_progress", "blocked"},
 				func(current ledger.Task) (map[string]any, error) {
 					if current.WorkerID != callerWorkerID {
@@ -1324,7 +1353,10 @@ func handleNotify(deps *Deps) ToolHandler {
 			}
 
 		case "split_request":
-			reason, _ := payload["reason"].(string)
+			reason, err := optionalStringArg(payload, "reason")
+			if err != nil {
+				return nil, err
+			}
 			if pendingIntent, originalReason, ok := cleanupIntentFromTask(*task); ok && pendingIntent == cleanupIntentSplitRequest {
 				pendingTask, err := toolDeps.Ledger.UpdateIfStatusesReturnPrevWith(taskID, []string{"blocked"},
 					func(current ledger.Task) (map[string]any, error) {
@@ -1402,7 +1434,10 @@ func handleNotify(deps *Deps) ToolHandler {
 				if childTitle == "" {
 					return nil, fmt.Errorf("proposed_slices[%d]: title is required", i)
 				}
-				childDesc, _ := sliceMap["description"].(string)
+				childDesc, err := optionalStringArg(sliceMap, "description")
+				if err != nil {
+					return nil, fmt.Errorf("proposed_slices[%d]: %w", i, err)
+				}
 				pendingSRs = append(pendingSRs, pendingSR{
 					title: childTitle, desc: childDesc,
 					allowed: childAllowed, forbidden: childForbidden,

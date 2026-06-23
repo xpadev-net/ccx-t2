@@ -1366,6 +1366,66 @@ func TestHandleCreateTaskAcceptsNaturalLanguageRequestWithoutTitle(t *testing.T)
 	}
 }
 
+func TestHandleCreateTaskTreatsNullOptionalStringAsAbsent(t *testing.T) {
+	dir := t.TempDir()
+	l := ledger.NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
+
+	_, err := handleCreateTask(&Deps{Ledger: l})(context.Background(), map[string]any{
+		"description": nil,
+		"request":     "Please investigate nullable optional string intake.",
+	})
+	if err != nil {
+		t.Fatalf("handleCreateTask: %v", err)
+	}
+	tasks, err := l.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(tasks) != 1 || tasks[0].Body != "Please investigate nullable optional string intake." {
+		t.Fatalf("tasks = %#v, want request body with null description ignored", tasks)
+	}
+}
+
+func TestHandleCreateTaskRejectsMalformedOptionalStrings(t *testing.T) {
+	cases := []struct {
+		name  string
+		field string
+		value any
+	}{
+		{name: "description array", field: "description", value: []any{"not a string"}},
+		{name: "request number", field: "request", value: float64(1)},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			l := ledger.NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
+			args := map[string]any{
+				"title":       "Task",
+				"description": "Task body",
+				"request":     "Investigate the task",
+			}
+			args[tc.field] = tc.value
+
+			_, err := handleCreateTask(&Deps{Ledger: l})(context.Background(), args)
+			if err == nil {
+				t.Fatal("handleCreateTask error = nil, want optional string type error")
+			}
+			wantErr := "argument \"" + tc.field + "\" must be a string"
+			if !strings.Contains(err.Error(), wantErr) {
+				t.Fatalf("handleCreateTask error = %v, want %q", err, wantErr)
+			}
+			tasks, err := l.Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if len(tasks) != 0 {
+				t.Fatalf("created task after malformed %s rejection: %#v", tc.field, tasks)
+			}
+		})
+	}
+}
+
 func TestHandleCreateTaskRejectsMalformedFileLists(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -1405,6 +1465,55 @@ func TestHandleCreateTaskRejectsMalformedFileLists(t *testing.T) {
 			}
 			if len(tasks) != 0 {
 				t.Fatalf("created task after malformed %s rejection: %#v", tc.field, tasks)
+			}
+		})
+	}
+}
+
+func TestHandleUpdateTaskRejectsMalformedOptionalStrings(t *testing.T) {
+	cases := []struct {
+		name  string
+		field string
+		value any
+	}{
+		{name: "description array", field: "description", value: []any{"not a string"}},
+		{name: "reason number", field: "reason", value: float64(1)},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			l := ledger.NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
+			if err := l.Add(ledger.Task{
+				ID:     "task-001",
+				Title:  "Task",
+				Status: "unstarted",
+				Reason: "current reason",
+				Body:   "current body",
+			}); err != nil {
+				t.Fatalf("Add: %v", err)
+			}
+			before, err := l.Load()
+			if err != nil {
+				t.Fatalf("Load before: %v", err)
+			}
+			args := map[string]any{"id": "task-001"}
+			args[tc.field] = tc.value
+
+			_, err = handleUpdateTask(&Deps{Ledger: l})(context.Background(), args)
+			if err == nil {
+				t.Fatal("handleUpdateTask error = nil, want optional string type error")
+			}
+			wantErr := "argument \"" + tc.field + "\" must be a string"
+			if !strings.Contains(err.Error(), wantErr) {
+				t.Fatalf("handleUpdateTask error = %v, want %q", err, wantErr)
+			}
+			after, err := l.Load()
+			if err != nil {
+				t.Fatalf("Load after: %v", err)
+			}
+			if !reflect.DeepEqual(after, before) {
+				t.Fatalf("task changed after malformed %s rejection:\nbefore=%#v\nafter=%#v", tc.field, before, after)
 			}
 		})
 	}
@@ -1455,6 +1564,72 @@ func TestHandleSplitTaskRejectsMalformedFileLists(t *testing.T) {
 			}
 			if len(tasks) != 1 || tasks[0].Status != "unstarted" || tasks[0].Body != "current body" {
 				t.Fatalf("task changed after malformed %s rejection: %#v", tc.field, tasks)
+			}
+		})
+	}
+}
+
+func TestHandleSplitTaskRejectsMalformedOptionalStrings(t *testing.T) {
+	cases := []struct {
+		name    string
+		args    map[string]any
+		wantErr string
+	}{
+		{
+			name: "reason array",
+			args: map[string]any{
+				"id":     "task-001",
+				"reason": []any{"not a string"},
+				"slices": []any{
+					map[string]any{
+						"title":       "Child",
+						"description": "child body",
+					},
+				},
+			},
+			wantErr: "argument \"reason\" must be a string",
+		},
+		{
+			name: "child description number",
+			args: map[string]any{
+				"id":     "task-001",
+				"reason": "split reason",
+				"slices": []any{
+					map[string]any{
+						"title":       "Child",
+						"description": float64(1),
+					},
+				},
+			},
+			wantErr: "slice 0: argument \"description\" must be a string",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			l := ledger.NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
+			if err := l.Add(ledger.Task{ID: "task-001", Title: "Task", Status: "unstarted", Body: "current body"}); err != nil {
+				t.Fatalf("Add: %v", err)
+			}
+			before, err := l.Load()
+			if err != nil {
+				t.Fatalf("Load before: %v", err)
+			}
+
+			_, err = handleSplitTask(&Deps{Ledger: l})(context.Background(), tc.args)
+			if err == nil {
+				t.Fatal("handleSplitTask error = nil, want optional string type error")
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("handleSplitTask error = %v, want %q", err, tc.wantErr)
+			}
+			after, err := l.Load()
+			if err != nil {
+				t.Fatalf("Load after: %v", err)
+			}
+			if !reflect.DeepEqual(after, before) {
+				t.Fatalf("task changed after malformed optional string rejection:\nbefore=%#v\nafter=%#v", before, after)
 			}
 		})
 	}
@@ -1604,7 +1779,7 @@ func TestHandleNotifyRejectsMissingOrEmptyWorkerID(t *testing.T) {
 	}
 }
 
-func TestHandleNotifyCompletedRejectsMissingCompletionEvidence(t *testing.T) {
+func TestHandleNotifyCompletedRejectsInvalidCompletionEvidence(t *testing.T) {
 	cases := []struct {
 		name    string
 		payload map[string]any
@@ -1623,6 +1798,22 @@ func TestHandleNotifyCompletedRejectsMissingCompletionEvidence(t *testing.T) {
 				"pr_url": "https://example.test/pr/1",
 			},
 			wantErr: "merge_commit is required",
+		},
+		{
+			name: "non-string pr_url",
+			payload: map[string]any{
+				"pr_url":       []any{"https://example.test/pr/1"},
+				"merge_commit": "abc123def456",
+			},
+			wantErr: "argument \"pr_url\" must be a string",
+		},
+		{
+			name: "non-string merge_commit",
+			payload: map[string]any{
+				"pr_url":       "https://example.test/pr/1",
+				"merge_commit": []any{"abc123def456"},
+			},
+			wantErr: "argument \"merge_commit\" must be a string",
 		},
 		{
 			name: "multiline pr_url",
@@ -1692,7 +1883,7 @@ func TestHandleNotifyCompletedRejectsMissingCompletionEvidence(t *testing.T) {
 				"payload": payload,
 			})
 			if err == nil {
-				t.Fatal("handleNotify completed error = nil, want missing completion evidence error")
+				t.Fatal("handleNotify completed error = nil, want invalid completion evidence error")
 			}
 			if !strings.Contains(err.Error(), tc.wantErr) {
 				t.Fatalf("handleNotify completed error = %v, want %q", err, tc.wantErr)
@@ -1703,6 +1894,94 @@ func TestHandleNotifyCompletedRejectsMissingCompletionEvidence(t *testing.T) {
 			}
 			if len(tasks) != 1 || tasks[0].Status != "in_progress" || tasks[0].PrURL != "" || strings.Contains(tasks[0].Body, "merge_commit") {
 				t.Fatalf("task changed after rejected completion: %#v", tasks)
+			}
+		})
+	}
+}
+
+func TestHandleNotifyRejectsMalformedOptionalStrings(t *testing.T) {
+	cases := []struct {
+		name       string
+		notifyType string
+		extra      map[string]any
+		wantErr    string
+	}{
+		{
+			name:       "blocked reason number",
+			notifyType: "blocked",
+			extra: map[string]any{
+				"reason": float64(1),
+			},
+			wantErr: "argument \"reason\" must be a string",
+		},
+		{
+			name:       "split reason array",
+			notifyType: "split_request",
+			extra: map[string]any{
+				"reason": []any{"not a string"},
+				"proposed_slices": []any{
+					map[string]any{"title": "Child"},
+				},
+			},
+			wantErr: "argument \"reason\" must be a string",
+		},
+		{
+			name:       "split child description number",
+			notifyType: "split_request",
+			extra: map[string]any{
+				"reason": "split reason",
+				"proposed_slices": []any{
+					map[string]any{
+						"title":       "Child",
+						"description": float64(1),
+					},
+				},
+			},
+			wantErr: "proposed_slices[0]: argument \"description\" must be a string",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			l := ledger.NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
+			if err := l.Add(ledger.Task{
+				ID:       "task-001",
+				Title:    "Task",
+				Status:   "in_progress",
+				WorkerID: "worker-current",
+				Body:     "current body",
+			}); err != nil {
+				t.Fatalf("Add: %v", err)
+			}
+			before, err := l.Load()
+			if err != nil {
+				t.Fatalf("Load before: %v", err)
+			}
+			payload := map[string]any{
+				"task_id":   "task-001",
+				"worker_id": "worker-current",
+			}
+			for k, v := range tc.extra {
+				payload[k] = v
+			}
+
+			_, err = handleNotify(testMCPDeps(dir, l))(context.Background(), map[string]any{
+				"type":    tc.notifyType,
+				"payload": payload,
+			})
+			if err == nil {
+				t.Fatalf("handleNotify(%s) error = nil, want optional string type error", tc.notifyType)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("handleNotify(%s) error = %v, want %q", tc.notifyType, err, tc.wantErr)
+			}
+			after, err := l.Load()
+			if err != nil {
+				t.Fatalf("Load after: %v", err)
+			}
+			if !reflect.DeepEqual(after, before) {
+				t.Fatalf("task changed after malformed optional string rejection:\nbefore=%#v\nafter=%#v", before, after)
 			}
 		})
 	}
