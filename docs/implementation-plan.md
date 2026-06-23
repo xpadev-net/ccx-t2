@@ -32,9 +32,12 @@ ccx-t2/
 │   │   │   └── server.go         ← MCP HTTP サーバー（/mcp/orchestrator・/mcp/worker）
 │   │   ├── event/
 │   │   │   └── queue.go          ← Worker notify イベントの直列キュー（chan Event）
-│   │   └── web/
-│   │       ├── server.go         ← REST API・静的ファイル配信
-│   │       └── ws.go             ← WebSocket ハンドラ
+│   │   ├── web/
+│   │   │   ├── server.go         ← REST API
+│   │   │   └── ws.go             ← WebSocket ハンドラ
+│   │   └── webui/
+│   │       ├── webui.go          ← embed された Web UI asset の http.Handler
+│   │       └── dist/             ← Go バイナリへ埋め込むビルド済み Web UI
 │   └── go.mod
 ├── web/                           ← フロントエンド（Vite + React + TypeScript）
 │   ├── src/
@@ -59,7 +62,7 @@ ccx-t2/
 - 設定ファイルが存在しない場合は、projects を空にした設定ファイルを自動生成する
 - 初回生成時は PATH 上の対応 harness CLI を検出し、存在するものだけを `harnesses` / `worker_harnesses` に追加する
 - 検出した harness の起動引数には、`--yolo` や dangerous permissions 系の flag を best-effort で含める
-- Web UI のビルド済み asset は Go バイナリに embed し、`--web-dir` は開発用 override とする
+- Web UI のビルド済み asset は `server/internal/webui/dist` から Go バイナリに embed し、配布時の通常フォールバックとする。有効な `--web-dir` パス（既定は `web/dist`）が存在する場合だけ外部 directory を優先する
 - 設定ファイルはグローバルに1つだけ持ち、`projects` 配下に複数プロジェクトを登録する
 - Go プロセスは REST API / WebSocket / MCP / Web UI 静的配信 / heartbeat scheduler をまとめて起動する
 - 各プロジェクトは `project_slug` をキーに、ledger、worker registry、orchestrator、scheduler を持つ
@@ -144,7 +147,7 @@ worktree path は `runtime.worktree_base/{project_slug}-{task_id}` を既定と�
 - 設定をロードし、tmux session を ensure する
 - `runtime.Manager` を生成し、各プロジェクトの ledger / registry / orchestrator / scheduler を初期化する
 - HTTP server を `server.host` / `server.port` で起動する
-- embed された Web UI asset を静的配信する。`--web-dir` が存在する場合だけ外部 directory を優先する
+- 有効な `--web-dir` パス（既定は `web/dist`）が存在する場合は外部 directory を静的配信し、存在しない場合は `server/internal/webui/dist` から embed された Web UI asset を配信する
 - SIGINT / SIGTERM で HTTP server と scheduler を graceful shutdown する
 
 **`internal/runtime/manager.go`**
@@ -247,7 +250,7 @@ Worker からのイベントを直列に処理し、Orchestrator を適切なタ
   - `GET /api/harnesses` — ハーネス一覧
   - `GET /api/config` — グローバル設定取得（GitHub トークン等のシークレットは返さない）
   - `PATCH /api/config` — グローバル設定更新。プロジェクト追加・更新・削除を含む
-- 本番ビルド時は `web/dist/` をビルド済み静的ファイルとして配信
+- 静的ファイル配信は `server/cmd/ccx/main.go` で登録される。有効な `--web-dir` パス（既定は `web/dist`）が存在する場合は外部 directory を配信し、存在しない場合は `server/internal/webui/dist` から embed された asset を配信する
 
 **`server/internal/web/ws.go`**
 - `GET /ws/projects/:slug/orchestrator` — tmux pipe-pane をブリッジして Orchestrator ログをストリーミング
@@ -256,7 +259,8 @@ Worker からのイベントを直列に処理し、Orchestrator を適切なタ
 
 **`web/` （Vite + React + TypeScript）**
 - 開発時は Vite dev server（デフォルト `localhost:5173`）を起動し、`/api` と `/ws` を Go サーバー（デフォルト `localhost:8080`）にプロキシする
-- 本番ビルド（`vite build`）の出力 `web/dist/` を Go サーバーが配信する
+- 本番ビルド（`vite build`）の出力 `web/dist/` は `npm run embedded:sync` で `server/internal/webui/dist` に同期し、Go サーバーは同期済みの embed asset を通常配信する
+- release workflow は `cd web && npm run build && npm run embedded:sync && npm run embedded:check` で `web/src`、`web/dist`、`server/internal/webui/dist` を同期・検証し、同期後の `server/internal/webui/dist` を Web UI のソース変更と一緒に commit する。CI は `npm run build` 後に `npm run embedded:check` を実行し、同期漏れを stale asset として検出する
 - 画面構成
   - プロジェクト切り替え
   - タスク台帳ビュー（一覧・編集・削除）

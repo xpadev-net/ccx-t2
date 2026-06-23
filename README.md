@@ -79,8 +79,24 @@ go run ./cmd/ccx
 既定では `~/.config/ccx-t2/config.yaml` を読みます。存在しない場合は、project を空のままにした
 config を自動生成します。利用可能な harness CLI は PATH から検出し、検出できたものだけを
 登録します。対応 CLI では `--yolo` や dangerous permissions 系の flag を best-effort で付与します。
-Web UI はバイナリに埋め込まれたビルド済み asset を配信します。開発時に外部の
-`dist` を使いたい場合のみ `--web-dir` を指定できます。
+Web UI は、配布時には `server/internal/webui/dist` から Go バイナリに埋め込まれたビルド済み
+asset を通常のフォールバックとして配信します。起動時には有効な `--web-dir` パス（既定は
+`web/dist`）を先に確認し、そのディレクトリが存在する場合だけ外部配信元として優先します。
+ローカルの `web/dist` を確認したい開発時の override として使います。
+
+Web UI を更新した場合は、release workflow と同じ流れで `web/src` から `web/dist` をビルドし、
+埋め込み用 asset と同期してから差分を検証します。
+
+```sh
+cd web
+npm run build
+npm run embedded:sync
+npm run embedded:check
+```
+
+`embedded:sync` を実行した場合は、Web UI のソース変更と一緒に
+`server/internal/webui/dist` も commit します。
+CI では `npm run build` 後に `npm run embedded:check` を実行し、同期漏れを検出します。
 
 ## 設定
 
