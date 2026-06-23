@@ -185,13 +185,16 @@ func stringArg(args map[string]any, key string) (string, error) {
 }
 
 // optionalStringArg extracts an optional string argument.
-func optionalStringArg(args map[string]any, key string) string {
-	if v, ok := args[key]; ok {
-		if s, ok := v.(string); ok {
-			return s
-		}
+func optionalStringArg(args map[string]any, key string) (string, error) {
+	v, ok := args[key]
+	if !ok {
+		return "", nil
 	}
-	return ""
+	s, ok := v.(string)
+	if !ok {
+		return "", fmt.Errorf("argument %q must be a string", key)
+	}
+	return s, nil
 }
 
 // stringSliceArg extracts a required []string argument.
