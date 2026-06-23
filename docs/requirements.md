@@ -153,8 +153,16 @@ project を空のままにした設定ファイルを自動生成する。PATH �
 対応 CLI では `--yolo` や dangerous permissions 系の flag を best-effort で付与し、
 権限確認で worker が止まらないようにする。
 
-Web UI はビルド済み asset を Go バイナリに埋め込み、既定ではその asset を配信する。
-開発時に外部 `dist` を確認したい場合のみ `--web-dir` で配信ディレクトリを上書きできる。
+Web UI は `server/internal/webui/dist` のビルド済み asset を Go バイナリに埋め込み、
+配布時の通常フォールバックとしてその asset を配信する。起動時は有効な `--web-dir` パス
+（既定は `web/dist`）を先に確認し、そのディレクトリが存在する場合だけ外部配信元として
+優先する。開発時にローカルの `web/dist` を確認したい場合の override として使う。
+
+Web UI を更新する release workflow は、`web/src` から `web/dist` を生成し、
+`web/dist` を `server/internal/webui/dist` に同期してから両者が一致することを検証する。
+想定コマンドは `cd web && npm run build && npm run embedded:sync && npm run embedded:check`。
+同期後の `server/internal/webui/dist` は Web UI のソース変更と一緒に commit する。
+CI は `npm run build` 後に `npm run embedded:check` を実行し、同期漏れを stale asset として検出する。
 
 ---
 
