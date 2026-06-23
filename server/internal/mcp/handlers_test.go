@@ -966,6 +966,110 @@ func TestHandleSpawnWorkerCancellationRollsBackWithBoundedCleanupContext(t *test
 	}
 }
 
+func TestHandleSpawnWorkerHarnessStartupFailureRollsBack(t *testing.T) {
+	dir := t.TempDir()
+	l := ledger.NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
+	if err := l.Add(ledger.Task{ID: "task-001", Title: "Task", Status: "unstarted"}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	deps := testMCPDeps(dir, l)
+	deps.Config.WorkerHarnesses = []string{"sh"}
+	deps.Config.Harnesses = map[string]config.HarnessConfig{
+		"sh": {Command: "sh", McpArgs: "--mcp-url {url}"},
+	}
+
+	var cleanupCalls []string
+	recordCleanupContext := func(label string, ctx context.Context) {
+		t.Helper()
+		if err := ctx.Err(); err != nil {
+			t.Fatalf("%s cleanup context is already canceled: %v", label, err)
+		}
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			t.Fatalf("%s cleanup context has no deadline", label)
+		}
+		now := time.Now()
+		if deadline.Before(now) || deadline.After(now.Add(spawnWorkerRollbackTimeout+time.Second)) {
+			t.Fatalf("%s cleanup deadline = %v, want within rollback timeout", label, deadline)
+		}
+		cleanupCalls = append(cleanupCalls, label)
+	}
+	var sentKeys []string
+	startupErr := errors.New("harness process did not start")
+	waitCalls := 0
+	deps.spawn = spawnWorkerOps{
+		validateBranchName:       func(context.Context, string) error { return nil },
+		ensureBranchCreationSafe: func(context.Context, string, string) error { return nil },
+		headRef:                  func(context.Context, string) (string, error) { return "abc123", nil },
+		createWorktree:           func(context.Context, string, string, string, string) error { return nil },
+		createWindow:             func(context.Context, string, string, string) error { return nil },
+		killWindow: func(ctx context.Context, _, window string) error {
+			if window != "worker-task-001" {
+				t.Fatalf("killWindow window = %q, want worker-task-001", window)
+			}
+			recordCleanupContext("killWindow", ctx)
+			return nil
+		},
+		removeWorktree: func(ctx context.Context, _, worktreePath string) error {
+			if worktreePath == "" {
+				t.Fatal("removeWorktree got empty path")
+			}
+			recordCleanupContext("removeWorktree", ctx)
+			return nil
+		},
+		deleteTaskBranch: func(ctx context.Context, _, branch, taskID string) error {
+			if branch != "feature/task-001-work" || taskID != "task-001" {
+				t.Fatalf("deleteTaskBranch branch/task = %q/%q, want feature/task-001-work/task-001", branch, taskID)
+			}
+			recordCleanupContext("deleteTaskBranch", ctx)
+			return nil
+		},
+		sendKeys: func(_ context.Context, _, _ string, keys string) error {
+			sentKeys = append(sentKeys, keys)
+			return nil
+		},
+		waitForHarnessProcess: func(_ context.Context, _, window string, timeout time.Duration) error {
+			waitCalls++
+			if window != "worker-task-001" {
+				t.Fatalf("waitForHarnessProcess window = %q, want worker-task-001", window)
+			}
+			if timeout != harnessStartupTimeout {
+				t.Fatalf("waitForHarnessProcess timeout = %v, want %v", timeout, harnessStartupTimeout)
+			}
+			return startupErr
+		},
+	}
+
+	_, err := handleSpawnWorker(deps)(context.Background(), map[string]any{
+		"task_id":       "task-001",
+		"branch":        "feature/task-001-work",
+		"allowed_files": []any{"server/internal/mcp"},
+	})
+	if !errors.Is(err, startupErr) || !strings.Contains(err.Error(), "wait for harness process") {
+		t.Fatalf("handleSpawnWorker error = %v, want wrapped startup failure", err)
+	}
+	if waitCalls != 1 {
+		t.Fatalf("waitForHarnessProcess calls = %d, want 1", waitCalls)
+	}
+	if len(sentKeys) != 1 {
+		t.Fatalf("sendKeys calls = %d, want only harness command before startup failure", len(sentKeys))
+	}
+	wantCleanupCalls := []string{"killWindow", "removeWorktree", "deleteTaskBranch"}
+	if !reflect.DeepEqual(cleanupCalls, wantCleanupCalls) {
+		t.Fatalf("cleanup calls = %#v, want %#v", cleanupCalls, wantCleanupCalls)
+	}
+	tasks, err := l.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(tasks) != 1 || tasks[0].Status != "unstarted" || tasks[0].Branch != "" || tasks[0].WorkerID != "" || tasks[0].Harness != "" {
+		t.Fatalf("task after startup rollback = %#v, want lifecycle fields reset", tasks)
+	}
+	if _, ok := deps.Registry.Get("worker-task-001"); ok {
+		t.Fatal("worker registry entry remained after startup rollback")
+	}
+}
+
 func TestHandleSpawnWorkerCreateWindowFailureDoesNotKillMissingWindow(t *testing.T) {
 	dir := t.TempDir()
 	l := ledger.NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))

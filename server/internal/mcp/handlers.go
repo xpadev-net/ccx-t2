@@ -68,6 +68,7 @@ const (
 	cleanupOriginalSplitReasonPrefix = "\noriginal split reason: "
 
 	spawnWorkerTimeout         = 2 * time.Minute
+	harnessStartupTimeout      = 10 * time.Second
 	spawnWorkerRollbackTimeout = 15 * time.Second
 	cleanupTaskBranchTimeout   = 10 * time.Second
 	completionFileProbeTimeout = 5 * time.Second
@@ -971,12 +972,9 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 			rollbackSpawnAfterLedgerUpdate(spawnCtx, ops, toolDeps, workerID, branch, taskID, repoPath, worktreePath)
 			return nil, fmt.Errorf("send harness command: %w", err)
 		}
-		if err := ops.waitForHarnessProcess(spawnCtx, toolDeps.Session, workerID, 2*time.Second); err != nil {
-			if isContextDoneError(spawnCtx, err) {
-				rollbackSpawnAfterLedgerUpdate(spawnCtx, ops, toolDeps, workerID, branch, taskID, repoPath, worktreePath)
-				return nil, fmt.Errorf("wait for harness process: %w", err)
-			}
-			log.Printf("warn: wait for harness process: %v", err)
+		if err := ops.waitForHarnessProcess(spawnCtx, toolDeps.Session, workerID, harnessStartupTimeout); err != nil {
+			rollbackSpawnAfterLedgerUpdate(spawnCtx, ops, toolDeps, workerID, branch, taskID, repoPath, worktreePath)
+			return nil, fmt.Errorf("wait for harness process: %w", err)
 		}
 
 		// Step 5: Send task prompt (best-effort — worker is already running).
