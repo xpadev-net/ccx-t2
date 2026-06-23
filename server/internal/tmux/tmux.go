@@ -28,6 +28,25 @@ func EnsureSessionContext(ctx context.Context, slug string) error {
 	return runCtx(ctx, "tmux", "new-session", "-d", "-s", slug)
 }
 
+// SessionExists reports whether the tmux session exists.
+func SessionExists(session string) (bool, error) {
+	return SessionExistsContext(context.Background(), session)
+}
+
+// SessionExistsContext reports whether the tmux session exists and aborts
+// command execution when ctx is canceled.
+func SessionExistsContext(ctx context.Context, session string) (bool, error) {
+	err := runCtx(ctx, "tmux", "has-session", "-t", session)
+	if err == nil {
+		return true, nil
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "no such session") || strings.Contains(msg, "can't find session") {
+		return false, nil
+	}
+	return false, err
+}
+
 // CreateWindow creates a new window in the given session with the specified
 // name and starting directory.
 func CreateWindow(session, name, startDir string) error {
