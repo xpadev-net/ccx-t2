@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	gh "github.com/google/go-github/v60/github"
@@ -118,6 +119,16 @@ func NewClient(token, owner, repo string, options ...ClientOption) (*Client, err
 	}, nil
 }
 
+// Repository reports the owner and repository configured for this client.
+func (c *Client) Repository() (owner, repo string) {
+	return c.owner, c.repo
+}
+
+// MatchesRepository reports whether owner/repo names the configured repository.
+func (c *Client) MatchesRepository(owner, repo string) bool {
+	return strings.EqualFold(c.owner, owner) && strings.EqualFold(c.repo, repo)
+}
+
 // GetPRStatus returns the current state of a pull request.
 func (c *Client) GetPRStatus(ctx context.Context, prNumber int) (*PRStatus, error) {
 	pr, _, err := c.client.PullRequests.Get(ctx, c.owner, c.repo, prNumber)
@@ -159,6 +170,29 @@ func (c *Client) GetPRStatus(ctx context.Context, prNumber int) (*PRStatus, erro
 		Mergeable: pr.Mergeable,
 		Checks:    checks,
 	}, nil
+}
+
+// ListPRFiles returns the repository paths changed by a pull request.
+func (c *Client) ListPRFiles(ctx context.Context, prNumber int) ([]string, error) {
+	opts := &gh.ListOptions{PerPage: 100}
+	var files []string
+	for {
+		page, resp, err := c.client.PullRequests.ListFiles(ctx, c.owner, c.repo, prNumber, opts)
+		if err != nil {
+			return nil, fmt.Errorf("list PR files: %w", err)
+		}
+		for _, file := range page {
+			files = append(files, file.GetFilename())
+			if previous := file.GetPreviousFilename(); previous != "" {
+				files = append(files, previous)
+			}
+		}
+		if resp.NextPage == 0 {
+			break
+		}
+		opts.Page = resp.NextPage
+	}
+	return files, nil
 }
 
 func normalizeCheckStatus(run *gh.CheckRun) CheckStatus {

@@ -1,15 +1,19 @@
 package mcp
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+	"net/url"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -66,6 +70,8 @@ const (
 	spawnWorkerTimeout         = 2 * time.Minute
 	spawnWorkerRollbackTimeout = 15 * time.Second
 	cleanupTaskBranchTimeout   = 10 * time.Second
+	completionFileProbeTimeout = 5 * time.Second
+	completionFileDiffTimeout  = 10 * time.Second
 )
 
 type workerCleanupOps struct {
@@ -1226,6 +1232,15 @@ func handleNotify(deps *Deps) ToolHandler {
 			if !mergeCommitRE.MatchString(mergeCommit) {
 				return nil, fmt.Errorf("merge_commit must be a valid commit hash")
 			}
+			completionAlreadyAccepted := false
+			if pendingIntent, _, ok := cleanupIntentFromTask(*task); ok && pendingIntent == cleanupIntentCompleted {
+				completionAlreadyAccepted = task.PrURL == prURL && extractMergeCommit(task.Body) == mergeCommit
+			}
+			if !completionAlreadyAccepted {
+				if err := verifyCompletionFileContract(ctx, toolDeps, *task, prURL); err != nil {
+					return nil, err
+				}
+			}
 
 			prevTask, err := toolDeps.Ledger.UpdateIfStatusesReturnPrevWith(taskID, []string{"in_progress", "blocked"},
 				func(current ledger.Task) (map[string]any, error) {
@@ -1236,6 +1251,10 @@ func handleNotify(deps *Deps) ToolHandler {
 					if pendingIntent, _, ok := cleanupIntentFromTask(current); ok && pendingIntent != cleanupIntentCompleted {
 						return nil, fmt.Errorf("task %s has %s cleanup pending; retry that cleanup before notify(completed)",
 							taskID, pendingIntent)
+					}
+					if !slices.Equal(current.AllowedFiles, task.AllowedFiles) ||
+						!slices.Equal(current.ForbiddenFiles, task.ForbiddenFiles) {
+						return nil, fmt.Errorf("task %s file contract changed during notify(completed); retry notify(completed)", taskID)
 					}
 					fields := map[string]any{
 						"status": "blocked",
@@ -1559,6 +1578,175 @@ func notifyTriggerReason(notifyType, taskID string) string {
 	default:
 		return "worker notify: " + taskID
 	}
+}
+
+func verifyCompletionFileContract(ctx context.Context, deps *Deps, task ledger.Task, prURL string) error {
+	if len(task.AllowedFiles) == 0 && len(task.ForbiddenFiles) == 0 {
+		return nil
+	}
+	if err := ledger.ValidatePaths(task.AllowedFiles); err != nil {
+		return fmt.Errorf("allowed_files: %w", err)
+	}
+	if err := ledger.ValidatePaths(task.ForbiddenFiles); err != nil {
+		return fmt.Errorf("forbidden_files: %w", err)
+	}
+	changedFiles, err := completionChangedFiles(ctx, deps, task, prURL)
+	if err != nil {
+		return err
+	}
+	return validateCompletionChangedFiles(task, changedFiles)
+}
+
+func completionChangedFiles(ctx context.Context, deps *Deps, task ledger.Task, prURL string) ([]string, error) {
+	if deps.GitHub != nil {
+		owner, repo, prNumber, ok := pullRequestFromURL(prURL)
+		if !ok {
+			return nil, fmt.Errorf("completion file contract: pr_url must be a GitHub pull request URL ending in /pull/<number> when GitHub is configured")
+		}
+		if !deps.GitHub.MatchesRepository(owner, repo) {
+			configuredOwner, configuredRepo := deps.GitHub.Repository()
+			return nil, fmt.Errorf("completion file contract: pr_url repository %s/%s does not match configured GitHub repository %s/%s",
+				owner, repo, configuredOwner, configuredRepo)
+		}
+		files, err := deps.GitHub.ListPRFiles(ctx, prNumber)
+		if err != nil {
+			return nil, fmt.Errorf("inspect PR changed files: %w", err)
+		}
+		return files, nil
+	}
+	if deps.Config == nil {
+		return nil, fmt.Errorf("completion file contract: project config is required to inspect local branch diff")
+	}
+	return localBranchChangedFiles(ctx, deps.Config.Project.RepoPath, task.Branch)
+}
+
+func pullRequestFromURL(raw string) (string, string, int, bool) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", "", 0, false
+	}
+	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+	if len(parts) != 4 || parts[0] == "" || parts[1] == "" || parts[2] != "pull" {
+		return "", "", 0, false
+	}
+	n, err := strconv.Atoi(parts[3])
+	if err != nil || n <= 0 {
+		return "", "", 0, false
+	}
+	return parts[0], parts[1], n, true
+}
+
+func localBranchChangedFiles(ctx context.Context, repoPath, branch string) ([]string, error) {
+	repoPath = strings.TrimSpace(repoPath)
+	branch = strings.TrimSpace(branch)
+	if repoPath == "" {
+		return nil, fmt.Errorf("completion file contract: repo_path is required to inspect local branch diff")
+	}
+	if branch == "" {
+		return nil, fmt.Errorf("completion file contract: task branch is required to inspect local branch diff")
+	}
+	if err := gitVerifyCommitWithTimeout(ctx, repoPath, branch); err != nil {
+		return nil, fmt.Errorf("completion file contract: task branch %q is not available locally: %w", branch, err)
+	}
+	baseRef, err := localDiffBaseRef(ctx, repoPath)
+	if err != nil {
+		return nil, err
+	}
+	diffCtx, cancel := context.WithTimeout(ctx, completionFileDiffTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(diffCtx, "git", "-C", repoPath, "diff", "--name-only", "-z", baseRef+"..."+branch, "--").Output()
+	if err != nil {
+		return nil, fmt.Errorf("completion file contract: inspect local branch diff: %w", err)
+	}
+	out = bytes.TrimSuffix(out, []byte{0})
+	if len(out) == 0 {
+		return nil, nil
+	}
+	parts := bytes.Split(out, []byte{0})
+	files := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if len(part) == 0 {
+			continue
+		}
+		files = append(files, filepath.ToSlash(string(part)))
+	}
+	return files, nil
+}
+
+func localDiffBaseRef(ctx context.Context, repoPath string) (string, error) {
+	for _, ref := range []string{"origin/master", "origin/main", "master", "main"} {
+		if err := gitVerifyCommitWithTimeout(ctx, repoPath, ref); err == nil {
+			return ref, nil
+		}
+	}
+	return "", fmt.Errorf("completion file contract: could not find a local base ref (tried origin/master, origin/main, master, main)")
+}
+
+func gitVerifyCommitWithTimeout(ctx context.Context, repoPath, ref string) error {
+	probeCtx, cancel := context.WithTimeout(ctx, completionFileProbeTimeout)
+	defer cancel()
+	return gitVerifyCommit(probeCtx, repoPath, ref)
+}
+
+func gitVerifyCommit(ctx context.Context, repoPath, ref string) error {
+	return exec.CommandContext(ctx, "git", "-C", repoPath, "rev-parse", "--verify", "--quiet", ref+"^{commit}").Run()
+}
+
+func validateCompletionChangedFiles(task ledger.Task, changedFiles []string) error {
+	files := uniqueNormalizedChangedFiles(changedFiles)
+	var invalid []string
+	var forbidden []string
+	var outsideAllowed []string
+	for _, file := range files {
+		if err := ledger.ValidatePath(file); err != nil {
+			invalid = append(invalid, file)
+			continue
+		}
+		if matchesAnyPath(task.ForbiddenFiles, file) {
+			forbidden = append(forbidden, file)
+		}
+		if len(task.AllowedFiles) > 0 && !matchesAnyPath(task.AllowedFiles, file) {
+			outsideAllowed = append(outsideAllowed, file)
+		}
+	}
+	var parts []string
+	if len(invalid) > 0 {
+		parts = append(parts, "invalid changed file paths: "+strings.Join(invalid, ", "))
+	}
+	if len(forbidden) > 0 {
+		parts = append(parts, "forbidden files changed: "+strings.Join(forbidden, ", "))
+	}
+	if len(outsideAllowed) > 0 {
+		parts = append(parts, "files outside allowed_files: "+strings.Join(outsideAllowed, ", "))
+	}
+	if len(parts) > 0 {
+		return fmt.Errorf("completion file contract violated: %s", strings.Join(parts, "; "))
+	}
+	return nil
+}
+
+func uniqueNormalizedChangedFiles(paths []string) []string {
+	seen := make(map[string]bool, len(paths))
+	var files []string
+	for _, path := range paths {
+		path = ledger.NormalizePath(path)
+		if path == "" || seen[path] {
+			continue
+		}
+		seen[path] = true
+		files = append(files, path)
+	}
+	sort.Strings(files)
+	return files
+}
+
+func matchesAnyPath(patterns []string, file string) bool {
+	for _, pattern := range patterns {
+		if ledger.PathMatches(pattern, file) {
+			return true
+		}
+	}
+	return false
 }
 
 func fileListArg(args map[string]any, key string) ([]string, error) {

@@ -23,7 +23,8 @@ func ValidatePath(p string) error {
 
 // NormalizePath removes trailing slashes for consistent comparison.
 func NormalizePath(p string) string {
-	return strings.TrimRight(p, "/")
+	p = strings.ReplaceAll(p, "\\", "/")
+	return strings.TrimRight(filepath.ToSlash(p), "/")
 }
 
 // PathMatches reports whether path f matches pattern p using directory-boundary
@@ -32,6 +33,12 @@ func NormalizePath(p string) string {
 func PathMatches(p, f string) bool {
 	p = NormalizePath(p)
 	f = NormalizePath(f)
+	if p == "**" {
+		return true
+	}
+	if strings.HasSuffix(p, "/**") {
+		return PathMatches(strings.TrimSuffix(p, "/**"), f)
+	}
 	if p == f {
 		return true
 	}
