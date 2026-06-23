@@ -70,6 +70,7 @@ const (
 	spawnWorkerTimeout         = 2 * time.Minute
 	spawnWorkerRollbackTimeout = 15 * time.Second
 	cleanupTaskBranchTimeout   = 10 * time.Second
+	completionFileProbeTimeout = 5 * time.Second
 	completionFileDiffTimeout  = 10 * time.Second
 )
 
@@ -1598,9 +1599,14 @@ func verifyCompletionFileContract(ctx context.Context, deps *Deps, task ledger.T
 
 func completionChangedFiles(ctx context.Context, deps *Deps, task ledger.Task, prURL string) ([]string, error) {
 	if deps.GitHub != nil {
-		prNumber, ok := pullRequestNumberFromURL(prURL)
+		owner, repo, prNumber, ok := pullRequestFromURL(prURL)
 		if !ok {
 			return nil, fmt.Errorf("completion file contract: pr_url must be a GitHub pull request URL ending in /pull/<number> when GitHub is configured")
+		}
+		if !deps.GitHub.MatchesRepository(owner, repo) {
+			configuredOwner, configuredRepo := deps.GitHub.Repository()
+			return nil, fmt.Errorf("completion file contract: pr_url repository %s/%s does not match configured GitHub repository %s/%s",
+				owner, repo, configuredOwner, configuredRepo)
 		}
 		files, err := deps.GitHub.ListPRFiles(ctx, prNumber)
 		if err != nil {
@@ -1614,23 +1620,20 @@ func completionChangedFiles(ctx context.Context, deps *Deps, task ledger.Task, p
 	return localBranchChangedFiles(ctx, deps.Config.Project.RepoPath, task.Branch)
 }
 
-func pullRequestNumberFromURL(raw string) (int, bool) {
+func pullRequestFromURL(raw string) (string, string, int, bool) {
 	u, err := url.Parse(raw)
 	if err != nil {
-		return 0, false
+		return "", "", 0, false
 	}
 	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
-	for i := 0; i+1 < len(parts); i++ {
-		if parts[i] != "pull" {
-			continue
-		}
-		n, err := strconv.Atoi(parts[i+1])
-		if err == nil && n > 0 {
-			return n, true
-		}
-		return 0, false
+	if len(parts) != 4 || parts[0] == "" || parts[1] == "" || parts[2] != "pull" {
+		return "", "", 0, false
 	}
-	return 0, false
+	n, err := strconv.Atoi(parts[3])
+	if err != nil || n <= 0 {
+		return "", "", 0, false
+	}
+	return parts[0], parts[1], n, true
 }
 
 func localBranchChangedFiles(ctx context.Context, repoPath, branch string) ([]string, error) {
@@ -1642,15 +1645,15 @@ func localBranchChangedFiles(ctx context.Context, repoPath, branch string) ([]st
 	if branch == "" {
 		return nil, fmt.Errorf("completion file contract: task branch is required to inspect local branch diff")
 	}
-	diffCtx, cancel := context.WithTimeout(ctx, completionFileDiffTimeout)
-	defer cancel()
-	if err := gitVerifyCommit(diffCtx, repoPath, branch); err != nil {
+	if err := gitVerifyCommitWithTimeout(ctx, repoPath, branch); err != nil {
 		return nil, fmt.Errorf("completion file contract: task branch %q is not available locally: %w", branch, err)
 	}
-	baseRef, err := localDiffBaseRef(diffCtx, repoPath)
+	baseRef, err := localDiffBaseRef(ctx, repoPath)
 	if err != nil {
 		return nil, err
 	}
+	diffCtx, cancel := context.WithTimeout(ctx, completionFileDiffTimeout)
+	defer cancel()
 	out, err := exec.CommandContext(diffCtx, "git", "-C", repoPath, "diff", "--name-only", "-z", baseRef+"..."+branch, "--").Output()
 	if err != nil {
 		return nil, fmt.Errorf("completion file contract: inspect local branch diff: %w", err)
@@ -1672,11 +1675,17 @@ func localBranchChangedFiles(ctx context.Context, repoPath, branch string) ([]st
 
 func localDiffBaseRef(ctx context.Context, repoPath string) (string, error) {
 	for _, ref := range []string{"origin/master", "origin/main", "master", "main"} {
-		if err := gitVerifyCommit(ctx, repoPath, ref); err == nil {
+		if err := gitVerifyCommitWithTimeout(ctx, repoPath, ref); err == nil {
 			return ref, nil
 		}
 	}
 	return "", fmt.Errorf("completion file contract: could not find a local base ref (tried origin/master, origin/main, master, main)")
+}
+
+func gitVerifyCommitWithTimeout(ctx context.Context, repoPath, ref string) error {
+	probeCtx, cancel := context.WithTimeout(ctx, completionFileProbeTimeout)
+	defer cancel()
+	return gitVerifyCommit(probeCtx, repoPath, ref)
 }
 
 func gitVerifyCommit(ctx context.Context, repoPath, ref string) error {

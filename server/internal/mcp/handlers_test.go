@@ -1746,6 +1746,47 @@ func TestHandleNotifyCompletedAcceptsAllowedGitHubFiles(t *testing.T) {
 	}
 }
 
+func TestHandleNotifyCompletedRejectsMismatchedGitHubPRRepository(t *testing.T) {
+	dir := t.TempDir()
+	l := ledger.NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
+	if err := l.Add(ledger.Task{
+		ID:           "task-001",
+		Title:        "Task",
+		Status:       "in_progress",
+		Branch:       "feature/task-001",
+		WorkerID:     "worker-current",
+		AllowedFiles: []string{"server/internal/mcp/**"},
+		Body:         "current body",
+	}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	deps := testMCPDeps(dir, l)
+	deps.GitHub = githubFilesClientForTest(t, []string{"server/internal/mcp/handlers.go"})
+
+	_, err := handleNotify(deps)(context.Background(), map[string]any{
+		"type": "completed",
+		"payload": map[string]any{
+			"task_id":      "task-001",
+			"worker_id":    "worker-current",
+			"pr_url":       "https://github.com/attacker/other/pull/123",
+			"merge_commit": "abc123def456",
+		},
+	})
+	if err == nil {
+		t.Fatal("handleNotify completed error = nil, want mismatched PR repository error")
+	}
+	if !strings.Contains(err.Error(), "pr_url repository attacker/other does not match configured GitHub repository octo/hello") {
+		t.Fatalf("handleNotify completed error = %v, want repository mismatch", err)
+	}
+	tasks, err := l.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(tasks) != 1 || tasks[0].Status != "in_progress" || tasks[0].PrURL != "" || strings.Contains(tasks[0].Body, "merge_commit") {
+		t.Fatalf("task changed after mismatched PR repository rejection: %#v", tasks)
+	}
+}
+
 func TestHandleNotifyCompletedRejectsForbiddenGitHubFiles(t *testing.T) {
 	dir := t.TempDir()
 	l := ledger.NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))

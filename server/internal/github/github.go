@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	gh "github.com/google/go-github/v60/github"
@@ -116,6 +117,16 @@ func NewClient(token, owner, repo string, options ...ClientOption) (*Client, err
 		repo:   repo,
 		client: ghClient,
 	}, nil
+}
+
+// Repository reports the owner and repository configured for this client.
+func (c *Client) Repository() (owner, repo string) {
+	return c.owner, c.repo
+}
+
+// MatchesRepository reports whether owner/repo names the configured repository.
+func (c *Client) MatchesRepository(owner, repo string) bool {
+	return strings.EqualFold(c.owner, owner) && strings.EqualFold(c.repo, repo)
 }
 
 // GetPRStatus returns the current state of a pull request.
