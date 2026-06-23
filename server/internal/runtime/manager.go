@@ -172,7 +172,7 @@ func (p *ProjectRuntime) start(ctx context.Context) {
 	}()
 }
 
-func (m *Manager) Reload(cfg *config.Config, onLedgerChange func()) error {
+func (m *Manager) Reload(cfg *config.Config, onLedgerChange func(slug string) func()) error {
 	if cfg == nil {
 		return fmt.Errorf("runtime: config is nil")
 	}
@@ -181,9 +181,9 @@ func (m *Manager) Reload(cfg *config.Config, onLedgerChange func()) error {
 	if err != nil {
 		return err
 	}
-	for _, project := range projects {
+	for slug, project := range projects {
 		if project.Ledger != nil && onLedgerChange != nil {
-			project.Ledger.SetOnChange(onLedgerChange)
+			project.Ledger.SetOnChange(onLedgerChange(slug))
 		}
 	}
 	m.mu.Lock()

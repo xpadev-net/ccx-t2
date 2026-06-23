@@ -49,7 +49,7 @@ type Server struct {
 	harnesses       []harnessResponse
 	mux             *http.ServeMux
 	ledgerClientsMu sync.Mutex
-	ledgerClients   map[*ledgerWSClient]struct{}
+	ledgerClients   map[string]map[*ledgerWSClient]struct{}
 	tmuxStreams     *tmuxStreamRegistry
 }
 
@@ -119,18 +119,31 @@ func New(deps Deps) *Server {
 		s.ledger.SetOnChange(s.broadcastLedgerChange)
 	}
 	if s.manager != nil {
-		for _, info := range s.manager.Projects() {
-			project, err := s.manager.Project(info.Slug)
-			if err == nil && project.Ledger != nil {
-				project.Ledger.SetOnChange(s.broadcastLedgerChange)
-			}
-		}
+		s.configureProjectLedgerCallbacks()
 	}
 	if s.secret == "" && !s.authDisabled {
 		log.Printf("web: bearer auth is not configured; set Secret or AuthDisabled=true explicitly")
 	}
 	s.routes()
 	return s
+}
+
+func (s *Server) configureProjectLedgerCallbacks() {
+	if s.manager == nil {
+		return
+	}
+	for _, info := range s.manager.Projects() {
+		project, err := s.manager.Project(info.Slug)
+		if err == nil && project.Ledger != nil {
+			project.Ledger.SetOnChange(s.projectLedgerChangeCallback(info.Slug))
+		}
+	}
+}
+
+func (s *Server) projectLedgerChangeCallback(slug string) func() {
+	return func() {
+		s.broadcastLedgerChangeForScope(slug)
+	}
 }
 
 // Triggerer starts or wakes the orchestrator after a web mutation.
@@ -508,6 +521,8 @@ func (s *Server) projectServer(slug string) (*Server, error) {
 		}
 		return s, nil
 	}
+	s.configMu.RLock()
+	defer s.configMu.RUnlock()
 	project, err := s.manager.Project(slug)
 	if err != nil {
 		return nil, err
@@ -1224,7 +1239,7 @@ func (s *Server) saveReloadConfigLocked(raw *config.Config) (*config.Config, err
 		return nil, fmt.Errorf("reload config: %w", err)
 	}
 	if s.manager != nil {
-		if err := s.manager.Reload(updated, s.broadcastLedgerChange); err != nil {
+		if err := s.manager.Reload(updated, s.projectLedgerChangeCallback); err != nil {
 			return nil, err
 		}
 	}

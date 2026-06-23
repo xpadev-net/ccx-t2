@@ -233,23 +233,23 @@ func (s *Server) handleProjectWS(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "project websocket route not found")
 		return
 	}
-	if _, err := s.projectServer(parts[0]); err != nil {
+	projectServer, err := s.projectServer(parts[0])
+	if err != nil {
 		writeError(w, http.StatusNotFound, "project not found")
 		return
 	}
 	switch parts[1] {
 	case "ledger":
 		if len(parts) == 2 {
-			s.handleLedgerWS(w, r)
+			if s.manager == nil {
+				s.handleLedgerWS(w, r)
+			} else {
+				s.handleLedgerWSForScope(w, r, parts[0])
+			}
 			return
 		}
 	case "worker":
 		if len(parts) == 3 {
-			projectServer, err := s.projectServer(parts[0])
-			if err != nil {
-				writeError(w, http.StatusNotFound, "project not found")
-				return
-			}
 			r2 := r.Clone(r.Context())
 			r2.URL.Path = "/ws/worker/" + parts[2]
 			projectServer.handleWorkerLogWS(w, r2)
@@ -257,11 +257,6 @@ func (s *Server) handleProjectWS(w http.ResponseWriter, r *http.Request) {
 		}
 	case "orchestrator":
 		if len(parts) == 2 {
-			projectServer, err := s.projectServer(parts[0])
-			if err != nil {
-				writeError(w, http.StatusNotFound, "project not found")
-				return
-			}
 			r2 := r.Clone(r.Context())
 			r2.URL.Path = "/ws/orchestrator"
 			projectServer.handleOrchestratorLogWS(w, r2)
@@ -272,6 +267,10 @@ func (s *Server) handleProjectWS(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleLedgerWS(w http.ResponseWriter, r *http.Request) {
+	s.handleLedgerWSForScope(w, r, "")
+}
+
+func (s *Server) handleLedgerWSForScope(w http.ResponseWriter, r *http.Request, scope string) {
 	if r.Method != http.MethodGet {
 		methodNotAllowed(w, http.MethodGet)
 		return
@@ -282,8 +281,8 @@ func (s *Server) handleLedgerWS(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close()
 	client := &ledgerWSClient{conn: conn, send: make(chan wsMessage, 16)}
-	s.addLedgerClient(client)
-	defer s.removeLedgerClient(client)
+	s.addLedgerClient(scope, client)
+	defer s.removeLedgerClient(scope, client)
 
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
@@ -405,29 +404,42 @@ func discardWSReads(ctx context.Context, conn *websocket.Conn, cancel context.Ca
 	}
 }
 
-func (s *Server) addLedgerClient(client *ledgerWSClient) {
+func (s *Server) addLedgerClient(scope string, client *ledgerWSClient) {
 	s.ledgerClientsMu.Lock()
 	defer s.ledgerClientsMu.Unlock()
 	if s.ledgerClients == nil {
-		s.ledgerClients = make(map[*ledgerWSClient]struct{})
+		s.ledgerClients = make(map[string]map[*ledgerWSClient]struct{})
 	}
-	s.ledgerClients[client] = struct{}{}
+	clients := s.ledgerClients[scope]
+	if clients == nil {
+		clients = make(map[*ledgerWSClient]struct{})
+		s.ledgerClients[scope] = clients
+	}
+	clients[client] = struct{}{}
 }
 
-func (s *Server) removeLedgerClient(client *ledgerWSClient) {
+func (s *Server) removeLedgerClient(scope string, client *ledgerWSClient) {
 	s.ledgerClientsMu.Lock()
 	defer s.ledgerClientsMu.Unlock()
-	if _, ok := s.ledgerClients[client]; ok {
-		delete(s.ledgerClients, client)
+	clients := s.ledgerClients[scope]
+	if _, ok := clients[client]; ok {
+		delete(clients, client)
+		if len(clients) == 0 {
+			delete(s.ledgerClients, scope)
+		}
 		close(client.send)
 	}
 }
 
 func (s *Server) broadcastLedgerChange() {
+	s.broadcastLedgerChangeForScope("")
+}
+
+func (s *Server) broadcastLedgerChangeForScope(scope string) {
 	msg := wsMessage{Type: "ledger_changed"}
 	s.ledgerClientsMu.Lock()
 	defer s.ledgerClientsMu.Unlock()
-	for client := range s.ledgerClients {
+	for client := range s.ledgerClients[scope] {
 		select {
 		case client.send <- msg:
 		default:
