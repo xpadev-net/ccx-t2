@@ -38,33 +38,37 @@ func TestCreateWindowContextUsesCommandContext(t *testing.T) {
 }
 
 func TestSessionExistsContextReportsMissingSession(t *testing.T) {
-	ctx := context.WithValue(context.Background(), tmuxTestContextKey{}, "marker")
-	var gotCtx context.Context
-	var gotName string
-	var gotArgs []string
+	for _, stderr := range []string{"no such session", "can't find session missing"} {
+		t.Run(stderr, func(t *testing.T) {
+			ctx := context.WithValue(context.Background(), tmuxTestContextKey{}, "marker")
+			var gotCtx context.Context
+			var gotName string
+			var gotArgs []string
 
-	oldExecCommandContext := execCommandContext
-	execCommandContext = func(ctx context.Context, name string, args ...string) *exec.Cmd {
-		gotCtx = ctx
-		gotName = name
-		gotArgs = append([]string(nil), args...)
-		return exec.Command("sh", "-c", "echo 'no such session' >&2; exit 1")
-	}
-	t.Cleanup(func() { execCommandContext = oldExecCommandContext })
+			oldExecCommandContext := execCommandContext
+			execCommandContext = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+				gotCtx = ctx
+				gotName = name
+				gotArgs = append([]string(nil), args...)
+				return exec.Command("sh", "-c", "printf '%s\n' \"$1\" >&2; exit 1", "sh", stderr)
+			}
+			t.Cleanup(func() { execCommandContext = oldExecCommandContext })
 
-	exists, err := SessionExistsContext(ctx, "missing")
-	if err != nil {
-		t.Fatalf("SessionExistsContext: %v", err)
-	}
-	if exists {
-		t.Fatal("exists = true, want false")
-	}
-	if gotCtx != ctx {
-		t.Fatal("SessionExistsContext did not pass caller context to tmux command")
-	}
-	wantArgs := []string{"has-session", "-t", "missing"}
-	if gotName != "tmux" || !reflect.DeepEqual(gotArgs, wantArgs) {
-		t.Fatalf("command = %s %#v, want tmux %#v", gotName, gotArgs, wantArgs)
+			exists, err := SessionExistsContext(ctx, "missing")
+			if err != nil {
+				t.Fatalf("SessionExistsContext: %v", err)
+			}
+			if exists {
+				t.Fatal("exists = true, want false")
+			}
+			if gotCtx != ctx {
+				t.Fatal("SessionExistsContext did not pass caller context to tmux command")
+			}
+			wantArgs := []string{"has-session", "-t", "missing"}
+			if gotName != "tmux" || !reflect.DeepEqual(gotArgs, wantArgs) {
+				t.Fatalf("command = %s %#v, want tmux %#v", gotName, gotArgs, wantArgs)
+			}
+		})
 	}
 }
 

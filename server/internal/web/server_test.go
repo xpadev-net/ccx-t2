@@ -2429,6 +2429,38 @@ func TestProjectOrchestratorLogWebSocketStreamsProjectWindow(t *testing.T) {
 	}
 }
 
+func TestProjectOrchestratorLogWebSocketRejectsMissingSession(t *testing.T) {
+	cfg, manager := newTestProjectManager(t, "alpha")
+	server := httptest.NewServer(New(Deps{
+		Config:  cfg,
+		Manager: manager,
+		IsSessionAlive: func(ctx context.Context, session string) (bool, error) {
+			if session != "ccx-test" {
+				t.Fatalf("session args = %q, want ccx-test", session)
+			}
+			return false, nil
+		},
+		IsWindowAlive: func(ctx context.Context, session, window string) (bool, error) {
+			t.Fatal("IsWindowAlive called after missing session")
+			return false, nil
+		},
+		PipeOutput: func(session, window string) (<-chan string, func(), error) {
+			t.Fatalf("PipeOutput called for missing tmux session %q window %q", session, window)
+			return nil, nil, nil
+		},
+		AuthDisabled: true,
+	}))
+	defer server.Close()
+
+	_, resp, err := websocket.DefaultDialer.Dial(wsURL(server.URL, "/ws/projects/alpha/orchestrator"), nil)
+	if err == nil {
+		t.Fatal("Dial error = nil, want not found")
+	}
+	if resp == nil || resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("response = %#v, want 404", resp)
+	}
+}
+
 func TestProjectOrchestratorLogWebSocketRejectsMissingWindow(t *testing.T) {
 	cfg, manager := newTestProjectManager(t, "alpha")
 	server := httptest.NewServer(New(Deps{

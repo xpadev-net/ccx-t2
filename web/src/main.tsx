@@ -156,6 +156,7 @@ type WebSocketDiagnosis = {
 type ReconnectingWebSocketOptions = {
   path: string;
   token: string;
+  notFoundPhase?: FailureConnectionPhase;
   setState: (state: ConnectionState) => void;
   onMessage: (event: MessageEvent) => void;
   onSocketError?: () => void;
@@ -298,6 +299,7 @@ function App() {
     return openReconnectingWebSocket({
       path: orchestratorLogPath(selectedProjectSlug),
       token,
+      notFoundPhase: "missing",
       setState: setOrchestratorConnection,
       onMessage: (event) => appendLogEvent(event, setOrchestratorLog),
       onSocketError: () => appendLogLine(setOrchestratorLog, "[stream error]", false)
@@ -1313,7 +1315,7 @@ function openReconnectingWebSocket(options: ReconnectingWebSocketOptions) {
         scheduleReconnect("Stream disconnected.");
         return;
       }
-      void diagnoseWebSocketFailure(options.path, options.token).then((diagnosis) => {
+      void diagnoseWebSocketFailure(options.path, options.token, options.notFoundPhase).then((diagnosis) => {
         if (closed) {
           return;
         }
@@ -1362,7 +1364,11 @@ function openReconnectingWebSocket(options: ReconnectingWebSocketOptions) {
   };
 }
 
-async function diagnoseWebSocketFailure(path: string, token: string): Promise<WebSocketDiagnosis> {
+async function diagnoseWebSocketFailure(
+  path: string,
+  token: string,
+  notFoundPhase: FailureConnectionPhase = "failed"
+): Promise<WebSocketDiagnosis> {
   try {
     const response = await fetch(withTokenQuery(path, token), {
       cache: "no-store",
@@ -1395,7 +1401,7 @@ async function diagnoseWebSocketFailure(path: string, token: string): Promise<We
     }
     if (response.status === 404) {
       return {
-        phase: "missing",
+        phase: notFoundPhase,
         detail: detail || "Stream not found.",
         retryable: false
       };
