@@ -19,6 +19,8 @@ type PipeOutputFunc func(session, window string) (<-chan string, func(), error)
 
 type SendKeysFunc func(ctx context.Context, session, window, keys string) error
 
+type SessionAliveFunc func(ctx context.Context, session string) (bool, error)
+
 type WindowAliveFunc func(ctx context.Context, session, window string) (bool, error)
 
 type wsMessage struct {
@@ -146,14 +148,37 @@ func (s *Server) handleOrchestratorLogWS(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusNotFound, "orchestrator websocket route not found")
 		return
 	}
-	cfg, ok := s.configSnapshot()
-	if !ok {
-		writeError(w, http.StatusInternalServerError, "config is not configured")
+	window, err := s.orchestratorWindowName()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	window := "orchestrator"
-	if s.projectScoped && cfg.Project.Slug != "" {
-		window = cfg.Project.Slug + "-orchestrator"
+	session, err := s.tmuxSessionName()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	aliveCtx, cancel := context.WithTimeout(r.Context(), followupTmuxOperationTimeout)
+	sessionAlive, err := s.isSessionAlive(aliveCtx, session)
+	cancel()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "check tmux session")
+		return
+	}
+	if !sessionAlive {
+		writeError(w, http.StatusNotFound, "tmux session not found")
+		return
+	}
+	aliveCtx, cancel = context.WithTimeout(r.Context(), followupTmuxOperationTimeout)
+	windowAlive, err := s.isWindowAlive(aliveCtx, session, window)
+	cancel()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "check orchestrator tmux window")
+		return
+	}
+	if !windowAlive {
+		writeError(w, http.StatusNotFound, "orchestrator tmux window not found")
+		return
 	}
 	s.handleTmuxLogWS(w, r, window, "orchestrator")
 }

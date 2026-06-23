@@ -2393,6 +2393,18 @@ func TestProjectOrchestratorLogWebSocketStreamsProjectWindow(t *testing.T) {
 	server := httptest.NewServer(New(Deps{
 		Config:  cfg,
 		Manager: manager,
+		IsSessionAlive: func(ctx context.Context, session string) (bool, error) {
+			if session != "ccx-test" {
+				t.Fatalf("session args = %q, want ccx-test", session)
+			}
+			return true, nil
+		},
+		IsWindowAlive: func(ctx context.Context, session, window string) (bool, error) {
+			if session != "ccx-test" || window != "alpha-orchestrator" {
+				t.Fatalf("alive args = %q %q, want ccx-test alpha-orchestrator", session, window)
+			}
+			return true, nil
+		},
 		PipeOutput: func(session, window string) (<-chan string, func(), error) {
 			if session != "ccx-test" || window != "alpha-orchestrator" {
 				t.Fatalf("pipe args = %q %q, want ccx-test alpha-orchestrator", session, window)
@@ -2414,6 +2426,37 @@ func TestProjectOrchestratorLogWebSocketStreamsProjectWindow(t *testing.T) {
 	}
 	if msg.Type != "line" || msg.Data != "orchestrator ready" {
 		t.Fatalf("message = %#v, want orchestrator line", msg)
+	}
+}
+
+func TestProjectOrchestratorLogWebSocketRejectsMissingWindow(t *testing.T) {
+	cfg, manager := newTestProjectManager(t, "alpha")
+	server := httptest.NewServer(New(Deps{
+		Config:  cfg,
+		Manager: manager,
+		IsSessionAlive: func(ctx context.Context, session string) (bool, error) {
+			return true, nil
+		},
+		IsWindowAlive: func(ctx context.Context, session, window string) (bool, error) {
+			if session != "ccx-test" || window != "alpha-orchestrator" {
+				t.Fatalf("alive args = %q %q, want ccx-test alpha-orchestrator", session, window)
+			}
+			return false, nil
+		},
+		PipeOutput: func(session, window string) (<-chan string, func(), error) {
+			t.Fatalf("PipeOutput called for missing orchestrator window %q in session %q", window, session)
+			return nil, nil, nil
+		},
+		AuthDisabled: true,
+	}))
+	defer server.Close()
+
+	_, resp, err := websocket.DefaultDialer.Dial(wsURL(server.URL, "/ws/projects/alpha/orchestrator"), nil)
+	if err == nil {
+		t.Fatal("Dial error = nil, want not found")
+	}
+	if resp == nil || resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("response = %#v, want 404", resp)
 	}
 }
 
@@ -2439,6 +2482,12 @@ func TestProjectOrchestratorLogWebSocketRejectsSecondSubscriber(t *testing.T) {
 	server := httptest.NewServer(New(Deps{
 		Config:  cfg,
 		Manager: manager,
+		IsSessionAlive: func(ctx context.Context, session string) (bool, error) {
+			return true, nil
+		},
+		IsWindowAlive: func(ctx context.Context, session, window string) (bool, error) {
+			return true, nil
+		},
 		PipeOutput: func(session, window string) (<-chan string, func(), error) {
 			return lines, func() {}, nil
 		},
@@ -2570,6 +2619,205 @@ func TestWorkerLogWebSocketRejectsSecondSubscriber(t *testing.T) {
 		t.Fatalf("response = %#v, want 409", resp)
 	}
 	close(lines)
+}
+
+func TestProjectOrchestratorInputRequiresPostAndAuth(t *testing.T) {
+	cfg, manager := newTestProjectManager(t, "alpha")
+	handler := New(Deps{Config: cfg, Manager: manager, Secret: "web-secret"})
+
+	unauthorized := performJSONRequest(handler, http.MethodPost, "/api/projects/alpha/orchestrator/input", `{
+		"message": "status"
+	}`)
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized status = %d, want %d", unauthorized.Code, http.StatusUnauthorized)
+	}
+
+	authorizedGet := performRequestWithHeaders(handler, http.MethodGet, "/api/projects/alpha/orchestrator/input", map[string]string{
+		"Authorization": "Bearer web-secret",
+	})
+	if authorizedGet.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("method status = %d, want %d", authorizedGet.Code, http.StatusMethodNotAllowed)
+	}
+	if allow := authorizedGet.Header().Get("Allow"); allow != "POST" {
+		t.Fatalf("Allow = %q, want POST", allow)
+	}
+}
+
+func TestProjectOrchestratorInputRejectsMissingProject(t *testing.T) {
+	cfg, manager := newTestProjectManager(t, "alpha")
+	handler := New(Deps{Config: cfg, Manager: manager, AuthDisabled: true})
+
+	resp := performJSONRequest(handler, http.MethodPost, "/api/projects/missing/orchestrator/input", `{
+		"message": "status"
+	}`)
+	if resp.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusNotFound, resp.Body.String())
+	}
+}
+
+func TestProjectOrchestratorInputSendsToProjectWindow(t *testing.T) {
+	cfg, manager := newTestProjectManager(t, "alpha")
+	var sentSession, sentWindow, sentKeys string
+	handler := New(Deps{
+		Config:  cfg,
+		Manager: manager,
+		IsSessionAlive: func(ctx context.Context, session string) (bool, error) {
+			if session != "ccx-test" {
+				t.Fatalf("session = %q, want ccx-test", session)
+			}
+			return true, nil
+		},
+		IsWindowAlive: func(ctx context.Context, session, window string) (bool, error) {
+			if session != "ccx-test" || window != "alpha-orchestrator" {
+				t.Fatalf("alive args = %q %q, want ccx-test alpha-orchestrator", session, window)
+			}
+			return true, nil
+		},
+		SendKeys: func(ctx context.Context, session, window, keys string) error {
+			sentSession, sentWindow, sentKeys = session, window, keys
+			return nil
+		},
+		AuthDisabled: true,
+	})
+
+	resp := performJSONRequest(handler, http.MethodPost, "/api/projects/alpha/orchestrator/input", `{
+		"message": "\r\nline one\r\nline two\r\n"
+	}`)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	if sentSession != "ccx-test" || sentWindow != "alpha-orchestrator" || sentKeys != "line one\nline two" {
+		t.Fatalf("sent = %q %q %q, want normalized project orchestrator input", sentSession, sentWindow, sentKeys)
+	}
+	var input orchestratorInputResponse
+	if err := json.Unmarshal(resp.Body.Bytes(), &input); err != nil {
+		t.Fatalf("decode input response: %v", err)
+	}
+	if !input.Sent || input.Session != "ccx-test" || input.Window != "alpha-orchestrator" {
+		t.Fatalf("input = %#v, want sent project orchestrator response", input)
+	}
+}
+
+func TestProjectOrchestratorInputRejectsMissingSession(t *testing.T) {
+	cfg, manager := newTestProjectManager(t, "alpha")
+	sendCalled := false
+	handler := New(Deps{
+		Config:  cfg,
+		Manager: manager,
+		IsSessionAlive: func(ctx context.Context, session string) (bool, error) {
+			return false, nil
+		},
+		IsWindowAlive: func(ctx context.Context, session, window string) (bool, error) {
+			t.Fatal("IsWindowAlive was called after missing session")
+			return false, nil
+		},
+		SendKeys: func(ctx context.Context, session, window, keys string) error {
+			sendCalled = true
+			return nil
+		},
+		AuthDisabled: true,
+	})
+
+	resp := performJSONRequest(handler, http.MethodPost, "/api/projects/alpha/orchestrator/input", `{
+		"message": "status"
+	}`)
+	if resp.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusNotFound, resp.Body.String())
+	}
+	if sendCalled {
+		t.Fatal("SendKeys was called after missing session")
+	}
+}
+
+func TestProjectOrchestratorInputRejectsMissingWindow(t *testing.T) {
+	cfg, manager := newTestProjectManager(t, "alpha")
+	sendCalled := false
+	handler := New(Deps{
+		Config:  cfg,
+		Manager: manager,
+		IsSessionAlive: func(ctx context.Context, session string) (bool, error) {
+			return true, nil
+		},
+		IsWindowAlive: func(ctx context.Context, session, window string) (bool, error) {
+			if session != "ccx-test" || window != "alpha-orchestrator" {
+				t.Fatalf("alive args = %q %q, want ccx-test alpha-orchestrator", session, window)
+			}
+			return false, nil
+		},
+		SendKeys: func(ctx context.Context, session, window, keys string) error {
+			sendCalled = true
+			return nil
+		},
+		AuthDisabled: true,
+	})
+
+	resp := performJSONRequest(handler, http.MethodPost, "/api/projects/alpha/orchestrator/input", `{
+		"message": "status"
+	}`)
+	if resp.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusNotFound, resp.Body.String())
+	}
+	if sendCalled {
+		t.Fatal("SendKeys was called after missing window")
+	}
+}
+
+func TestProjectOrchestratorInputReportsSendFailure(t *testing.T) {
+	cfg, manager := newTestProjectManager(t, "alpha")
+	handler := New(Deps{
+		Config:  cfg,
+		Manager: manager,
+		IsSessionAlive: func(ctx context.Context, session string) (bool, error) {
+			return true, nil
+		},
+		IsWindowAlive: func(ctx context.Context, session, window string) (bool, error) {
+			return true, nil
+		},
+		SendKeys: func(ctx context.Context, session, window, keys string) error {
+			return errors.New("send failed")
+		},
+		AuthDisabled: true,
+	})
+
+	resp := performJSONRequest(handler, http.MethodPost, "/api/projects/alpha/orchestrator/input", `{
+		"message": "status"
+	}`)
+	if resp.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusInternalServerError, resp.Body.String())
+	}
+	if !strings.Contains(resp.Body.String(), "send orchestrator input") {
+		t.Fatalf("body = %s, want send failure message", resp.Body.String())
+	}
+}
+
+func TestProjectOrchestratorInputRejectsControlCharacters(t *testing.T) {
+	cfg, manager := newTestProjectManager(t, "alpha")
+	sendCalled := false
+	handler := New(Deps{
+		Config:  cfg,
+		Manager: manager,
+		IsSessionAlive: func(ctx context.Context, session string) (bool, error) {
+			return true, nil
+		},
+		IsWindowAlive: func(ctx context.Context, session, window string) (bool, error) {
+			return true, nil
+		},
+		SendKeys: func(ctx context.Context, session, window, keys string) error {
+			sendCalled = true
+			return nil
+		},
+		AuthDisabled: true,
+	})
+
+	resp := performJSONRequest(handler, http.MethodPost, "/api/projects/alpha/orchestrator/input", `{
+		"message": "please stop\u0003"
+	}`)
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusBadRequest, resp.Body.String())
+	}
+	if sendCalled {
+		t.Fatal("SendKeys was called for unsafe orchestrator input")
+	}
 }
 
 func TestProjectWorkerFollowupSendsToActiveWorkerWindow(t *testing.T) {

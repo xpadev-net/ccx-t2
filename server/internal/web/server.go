@@ -38,6 +38,7 @@ type Server struct {
 	cleaner         WorkerCleaner
 	pipeOutput      PipeOutputFunc
 	sendKeys        SendKeysFunc
+	isSessionAlive  SessionAliveFunc
 	isWindowAlive   WindowAliveFunc
 	tmuxSession     string
 	projectScoped   bool
@@ -68,6 +69,7 @@ type Deps struct {
 	Cleaner        WorkerCleaner
 	PipeOutput     PipeOutputFunc
 	SendKeys       SendKeysFunc
+	IsSessionAlive SessionAliveFunc
 	IsWindowAlive  WindowAliveFunc
 	Session        string
 	Secret         string
@@ -87,6 +89,7 @@ func New(deps Deps) *Server {
 		trigger:        deps.Trigger,
 		pipeOutput:     deps.PipeOutput,
 		sendKeys:       deps.SendKeys,
+		isSessionAlive: deps.IsSessionAlive,
 		isWindowAlive:  deps.IsWindowAlive,
 		tmuxSession:    deps.Session,
 		secret:         deps.Secret,
@@ -105,6 +108,9 @@ func New(deps Deps) *Server {
 	}
 	if s.sendKeys == nil {
 		s.sendKeys = tmux.SendKeysContext
+	}
+	if s.isSessionAlive == nil {
+		s.isSessionAlive = tmux.SessionExistsContext
 	}
 	if s.isWindowAlive == nil {
 		s.isWindowAlive = tmux.IsWindowAliveContext
@@ -442,6 +448,11 @@ func (s *Server) handleProjectRoute(w http.ResponseWriter, r *http.Request) {
 			projectServer.sendWorkerFollowup(w, r, parts[2])
 			return
 		}
+	case "orchestrator":
+		if len(parts) == 3 && parts[2] == "input" {
+			projectServer.sendOrchestratorInput(w, r)
+			return
+		}
 	}
 	writeError(w, http.StatusNotFound, "project route not found")
 }
@@ -509,6 +520,7 @@ func (s *Server) projectServer(slug string) (*Server, error) {
 		trigger:         project.Orchestrator,
 		pipeOutput:      s.pipeOutput,
 		sendKeys:        s.sendKeys,
+		isSessionAlive:  s.isSessionAlive,
 		isWindowAlive:   s.isWindowAlive,
 		tmuxSession:     project.Session,
 		projectScoped:   true,
@@ -995,6 +1007,80 @@ func (s *Server) sendWorkerFollowup(w http.ResponseWriter, r *http.Request, work
 	})
 }
 
+func (s *Server) sendOrchestratorInput(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodPost) {
+		return
+	}
+	window, err := s.orchestratorWindowName()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	var req orchestratorInputRequest
+	if err := decodeJSON(w, r, &req); err != nil {
+		writeDecodeError(w, err)
+		return
+	}
+	message, err := normalizeFollowupMessage(req.Message)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	session, err := s.tmuxSessionName()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	aliveCtx, cancel := context.WithTimeout(r.Context(), followupTmuxOperationTimeout)
+	sessionAlive, err := s.isSessionAlive(aliveCtx, session)
+	cancel()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "check tmux session")
+		return
+	}
+	if !sessionAlive {
+		writeError(w, http.StatusNotFound, "tmux session not found")
+		return
+	}
+	aliveCtx, cancel = context.WithTimeout(r.Context(), followupTmuxOperationTimeout)
+	windowAlive, err := s.isWindowAlive(aliveCtx, session, window)
+	cancel()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "check orchestrator tmux window")
+		return
+	}
+	if !windowAlive {
+		writeError(w, http.StatusNotFound, "orchestrator tmux window not found")
+		return
+	}
+	sendCtx, cancel := context.WithTimeout(r.Context(), followupTmuxOperationTimeout)
+	defer cancel()
+	if err := s.sendKeys(sendCtx, session, window, message); err != nil {
+		writeError(w, http.StatusInternalServerError, "send orchestrator input")
+		return
+	}
+	writeJSON(w, http.StatusOK, orchestratorInputResponse{
+		Sent:    true,
+		Session: session,
+		Window:  window,
+	})
+}
+
+func (s *Server) orchestratorWindowName() (string, error) {
+	cfg, ok := s.configSnapshot()
+	if !ok {
+		return "", fmt.Errorf("config is not configured")
+	}
+	slug := strings.TrimSpace(cfg.Project.Slug)
+	if s.projectScoped {
+		if slug == "" {
+			return "", fmt.Errorf("project is not configured")
+		}
+		return slug + "-orchestrator", nil
+	}
+	return "orchestrator", nil
+}
+
 func (s *Server) activeTaskForWorker(workerID string) (ledger.Task, error) {
 	tasks, err := s.ledger.Load()
 	if err != nil {
@@ -1192,6 +1278,16 @@ type workerFollowupResponse struct {
 	WorkerID string `json:"worker_id"`
 	Session  string `json:"session"`
 	Window   string `json:"window"`
+}
+
+type orchestratorInputRequest struct {
+	Message string `json:"message"`
+}
+
+type orchestratorInputResponse struct {
+	Sent    bool   `json:"sent"`
+	Session string `json:"session"`
+	Window  string `json:"window"`
 }
 
 type taskMutationRequest struct {

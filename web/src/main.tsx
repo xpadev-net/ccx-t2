@@ -36,6 +36,12 @@ type WorkerFollowupResponse = {
   window: string;
 };
 
+type OrchestratorInputResponse = {
+  sent: boolean;
+  session: string;
+  window: string;
+};
+
 type WorkerInfo = {
   worker_id: string;
   task_id: string;
@@ -107,8 +113,17 @@ type TaskEditorDirty = {
   status: boolean;
 };
 
-type ConnectionPhase = "idle" | "connecting" | "open" | "retrying" | "unauthorized" | "forbidden" | "blocked" | "failed";
-type FailureConnectionPhase = "unauthorized" | "forbidden" | "blocked" | "failed";
+type ConnectionPhase =
+  | "idle"
+  | "connecting"
+  | "open"
+  | "retrying"
+  | "unauthorized"
+  | "forbidden"
+  | "blocked"
+  | "missing"
+  | "failed";
+type FailureConnectionPhase = "unauthorized" | "forbidden" | "blocked" | "missing" | "failed";
 
 type ConnectionState =
   | {
@@ -173,6 +188,8 @@ function App() {
   const [workerConnection, setWorkerConnection] = useState<ConnectionState>(() =>
     idleConnection("Select a worker to open its log stream.")
   );
+  const [orchestratorInput, setOrchestratorInput] = useState("");
+  const [orchestratorInputSending, setOrchestratorInputSending] = useState(false);
   const [followupMessage, setFollowupMessage] = useState("");
   const [followupSending, setFollowupSending] = useState(false);
   const [projects, setProjects] = useState<ProjectInfo[]>([]);
@@ -274,6 +291,7 @@ function App() {
     if (!selectedProjectSlug) {
       setOrchestratorLog([]);
       setOrchestratorConnection(idleConnection("Select a project to open the orchestrator log."));
+      setOrchestratorInput("");
       return;
     }
     setOrchestratorLog([]);
@@ -576,6 +594,33 @@ function App() {
     }
   }
 
+  async function sendOrchestratorInput(event: FormEvent) {
+    event.preventDefault();
+    if (!selectedProjectSlug || !orchestratorInput.trim()) {
+      return;
+    }
+    setOrchestratorInputSending(true);
+    setError("");
+    setMessage("");
+    setWarning("");
+    try {
+      const response = await api<OrchestratorInputResponse>(
+        orchestratorInputPath(selectedProjectSlug),
+        {
+          method: "POST",
+          body: JSON.stringify({ message: orchestratorInput })
+        },
+        token
+      );
+      setOrchestratorInput("");
+      setMessage(`Input sent to ${response.window}.`);
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setOrchestratorInputSending(false);
+    }
+  }
+
   async function saveConfig(event: FormEvent) {
     event.preventDefault();
     setSaving(true);
@@ -672,6 +717,7 @@ function App() {
     setSelectedWorkerID("");
     setWorkerLog([]);
     setOrchestratorLog([]);
+    setOrchestratorInput("");
     setFollowupMessage("");
   }
 
@@ -929,6 +975,24 @@ function App() {
               "Select a project to open the orchestrator log."
             )}</pre>
           </div>
+          <form className="orchestrator-input-form" onSubmit={sendOrchestratorInput}>
+            <label>
+              Orchestrator input
+              <textarea
+                value={orchestratorInput}
+                onChange={(event) => setOrchestratorInput(event.target.value)}
+                disabled={!selectedProjectSlug || orchestratorInputSending}
+              />
+            </label>
+            <div className="actions">
+              <button
+                type="submit"
+                disabled={!selectedProjectSlug || orchestratorInputSending || !orchestratorInput.trim()}
+              >
+                Send Input
+              </button>
+            </div>
+          </form>
         </section>
 
         <section className="worker-dashboard" aria-label="Worker dashboard">
@@ -1331,7 +1395,7 @@ async function diagnoseWebSocketFailure(path: string, token: string): Promise<We
     }
     if (response.status === 404) {
       return {
-        phase: "failed",
+        phase: "missing",
         detail: detail || "Stream not found.",
         retryable: false
       };
@@ -1411,6 +1475,7 @@ function logDisplayText(lines: string[], state: ConnectionState, emptyText: stri
     case "unauthorized":
     case "forbidden":
     case "blocked":
+    case "missing":
     case "failed":
       return state.detail || connectionLabel(state);
   }
@@ -1447,6 +1512,8 @@ function connectionLabel(state: ConnectionState) {
       return "Forbidden";
     case "blocked":
       return "Blocked";
+    case "missing":
+      return "Missing";
     case "failed":
       return "Disconnected";
   }
@@ -1469,6 +1536,7 @@ function connectionTone(phase: ConnectionPhase) {
     case "unauthorized":
     case "forbidden":
     case "blocked":
+    case "missing":
     case "failed":
       return "problem";
     case "idle":
@@ -1577,6 +1645,10 @@ function ledgerWSPath(projectSlug: string) {
 
 function orchestratorLogPath(projectSlug: string) {
   return projectSlug ? `/ws/projects/${encodeURIComponent(projectSlug)}/orchestrator` : "/ws/orchestrator";
+}
+
+function orchestratorInputPath(projectSlug: string) {
+  return `/api/projects/${encodeURIComponent(projectSlug)}/orchestrator/input`;
 }
 
 function workerFollowupPath(projectSlug: string, workerID: string) {

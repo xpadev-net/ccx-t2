@@ -428,10 +428,15 @@ button:disabled {
   overflow-wrap: anywhere;
 }
 
+.orchestrator-input-form,
 .followup-form {
   display: grid;
   gap: 12px;
   margin-top: 14px;
+}
+
+.orchestrator-input-form textarea {
+  min-height: 96px;
 }
 
 .followup-form textarea {
