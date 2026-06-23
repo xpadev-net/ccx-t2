@@ -187,7 +187,7 @@ func stringArg(args map[string]any, key string) (string, error) {
 // optionalStringArg extracts an optional string argument.
 func optionalStringArg(args map[string]any, key string) (string, error) {
 	v, ok := args[key]
-	if !ok {
+	if !ok || v == nil {
 		return "", nil
 	}
 	s, ok := v.(string)

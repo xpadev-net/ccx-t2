@@ -1366,6 +1366,26 @@ func TestHandleCreateTaskAcceptsNaturalLanguageRequestWithoutTitle(t *testing.T)
 	}
 }
 
+func TestHandleCreateTaskTreatsNullOptionalStringAsAbsent(t *testing.T) {
+	dir := t.TempDir()
+	l := ledger.NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
+
+	_, err := handleCreateTask(&Deps{Ledger: l})(context.Background(), map[string]any{
+		"description": nil,
+		"request":     "Please investigate nullable optional string intake.",
+	})
+	if err != nil {
+		t.Fatalf("handleCreateTask: %v", err)
+	}
+	tasks, err := l.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(tasks) != 1 || tasks[0].Body != "Please investigate nullable optional string intake." {
+		t.Fatalf("tasks = %#v, want request body with null description ignored", tasks)
+	}
+}
+
 func TestHandleCreateTaskRejectsMalformedOptionalStrings(t *testing.T) {
 	cases := []struct {
 		name  string
