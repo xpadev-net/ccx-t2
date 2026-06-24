@@ -73,7 +73,7 @@ func TestBuildHarnessLaunchCommandExpandsWorkerSecretFromTempFile(t *testing.T) 
 	dir := t.TempDir()
 	secretPath := filepath.Join(dir, "secret")
 	outputPath := filepath.Join(dir, "argv")
-	secret := `tok en ' "$HOME" $(echo nope); *`
+	secret := "tok en ' \"$HOME\" $(echo nope); *\n\n"
 	want := "prefix:" + secret + ":suffix"
 
 	if err := os.WriteFile(secretPath, []byte(secret), 0o600); err != nil {

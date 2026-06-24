@@ -1006,12 +1006,16 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 		}
 		harnessCmd := buildHarnessLaunchCommand(hCfg.Command, mcpTokens, secretPath)
 		if err := ops.sendKeys(spawnCtx, toolDeps.Session, workerID, harnessCmd); err != nil {
-			_ = os.Remove(secretPath)
+			if secretPath != "" {
+				_ = os.Remove(secretPath)
+			}
 			rollbackSpawnAfterLedgerUpdate(spawnCtx, ops, toolDeps, workerID, branch, taskID, repoPath, worktreePath)
 			return nil, fmt.Errorf("send harness command: %w", err)
 		}
 		if err := ops.waitForHarnessProcess(spawnCtx, toolDeps.Session, workerID, harnessStartupTimeout); err != nil {
-			_ = os.Remove(secretPath)
+			if secretPath != "" {
+				_ = os.Remove(secretPath)
+			}
 			rollbackSpawnAfterLedgerUpdate(spawnCtx, ops, toolDeps, workerID, branch, taskID, repoPath, worktreePath)
 			return nil, fmt.Errorf("wait for harness process: %w", err)
 		}
@@ -2214,7 +2218,8 @@ func buildHarnessLaunchCommand(command string, mcpTokens []string, secretPath st
 		return buildHarnessCommand(command, mcpTokens)
 	}
 	quotedSecretPath := shellQuoteArg(secretPath)
-	return workerMCPSecretEnvName + "=$(cat " + quotedSecretPath + "); export " + workerMCPSecretEnvName +
+	return workerMCPSecretEnvName + "=$(cat " + quotedSecretPath + "; printf x); " +
+		workerMCPSecretEnvName + "=${" + workerMCPSecretEnvName + "%x}; export " + workerMCPSecretEnvName +
 		"; rm -f " + quotedSecretPath + "; exec " + buildHarnessCommandWithSecretEnv(command, mcpTokens)
 }
 
