@@ -1436,6 +1436,178 @@ func TestRegisterWorkerToolsNotifyUsesSelectedProjectTrigger(t *testing.T) {
 	}
 }
 
+func TestHandleStopWorkerRequiresSelectedProjectOwnership(t *testing.T) {
+	_, manager, alpha, beta := setupWorkerScopeProjectManager(t)
+	if err := alpha.Ledger.Add(ledger.Task{
+		ID:       "task-alpha",
+		Title:    "Alpha",
+		Status:   "in_progress",
+		Branch:   "feature/task-alpha",
+		WorkerID: "worker-alpha",
+		Harness:  "codex",
+	}); err != nil {
+		t.Fatalf("Add alpha: %v", err)
+	}
+	if err := beta.Ledger.Add(ledger.Task{
+		ID:       "task-beta",
+		Title:    "Beta",
+		Status:   "in_progress",
+		Branch:   "feature/task-beta",
+		WorkerID: "worker-beta",
+		Harness:  "codex",
+	}); err != nil {
+		t.Fatalf("Add beta: %v", err)
+	}
+	beta.Registry.Register(worker.Info{TaskID: "task-beta", WorkerID: "worker-beta", Harness: "codex"})
+
+	var cleanupCalls []string
+	cleanupOps := workerCleanupOps{
+		isWindowAlive: func(_, window string) (bool, error) {
+			cleanupCalls = append(cleanupCalls, "isWindowAlive:"+window)
+			return false, nil
+		},
+		killWindow: func(_, window string) error {
+			cleanupCalls = append(cleanupCalls, "killWindow:"+window)
+			return nil
+		},
+		removeWorktree: func(_, worktreePath string) error {
+			cleanupCalls = append(cleanupCalls, "removeWorktree:"+filepath.Base(worktreePath))
+			return nil
+		},
+		deleteTaskBranch: func(_, branch, taskID string) error {
+			cleanupCalls = append(cleanupCalls, "deleteTaskBranch:"+branch+":"+taskID)
+			return nil
+		},
+	}
+	s := NewServer("worker", "")
+	RegisterOrchestratorTools(s, &Deps{Manager: manager, cleanup: cleanupOps})
+
+	resp := callMCPToolForTest(t, s, "stop_worker", map[string]any{
+		"project_slug": "alpha",
+		"worker_id":    "worker-beta",
+	})
+	errPayload, ok := resp["error"].(map[string]any)
+	if !ok {
+		t.Fatalf("stop_worker alpha/beta response = %#v, want ownership error", resp)
+	}
+	msg, _ := errPayload["message"].(string)
+	if !strings.Contains(msg, `worker "worker-beta" not found in registry or ledger`) {
+		t.Fatalf("stop_worker alpha/beta error = %q, want not found in selected project", msg)
+	}
+	if len(cleanupCalls) != 0 {
+		t.Fatalf("cleanup calls for wrong project = %#v, want none", cleanupCalls)
+	}
+	if _, ok := beta.Registry.Get("worker-beta"); !ok {
+		t.Fatal("beta registry entry removed after alpha stop_worker rejection")
+	}
+	betaTasks, err := beta.Ledger.Load()
+	if err != nil {
+		t.Fatalf("Load beta after rejection: %v", err)
+	}
+	if len(betaTasks) != 1 || betaTasks[0].Status != "in_progress" || betaTasks[0].WorkerID != "worker-beta" ||
+		betaTasks[0].Branch != "feature/task-beta" || betaTasks[0].Harness != "codex" {
+		t.Fatalf("beta task after alpha stop_worker = %#v, want untouched active worker", betaTasks)
+	}
+
+	resp = callMCPToolForTest(t, s, "stop_worker", map[string]any{
+		"project_slug": "beta",
+		"worker_id":    "worker-beta",
+	})
+	if errPayload, ok := resp["error"]; ok {
+		t.Fatalf("stop_worker beta returned error: %#v", errPayload)
+	}
+	wantCalls := []string{
+		"isWindowAlive:worker-beta",
+		"removeWorktree:beta-task-beta",
+		"deleteTaskBranch:feature/task-beta:task-beta",
+	}
+	if !reflect.DeepEqual(cleanupCalls, wantCalls) {
+		t.Fatalf("cleanup calls = %#v, want %#v", cleanupCalls, wantCalls)
+	}
+	betaTasks, err = beta.Ledger.Load()
+	if err != nil {
+		t.Fatalf("Load beta after stop: %v", err)
+	}
+	if len(betaTasks) != 1 || betaTasks[0].Status != "unstarted" || betaTasks[0].WorkerID != "" ||
+		betaTasks[0].Branch != "" || betaTasks[0].Harness != "" {
+		t.Fatalf("beta task after owned stop_worker = %#v, want reset worker fields", betaTasks)
+	}
+	if _, ok := beta.Registry.Get("worker-beta"); ok {
+		t.Fatal("beta registry entry remained after owned stop_worker")
+	}
+}
+
+func TestHandleFollowupWorkerRequiresSelectedProjectOwnership(t *testing.T) {
+	_, manager, alpha, beta := setupWorkerScopeProjectManager(t)
+	if err := alpha.Ledger.Add(ledger.Task{
+		ID:       "task-alpha",
+		Title:    "Alpha",
+		Status:   "in_progress",
+		WorkerID: "worker-alpha",
+	}); err != nil {
+		t.Fatalf("Add alpha: %v", err)
+	}
+	if err := beta.Ledger.Add(ledger.Task{
+		ID:       "task-beta",
+		Title:    "Beta",
+		Status:   "in_progress",
+		WorkerID: "worker-beta",
+	}); err != nil {
+		t.Fatalf("Add beta: %v", err)
+	}
+
+	var followupCalls []string
+	followupOps := workerFollowupOps{
+		isWindowAlive: func(_, window string) (bool, error) {
+			followupCalls = append(followupCalls, "isWindowAlive:"+window)
+			return true, nil
+		},
+		sendKeys: func(_, window, keys string) error {
+			followupCalls = append(followupCalls, "sendKeys:"+window+":"+keys)
+			return nil
+		},
+	}
+	s := NewServer("worker", "")
+	RegisterOrchestratorTools(s, &Deps{Manager: manager, followup: followupOps})
+
+	resp := callMCPToolForTest(t, s, "followup_worker", map[string]any{
+		"project_slug": "alpha",
+		"worker_id":    "worker-beta",
+		"message":      "hello beta",
+	})
+	errPayload, ok := resp["error"].(map[string]any)
+	if !ok {
+		t.Fatalf("followup_worker alpha/beta response = %#v, want ownership error", resp)
+	}
+	msg, _ := errPayload["message"].(string)
+	if !strings.Contains(msg, `no task found with worker_id "worker-beta"`) {
+		t.Fatalf("followup_worker alpha/beta error = %q, want not found in selected project", msg)
+	}
+	if len(followupCalls) != 0 {
+		t.Fatalf("followup tmux calls for wrong project = %#v, want none", followupCalls)
+	}
+
+	resp = callMCPToolForTest(t, s, "followup_worker", map[string]any{
+		"project_slug": "beta",
+		"worker_id":    "worker-beta",
+		"message":      "hello beta",
+	})
+	if errPayload, ok := resp["error"]; ok {
+		t.Fatalf("followup_worker beta returned error: %#v", errPayload)
+	}
+	wantCalls := []string{"isWindowAlive:worker-beta", "sendKeys:worker-beta:hello beta"}
+	if !reflect.DeepEqual(followupCalls, wantCalls) {
+		t.Fatalf("followup calls = %#v, want %#v", followupCalls, wantCalls)
+	}
+	betaTasks, err := beta.Ledger.Load()
+	if err != nil {
+		t.Fatalf("Load beta after followup: %v", err)
+	}
+	if len(betaTasks) != 1 || betaTasks[0].Status != "in_progress" || betaTasks[0].WorkerID != "worker-beta" {
+		t.Fatalf("beta task after followup = %#v, want unchanged active worker", betaTasks)
+	}
+}
+
 func TestHandleCreateTaskAcceptsNaturalLanguageRequestWithoutTitle(t *testing.T) {
 	dir := t.TempDir()
 	l := ledger.NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
@@ -3043,6 +3215,58 @@ func testMCPDeps(dir string, l *ledger.Ledger) *Deps {
 		Session: "missing-session",
 		cleanup: successfulCleanupOps(),
 	}
+}
+
+func setupWorkerScopeProjectManager(t *testing.T) (*config.Config, *runtimepkg.Manager, *runtimepkg.ProjectRuntime, *runtimepkg.ProjectRuntime) {
+	t.Helper()
+	dir := t.TempDir()
+	worktreeBase := filepath.Join(dir, "worktrees")
+	if err := os.MkdirAll(worktreeBase, 0o755); err != nil {
+		t.Fatalf("MkdirAll worktrees: %v", err)
+	}
+	alphaRepo := initTestRepo(t)
+	betaRepo := initTestRepo(t)
+	cfg := &config.Config{
+		Server:  config.ServerConfig{Port: 8080},
+		Runtime: config.RuntimeConfig{TmuxSession: "ccx-test", WorktreeBase: worktreeBase},
+		Orchestrator: config.OrchestratorConfig{
+			Harness:           "sh",
+			HeartbeatInterval: time.Minute,
+			Timeout:           time.Minute,
+		},
+		WorkerHarnesses: []string{"sh"},
+		Harnesses: map[string]config.HarnessConfig{
+			"sh": {Command: "sh", McpArgs: "--mcp-url {url}"},
+		},
+		Projects: map[string]config.ProjectConfig{
+			"alpha": {
+				RepoPath:     alphaRepo,
+				LedgerPath:   filepath.Join(alphaRepo, "tasks", "ledger.md"),
+				WorktreeBase: worktreeBase,
+			},
+			"beta": {
+				RepoPath:     betaRepo,
+				LedgerPath:   filepath.Join(betaRepo, "tasks", "ledger.md"),
+				WorktreeBase: worktreeBase,
+			},
+		},
+	}
+	if err := config.Prepare(cfg); err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	manager, err := runtimepkg.NewManager(cfg, "http://127.0.0.1:8080")
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	alpha, err := manager.Project("alpha")
+	if err != nil {
+		t.Fatalf("Project alpha: %v", err)
+	}
+	beta, err := manager.Project("beta")
+	if err != nil {
+		t.Fatalf("Project beta: %v", err)
+	}
+	return cfg, manager, alpha, beta
 }
 
 func githubFilesClientForTest(t *testing.T, files []string) *githubpkg.Client {
