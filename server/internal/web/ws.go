@@ -17,15 +17,44 @@ import (
 // function that stops the stream.
 type PipeOutputFunc func(session, window string) (<-chan string, func(), error)
 
+// PipeBytesFunc streams tmux pane output as raw bytes and returns a cleanup
+// function that stops the stream.
+type PipeBytesFunc func(session, window string) (<-chan []byte, func(), error)
+
+type CapturePaneFunc func(ctx context.Context, session, window string) ([]byte, error)
+
 type SendKeysFunc func(ctx context.Context, session, window, keys string) error
+
+type SendRawKeysFunc func(ctx context.Context, session, window, keys string) error
 
 type SessionAliveFunc func(ctx context.Context, session string) (bool, error)
 
 type WindowAliveFunc func(ctx context.Context, session, window string) (bool, error)
 
+type ResizePaneFunc func(ctx context.Context, session, window string, cols, rows int) error
+
 type wsMessage struct {
 	Type string `json:"type"`
 	Data string `json:"data,omitempty"`
+	Cols int    `json:"cols,omitempty"`
+	Rows int    `json:"rows,omitempty"`
+}
+
+func pipeLinesAsBytes(pipe PipeOutputFunc) PipeBytesFunc {
+	return func(session, window string) (<-chan []byte, func(), error) {
+		lines, cleanup, err := pipe(session, window)
+		if err != nil {
+			return nil, nil, err
+		}
+		chunks := make(chan []byte, 128)
+		go func() {
+			defer close(chunks)
+			for line := range lines {
+				chunks <- []byte(line)
+			}
+		}()
+		return chunks, cleanup, nil
+	}
 }
 
 type ledgerWSClient struct {
@@ -35,7 +64,15 @@ type ledgerWSClient struct {
 
 type tmuxStreamRegistry struct {
 	mu      sync.Mutex
-	streams map[string]struct{}
+	streams map[string]*tmuxSharedStream
+}
+
+type tmuxSharedStream struct {
+	key         string
+	cleanup     func()
+	cleanupOnce sync.Once
+	subscribers map[chan []byte]struct{}
+	closed      bool
 }
 
 const wsWriteTimeout = 5 * time.Second
@@ -189,18 +226,26 @@ func (s *Server) handleTmuxLogWS(w http.ResponseWriter, r *http.Request, window,
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	streamKey := session + "\x00" + window
-	if !s.reserveTmuxStream(streamKey) {
-		writeError(w, http.StatusConflict, label+" log stream already open")
-		return
-	}
-	defer s.releaseTmuxStream(streamKey)
 	conn, err := s.upgradeWebSocket(w, r)
 	if err != nil {
 		return
 	}
 	defer conn.Close()
-	lines, cleanup, err := s.pipeOutput(session, window)
+	if s.capturePane != nil {
+		captureCtx, captureCancel := context.WithTimeout(r.Context(), followupTmuxOperationTimeout)
+		snapshot, err := s.capturePane(captureCtx, session, window)
+		captureCancel()
+		if err != nil {
+			_ = writeWSJSON(conn, wsMessage{Type: "error", Data: "capture " + label + " pane"})
+			return
+		}
+		if len(snapshot) > 0 {
+			if err := writeWSJSON(conn, wsMessage{Type: "chunk", Data: string(snapshot)}); err != nil {
+				return
+			}
+		}
+	}
+	chunks, cleanup, err := s.subscribeTmuxStream(session, window)
 	if err != nil {
 		_ = writeWSJSON(conn, wsMessage{Type: "error", Data: "open " + label + " log stream"})
 		return
@@ -209,19 +254,68 @@ func (s *Server) handleTmuxLogWS(w http.ResponseWriter, r *http.Request, window,
 
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
-	go discardWSReads(ctx, conn, cancel)
+	go handleTmuxClientMessages(ctx, conn, session, window, s.sendRawKeys, s.resizePane, cancel)
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case line, ok := <-lines:
+		case chunk, ok := <-chunks:
 			if !ok {
 				_ = writeWSJSON(conn, wsMessage{Type: "closed"})
 				return
 			}
-			if err := writeWSJSON(conn, wsMessage{Type: "line", Data: line}); err != nil {
+			if err := writeWSJSON(conn, wsMessage{Type: "chunk", Data: string(chunk)}); err != nil {
 				return
 			}
+		}
+	}
+}
+
+func handleTmuxClientMessages(ctx context.Context, conn *websocket.Conn, session, window string, sendRawKeys SendRawKeysFunc, resizePane ResizePaneFunc, cancel context.CancelFunc) {
+	defer cancel()
+	if sendRawKeys == nil && resizePane == nil {
+		discardWSReads(ctx, conn, cancel)
+		return
+	}
+	conn.SetReadLimit(maxFollowupMessageBytes)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		var msg wsMessage
+		if err := conn.ReadJSON(&msg); err != nil {
+			if !errors.Is(err, websocket.ErrCloseSent) {
+				_ = conn.Close()
+			}
+			return
+		}
+		switch msg.Type {
+		case "input":
+			if msg.Data == "" || sendRawKeys == nil {
+				continue
+			}
+			sendCtx, sendCancel := context.WithTimeout(ctx, followupTmuxOperationTimeout)
+			err := sendRawKeys(sendCtx, session, window, msg.Data)
+			sendCancel()
+			if err != nil {
+				_ = conn.Close()
+				return
+			}
+		case "resize":
+			if resizePane == nil || msg.Cols <= 0 || msg.Rows <= 0 {
+				continue
+			}
+			resizeCtx, resizeCancel := context.WithTimeout(ctx, followupTmuxOperationTimeout)
+			err := resizePane(resizeCtx, session, window, msg.Cols, msg.Rows)
+			resizeCancel()
+			if err != nil {
+				_ = conn.Close()
+				return
+			}
+		default:
+			continue
 		}
 	}
 }
@@ -360,33 +454,6 @@ func writeWSJSON(conn *websocket.Conn, msg wsMessage) error {
 	return conn.WriteJSON(msg)
 }
 
-func (s *Server) reserveTmuxStream(key string) bool {
-	streams := s.tmuxStreams
-	if streams == nil {
-		return true
-	}
-	streams.mu.Lock()
-	defer streams.mu.Unlock()
-	if streams.streams == nil {
-		streams.streams = make(map[string]struct{})
-	}
-	if _, ok := streams.streams[key]; ok {
-		return false
-	}
-	streams.streams[key] = struct{}{}
-	return true
-}
-
-func (s *Server) releaseTmuxStream(key string) {
-	streams := s.tmuxStreams
-	if streams == nil {
-		return
-	}
-	streams.mu.Lock()
-	defer streams.mu.Unlock()
-	delete(streams.streams, key)
-}
-
 func discardWSReads(ctx context.Context, conn *websocket.Conn, cancel context.CancelFunc) {
 	defer cancel()
 	for {
@@ -402,6 +469,97 @@ func discardWSReads(ctx context.Context, conn *websocket.Conn, cancel context.Ca
 			return
 		}
 	}
+}
+
+func (s *Server) subscribeTmuxStream(session, window string) (<-chan []byte, func(), error) {
+	if s.tmuxStreams == nil {
+		return s.pipeBytes(session, window)
+	}
+	return s.tmuxStreams.subscribe(session+"\x00"+window, session, window, s.pipeBytes)
+}
+
+func (r *tmuxStreamRegistry) subscribe(key, session, window string, pipe PipeBytesFunc) (<-chan []byte, func(), error) {
+	if pipe == nil {
+		return nil, nil, errors.New("tmux pipe is not configured")
+	}
+	r.mu.Lock()
+	if r.streams == nil {
+		r.streams = make(map[string]*tmuxSharedStream)
+	}
+	stream := r.streams[key]
+	if stream == nil || stream.closed {
+		chunks, cleanup, err := pipe(session, window)
+		if err != nil {
+			r.mu.Unlock()
+			return nil, nil, err
+		}
+		stream = &tmuxSharedStream{
+			key:         key,
+			cleanup:     cleanup,
+			subscribers: make(map[chan []byte]struct{}),
+		}
+		r.streams[key] = stream
+		go r.runStream(stream, chunks)
+	}
+	sub := make(chan []byte, 128)
+	stream.subscribers[sub] = struct{}{}
+	r.mu.Unlock()
+
+	var once sync.Once
+	cleanup := func() {
+		once.Do(func() {
+			r.mu.Lock()
+			defer r.mu.Unlock()
+			current := r.streams[key]
+			if current != stream || stream.closed {
+				return
+			}
+			delete(stream.subscribers, sub)
+			if len(stream.subscribers) == 0 {
+				stream.closed = true
+				delete(r.streams, key)
+				stream.closePipe()
+			}
+		})
+	}
+	return sub, cleanup, nil
+}
+
+func (r *tmuxStreamRegistry) runStream(stream *tmuxSharedStream, chunks <-chan []byte) {
+	defer stream.closePipe()
+	for chunk := range chunks {
+		r.mu.Lock()
+		subs := make([]chan []byte, 0, len(stream.subscribers))
+		for sub := range stream.subscribers {
+			subs = append(subs, sub)
+		}
+		r.mu.Unlock()
+		for _, sub := range subs {
+			select {
+			case sub <- chunk:
+			default:
+				// Keep the shared tmux pipe live even if one browser falls behind.
+			}
+		}
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if current := r.streams[stream.key]; current == stream {
+		delete(r.streams, stream.key)
+	}
+	stream.closed = true
+	for sub := range stream.subscribers {
+		close(sub)
+	}
+	stream.subscribers = nil
+}
+
+func (s *tmuxSharedStream) closePipe() {
+	if s.cleanup == nil {
+		return
+	}
+	s.cleanupOnce.Do(s.cleanup)
 }
 
 func (s *Server) addLedgerClient(scope string, client *ledgerWSClient) {

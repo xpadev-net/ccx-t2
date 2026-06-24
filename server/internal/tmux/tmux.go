@@ -81,6 +81,27 @@ func SendKeysContext(ctx context.Context, session, window, keys string) error {
 	return runCtx(ctx, "tmux", "send-keys", "-t", target, "Enter")
 }
 
+// SendRawKeys sends literal keys to a window's pane without appending Enter.
+func SendRawKeys(session, window, keys string) error {
+	return SendRawKeysContext(context.Background(), session, window, keys)
+}
+
+// SendRawKeysContext sends literal keys to a window's pane and aborts command
+// execution when ctx is canceled.
+func SendRawKeysContext(ctx context.Context, session, window, keys string) error {
+	target := session + ":" + window
+	return runCtx(ctx, "tmux", "send-keys", "-t", target, "-l", keys)
+}
+
+// ResizePaneContext resizes a tmux pane to match a terminal viewport.
+func ResizePaneContext(ctx context.Context, session, window string, cols, rows int) error {
+	if cols <= 0 || rows <= 0 {
+		return fmt.Errorf("resize pane dimensions must be positive")
+	}
+	target := session + ":" + window
+	return runCtx(ctx, "tmux", "resize-window", "-t", target, "-x", fmt.Sprint(cols), "-y", fmt.Sprint(rows))
+}
+
 // KillWindow terminates a window in a session.
 func KillWindow(session, window string) error {
 	return KillWindowContext(context.Background(), session, window)
@@ -142,25 +163,26 @@ func IsPaneIdleContext(ctx context.Context, session, window string) (bool, error
 	return false, nil
 }
 
+// CapturePaneContext returns the current visible and recent scrollback content
+// for a pane, including terminal escape sequences where tmux can preserve them.
+func CapturePaneContext(ctx context.Context, session, window string) ([]byte, error) {
+	target := session + ":" + window
+	out, err := outputBytesCtx(ctx, "tmux", "capture-pane", "-p", "-e", "-S", "-200", "-t", target)
+	if err != nil {
+		return nil, fmt.Errorf("capture-pane: %w", err)
+	}
+	return out, nil
+}
+
 // PipeOutput redirects pane output to a temporary file and streams it line by
 // line on the returned channel. Call the returned cleanup function to stop
 // streaming and release resources. Cleanup is safe to call multiple times.
 func PipeOutput(session, window string) (<-chan string, func(), error) {
 	target := session + ":" + window
 
-	f, err := os.CreateTemp("", "ccx-pipe-*.log")
+	logPath, stopPipe, err := startPipe(target)
 	if err != nil {
 		return nil, nil, err
-	}
-	logPath := f.Name()
-	f.Close()
-
-	// Shell-safe path: wrap in single quotes, escaping any embedded single quotes.
-	safeLogPath := "'" + strings.ReplaceAll(logPath, "'", "'\\''") + "'"
-	if err := run("tmux", "pipe-pane", "-t", target,
-		"cat >> "+safeLogPath); err != nil {
-		os.Remove(logPath)
-		return nil, nil, fmt.Errorf("pipe-pane: %w", err)
 	}
 
 	ch := make(chan string, 128)
@@ -170,10 +192,7 @@ func PipeOutput(session, window string) (<-chan string, func(), error) {
 	go func() {
 		defer close(ch)
 		defer os.Remove(logPath)
-		defer func() {
-			// Stop pipe-pane (run with no command argument clears the pipe).
-			_ = run("tmux", "pipe-pane", "-t", target)
-		}()
+		defer stopPipe()
 
 		f, err := os.Open(logPath)
 		if err != nil {
@@ -227,6 +246,86 @@ func PipeOutput(session, window string) (<-chan string, func(), error) {
 	return ch, cleanup, nil
 }
 
+// PipeBytes redirects pane output to a temporary file and streams raw byte
+// chunks on the returned channel. It preserves ANSI and cursor-control
+// sequences for terminal emulators.
+func PipeBytes(session, window string) (<-chan []byte, func(), error) {
+	target := session + ":" + window
+
+	logPath, stopPipe, err := startPipe(target)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	ch := make(chan []byte, 128)
+	stop := make(chan struct{})
+	var once sync.Once
+
+	go func() {
+		defer close(ch)
+		defer os.Remove(logPath)
+		defer stopPipe()
+
+		f, err := os.Open(logPath)
+		if err != nil {
+			return
+		}
+		defer f.Close()
+
+		buf := make([]byte, 4096)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			n, err := f.Read(buf)
+			if n > 0 {
+				chunk := append([]byte(nil), buf[:n]...)
+				select {
+				case ch <- chunk:
+				case <-stop:
+					return
+				}
+			}
+			if err != nil {
+				if errors.Is(err, io.EOF) {
+					time.Sleep(50 * time.Millisecond)
+					continue
+				}
+				return
+			}
+		}
+	}()
+
+	cleanup := func() {
+		once.Do(func() { close(stop) })
+	}
+	return ch, cleanup, nil
+}
+
+func startPipe(target string) (string, func(), error) {
+	f, err := os.CreateTemp("", "ccx-pipe-*.log")
+	if err != nil {
+		return "", nil, err
+	}
+	logPath := f.Name()
+	f.Close()
+
+	// Shell-safe path: wrap in single quotes, escaping any embedded single quotes.
+	safeLogPath := "'" + strings.ReplaceAll(logPath, "'", "'\\''") + "'"
+	if err := run("tmux", "pipe-pane", "-t", target, "cat >> "+safeLogPath); err != nil {
+		os.Remove(logPath)
+		return "", nil, fmt.Errorf("pipe-pane: %w", err)
+	}
+
+	stopPipe := func() {
+		// Stop pipe-pane (run with no command argument clears the pipe).
+		_ = run("tmux", "pipe-pane", "-t", target)
+	}
+	return logPath, stopPipe, nil
+}
+
 func run(name string, args ...string) error {
 	return runCtx(context.Background(), name, args...)
 }
@@ -240,22 +339,27 @@ func runCtx(ctx context.Context, name string, args ...string) error {
 }
 
 func outputCtx(ctx context.Context, name string, args ...string) (string, error) {
+	out, err := outputBytesCtx(ctx, name, args...)
+	return string(out), err
+}
+
+func outputBytesCtx(ctx context.Context, name string, args ...string) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
-		return "", err
+		return nil, err
 	}
 	cmd := execCommandContext(ctx, name, args...)
 	out, err := cmd.Output()
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return "", ctxErr
+			return nil, ctxErr
 		}
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
-			return "", fmt.Errorf("%s %v: %w: %s", name, args, err, strings.TrimSpace(string(exitErr.Stderr)))
+			return nil, fmt.Errorf("%s %v: %w: %s", name, args, err, strings.TrimSpace(string(exitErr.Stderr)))
 		}
-		return "", fmt.Errorf("%s %v: %w", name, args, err)
+		return nil, fmt.Errorf("%s %v: %w", name, args, err)
 	}
-	return string(out), nil
+	return out, nil
 }
 
 var execCommandContext = exec.CommandContext

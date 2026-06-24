@@ -37,7 +37,11 @@ type Server struct {
 	trigger         Triggerer
 	cleaner         WorkerCleaner
 	pipeOutput      PipeOutputFunc
+	pipeBytes       PipeBytesFunc
+	capturePane     CapturePaneFunc
 	sendKeys        SendKeysFunc
+	sendRawKeys     SendRawKeysFunc
+	resizePane      ResizePaneFunc
 	isSessionAlive  SessionAliveFunc
 	isWindowAlive   WindowAliveFunc
 	tmuxSession     string
@@ -68,7 +72,11 @@ type Deps struct {
 	Trigger        Triggerer
 	Cleaner        WorkerCleaner
 	PipeOutput     PipeOutputFunc
+	PipeBytes      PipeBytesFunc
+	CapturePane    CapturePaneFunc
 	SendKeys       SendKeysFunc
+	SendRawKeys    SendRawKeysFunc
+	ResizePane     ResizePaneFunc
 	IsSessionAlive SessionAliveFunc
 	IsWindowAlive  WindowAliveFunc
 	Session        string
@@ -88,7 +96,11 @@ func New(deps Deps) *Server {
 		registry:       deps.Registry,
 		trigger:        deps.Trigger,
 		pipeOutput:     deps.PipeOutput,
+		pipeBytes:      deps.PipeBytes,
+		capturePane:    deps.CapturePane,
 		sendKeys:       deps.SendKeys,
+		sendRawKeys:    deps.SendRawKeys,
+		resizePane:     deps.ResizePane,
 		isSessionAlive: deps.IsSessionAlive,
 		isWindowAlive:  deps.IsWindowAlive,
 		tmuxSession:    deps.Session,
@@ -106,8 +118,24 @@ func New(deps Deps) *Server {
 	if s.pipeOutput == nil {
 		s.pipeOutput = tmux.PipeOutput
 	}
+	if s.pipeBytes == nil {
+		if deps.PipeOutput != nil {
+			s.pipeBytes = pipeLinesAsBytes(deps.PipeOutput)
+		} else {
+			s.pipeBytes = tmux.PipeBytes
+		}
+	}
+	if s.capturePane == nil && deps.PipeOutput == nil && deps.PipeBytes == nil {
+		s.capturePane = tmux.CapturePaneContext
+	}
 	if s.sendKeys == nil {
 		s.sendKeys = tmux.SendKeysContext
+	}
+	if s.sendRawKeys == nil {
+		s.sendRawKeys = tmux.SendRawKeysContext
+	}
+	if s.resizePane == nil {
+		s.resizePane = tmux.ResizePaneContext
 	}
 	if s.isSessionAlive == nil {
 		s.isSessionAlive = tmux.SessionExistsContext
@@ -534,7 +562,11 @@ func (s *Server) projectServer(slug string) (*Server, error) {
 		registry:        project.Registry,
 		trigger:         project.Orchestrator,
 		pipeOutput:      s.pipeOutput,
+		pipeBytes:       s.pipeBytes,
+		capturePane:     s.capturePane,
 		sendKeys:        s.sendKeys,
+		sendRawKeys:     s.sendRawKeys,
+		resizePane:      s.resizePane,
 		isSessionAlive:  s.isSessionAlive,
 		isWindowAlive:   s.isWindowAlive,
 		tmuxSession:     project.Session,

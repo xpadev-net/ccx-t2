@@ -1,6 +1,9 @@
 import { StrictMode, useEffect, useMemo, useRef, useState } from "react";
 import type { Dispatch, FormEvent, SetStateAction } from "react";
 import { createRoot } from "react-dom/client";
+import { FitAddon } from "@xterm/addon-fit";
+import { Terminal } from "@xterm/xterm";
+import "@xterm/xterm/css/xterm.css";
 import "./styles.css";
 
 type Task = {
@@ -32,12 +35,6 @@ type WorkerFollowupResponse = {
   sent: boolean;
   task_id: string;
   worker_id: string;
-  session: string;
-  window: string;
-};
-
-type OrchestratorInputResponse = {
-  sent: boolean;
   session: string;
   window: string;
 };
@@ -159,6 +156,8 @@ type ReconnectingWebSocketOptions = {
   notFoundPhase?: FailureConnectionPhase;
   setState: (state: ConnectionState) => void;
   onMessage: (event: MessageEvent) => void;
+  onOpen?: (socket: WebSocket) => void;
+  onClose?: () => void;
   onSocketError?: () => void;
 };
 
@@ -189,8 +188,6 @@ function App() {
   const [workerConnection, setWorkerConnection] = useState<ConnectionState>(() =>
     idleConnection("Select a worker to open its log stream.")
   );
-  const [orchestratorInput, setOrchestratorInput] = useState("");
-  const [orchestratorInputSending, setOrchestratorInputSending] = useState(false);
   const [followupMessage, setFollowupMessage] = useState("");
   const [followupSending, setFollowupSending] = useState(false);
   const [projects, setProjects] = useState<ProjectInfo[]>([]);
@@ -210,6 +207,8 @@ function App() {
   const settingsDirtyRef = useRef(false);
   const selectedProjectSlugRef = useRef("");
   const tokenRef = useRef(token);
+  const orchestratorSocketRef = useRef<WebSocket | null>(null);
+  const orchestratorTerminalSizeRef = useRef<{ cols: number; rows: number } | null>(null);
   const taskEditorDirtyRef = useRef<TaskEditorDirty>(emptyTaskEditorDirty());
   const taskEditorTaskIDRef = useRef("");
 
@@ -292,7 +291,7 @@ function App() {
     if (!selectedProjectSlug) {
       setOrchestratorLog([]);
       setOrchestratorConnection(idleConnection("Select a project to open the orchestrator log."));
-      setOrchestratorInput("");
+      orchestratorSocketRef.current = null;
       return;
     }
     setOrchestratorLog([]);
@@ -302,6 +301,16 @@ function App() {
       notFoundPhase: "missing",
       setState: setOrchestratorConnection,
       onMessage: (event) => appendLogEvent(event, setOrchestratorLog),
+      onOpen: (socket) => {
+        orchestratorSocketRef.current = socket;
+        const size = orchestratorTerminalSizeRef.current;
+        if (size) {
+          socket.send(JSON.stringify({ type: "resize", cols: size.cols, rows: size.rows }));
+        }
+      },
+      onClose: () => {
+        orchestratorSocketRef.current = null;
+      },
       onSocketError: () => appendLogLine(setOrchestratorLog, "[stream error]", false)
     });
   }, [selectedProjectSlug, token]);
@@ -596,31 +605,21 @@ function App() {
     }
   }
 
-  async function sendOrchestratorInput(event: FormEvent) {
-    event.preventDefault();
-    if (!selectedProjectSlug || !orchestratorInput.trim()) {
+  function sendOrchestratorTerminalInput(data: string) {
+    const socket = orchestratorSocketRef.current;
+    if (!socket || socket.readyState !== WebSocket.OPEN || !data) {
       return;
     }
-    setOrchestratorInputSending(true);
-    setError("");
-    setMessage("");
-    setWarning("");
-    try {
-      const response = await api<OrchestratorInputResponse>(
-        orchestratorInputPath(selectedProjectSlug),
-        {
-          method: "POST",
-          body: JSON.stringify({ message: orchestratorInput })
-        },
-        token
-      );
-      setOrchestratorInput("");
-      setMessage(`Input sent to ${response.window}.`);
-    } catch (err) {
-      setError(errorMessage(err));
-    } finally {
-      setOrchestratorInputSending(false);
+    socket.send(JSON.stringify({ type: "input", data }));
+  }
+
+  function sendOrchestratorTerminalResize(cols: number, rows: number) {
+    orchestratorTerminalSizeRef.current = { cols, rows };
+    const socket = orchestratorSocketRef.current;
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      return;
     }
+    socket.send(JSON.stringify({ type: "resize", cols, rows }));
   }
 
   async function saveConfig(event: FormEvent) {
@@ -719,7 +718,7 @@ function App() {
     setSelectedWorkerID("");
     setWorkerLog([]);
     setOrchestratorLog([]);
-    setOrchestratorInput("");
+    orchestratorSocketRef.current = null;
     setFollowupMessage("");
   }
 
@@ -970,31 +969,15 @@ function App() {
               <span>{orchestratorWindow}</span>
               <span>{selectedProject?.repo_path || "No repository"}</span>
             </div>
-            <pre>{logDisplayText(
-              orchestratorLog,
-              orchestratorConnection,
-              "No orchestrator output yet.",
-              "Select a project to open the orchestrator log."
-            )}</pre>
+            <TerminalPane
+              chunks={orchestratorLog}
+              connection={orchestratorConnection}
+              emptyText="No orchestrator output yet."
+              idleText="Select a project to open the orchestrator log."
+              onData={sendOrchestratorTerminalInput}
+              onResize={sendOrchestratorTerminalResize}
+            />
           </div>
-          <form className="orchestrator-input-form" onSubmit={sendOrchestratorInput}>
-            <label>
-              Orchestrator input
-              <textarea
-                value={orchestratorInput}
-                onChange={(event) => setOrchestratorInput(event.target.value)}
-                disabled={!selectedProjectSlug || orchestratorInputSending}
-              />
-            </label>
-            <div className="actions">
-              <button
-                type="submit"
-                disabled={!selectedProjectSlug || orchestratorInputSending || !orchestratorInput.trim()}
-              >
-                Send Input
-              </button>
-            </div>
-          </form>
         </section>
 
         <section className="worker-dashboard" aria-label="Worker dashboard">
@@ -1029,12 +1012,12 @@ function App() {
                 <span>{selectedWorker?.worker_id || "No worker selected"}</span>
                 <span>{selectedWorkerTask?.branch || selectedWorker?.task_id || "No task"}</span>
               </div>
-              <pre>{logDisplayText(
-                workerLog,
-                workerConnection,
-                "No worker output yet.",
-                "Select a worker to open its log stream."
-              )}</pre>
+              <TerminalPane
+                chunks={workerLog}
+                connection={workerConnection}
+                emptyText="No worker output yet."
+                idleText="Select a worker to open its log stream."
+              />
             </div>
           </div>
           <form className="followup-form" onSubmit={sendWorkerFollowup}>
@@ -1285,28 +1268,31 @@ function openReconnectingWebSocket(options: ReconnectingWebSocketOptions) {
     let opened = false;
     options.setState({ phase: "connecting", detail: "Opening stream..." });
     socket = new WebSocket(webSocketURL(options.path, options.token));
-    socket.addEventListener("open", () => {
+    const currentSocket = socket;
+    currentSocket.addEventListener("open", () => {
       if (closed) {
         return;
       }
       opened = true;
+      options.onOpen?.(currentSocket);
       options.setState({ phase: "open", detail: "Connected." });
       stableTimer = window.setTimeout(() => {
         attempts = 0;
         stableTimer = undefined;
       }, stableOpenResetDelayMs);
     });
-    socket.addEventListener("message", (event) => {
+    currentSocket.addEventListener("message", (event) => {
       if (!closed) {
         options.onMessage(event);
       }
     });
-    socket.addEventListener("error", () => {
+    currentSocket.addEventListener("error", () => {
       if (!closed && opened) {
         options.onSocketError?.();
       }
     });
-    socket.addEventListener("close", () => {
+    currentSocket.addEventListener("close", () => {
+      options.onClose?.();
       if (closed) {
         return;
       }
@@ -1360,6 +1346,7 @@ function openReconnectingWebSocket(options: ReconnectingWebSocketOptions) {
       window.clearTimeout(retryTimer);
     }
     clearStableTimer();
+    options.onClose?.();
     socket?.close();
   };
 }
@@ -1449,7 +1436,7 @@ async function responseErrorDetail(response: Response) {
 function appendLogEvent(event: MessageEvent, setLog: LogSetter) {
   try {
     const msg = JSON.parse(String(event.data)) as { type?: string; data?: string };
-    if (msg.type === "line" && typeof msg.data === "string") {
+    if ((msg.type === "chunk" || msg.type === "line") && typeof msg.data === "string") {
       appendLogLine(setLog, msg.data);
     } else if (msg.type === "closed") {
       appendLogLine(setLog, "[stream closed]", false);
@@ -1462,7 +1449,7 @@ function appendLogEvent(event: MessageEvent, setLog: LogSetter) {
 }
 
 function appendLogLine(setLog: LogSetter, line: string, trim = true) {
-  setLog((current) => [...(trim ? current.slice(-299) : current), line]);
+  setLog((current) => [...(trim ? current.slice(-999) : current), line]);
 }
 
 function logDisplayText(lines: string[], state: ConnectionState, emptyText: string, idleText: string) {
@@ -1485,6 +1472,105 @@ function logDisplayText(lines: string[], state: ConnectionState, emptyText: stri
     case "failed":
       return state.detail || connectionLabel(state);
   }
+}
+
+function TerminalPane({
+  chunks,
+  connection,
+  emptyText,
+  idleText,
+  onData,
+  onResize
+}: {
+  chunks: string[];
+  connection: ConnectionState;
+  emptyText: string;
+  idleText: string;
+  onData?: (data: string) => void;
+  onResize?: (cols: number, rows: number) => void;
+}) {
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const terminalRef = useRef<Terminal | null>(null);
+  const writtenRef = useRef(0);
+  const sizeRef = useRef<{ cols: number; rows: number } | null>(null);
+
+  useEffect(() => {
+    if (!containerRef.current) {
+      return;
+    }
+    const terminal = new Terminal({
+      allowProposedApi: false,
+      convertEol: false,
+      cursorBlink: false,
+      disableStdin: !onData,
+      fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace',
+      fontSize: 12,
+      lineHeight: 1.2,
+      scrollback: 3000,
+      theme: {
+        background: "#111827",
+        foreground: "#d7e2ec",
+        cursor: "#d7e2ec",
+        selectionBackground: "#2f6f73"
+      }
+    });
+    const fit = new FitAddon();
+    terminal.loadAddon(fit);
+    terminal.open(containerRef.current);
+    terminalRef.current = terminal;
+    const dataDisposable = onData ? terminal.onData(onData) : undefined;
+    for (let index = writtenRef.current; index < chunks.length; index += 1) {
+      terminal.write(chunks[index]);
+    }
+    writtenRef.current = chunks.length;
+    const resize = () => {
+      try {
+        fit.fit();
+        const next = { cols: terminal.cols, rows: terminal.rows };
+        const prev = sizeRef.current;
+        if (next.cols > 0 && next.rows > 0 && (!prev || prev.cols !== next.cols || prev.rows !== next.rows)) {
+          sizeRef.current = next;
+          onResize?.(next.cols, next.rows);
+        }
+      } catch {
+        // The terminal can briefly report zero dimensions while the layout settles.
+      }
+    };
+    resize();
+    const observer = new ResizeObserver(resize);
+    observer.observe(containerRef.current);
+    return () => {
+      observer.disconnect();
+      dataDisposable?.dispose();
+      terminal.dispose();
+      terminalRef.current = null;
+      writtenRef.current = 0;
+    };
+  }, []);
+
+  useEffect(() => {
+    const terminal = terminalRef.current;
+    if (!terminal) {
+      return;
+    }
+    if (chunks.length < writtenRef.current) {
+      terminal.reset();
+      writtenRef.current = 0;
+    }
+    for (let index = writtenRef.current; index < chunks.length; index += 1) {
+      terminal.write(chunks[index]);
+    }
+    writtenRef.current = chunks.length;
+  }, [chunks]);
+
+  const placeholder = chunks.length ? "" : logDisplayText(chunks, connection, emptyText, idleText);
+
+  return (
+    <div className="terminal-pane">
+      <div ref={containerRef} className="terminal-surface" />
+      {placeholder && <div className="terminal-placeholder">{placeholder}</div>}
+    </div>
+  );
 }
 
 function ConnectionBadge({ label, state }: { label: string; state: ConnectionState }) {
@@ -1651,10 +1737,6 @@ function ledgerWSPath(projectSlug: string) {
 
 function orchestratorLogPath(projectSlug: string) {
   return projectSlug ? `/ws/projects/${encodeURIComponent(projectSlug)}/orchestrator` : "/ws/orchestrator";
-}
-
-function orchestratorInputPath(projectSlug: string) {
-  return `/api/projects/${encodeURIComponent(projectSlug)}/orchestrator/input`;
 }
 
 function workerFollowupPath(projectSlug: string, workerID: string) {

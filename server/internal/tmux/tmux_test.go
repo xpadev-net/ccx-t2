@@ -146,6 +146,60 @@ func TestSendKeysContextUsesCommandContextForLiteralAndEnter(t *testing.T) {
 	}
 }
 
+func TestSendRawKeysContextDoesNotAppendEnter(t *testing.T) {
+	ctx := context.WithValue(context.Background(), tmuxTestContextKey{}, "marker")
+	var gotCtx context.Context
+	var gotName string
+	var gotArgs []string
+
+	oldExecCommandContext := execCommandContext
+	execCommandContext = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		gotCtx = ctx
+		gotName = name
+		gotArgs = append([]string(nil), args...)
+		return exec.Command("sh", "-c", "true")
+	}
+	t.Cleanup(func() { execCommandContext = oldExecCommandContext })
+
+	if err := SendRawKeysContext(ctx, "session", "orchestrator", "\x1b[B"); err != nil {
+		t.Fatalf("SendRawKeysContext: %v", err)
+	}
+	if gotCtx != ctx {
+		t.Fatal("SendRawKeysContext did not pass caller context")
+	}
+	wantArgs := []string{"send-keys", "-t", "session:orchestrator", "-l", "\x1b[B"}
+	if gotName != "tmux" || !reflect.DeepEqual(gotArgs, wantArgs) {
+		t.Fatalf("command = %s %#v, want tmux %#v", gotName, gotArgs, wantArgs)
+	}
+}
+
+func TestResizePaneContextUsesCommandContext(t *testing.T) {
+	ctx := context.WithValue(context.Background(), tmuxTestContextKey{}, "marker")
+	var gotCtx context.Context
+	var gotName string
+	var gotArgs []string
+
+	oldExecCommandContext := execCommandContext
+	execCommandContext = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		gotCtx = ctx
+		gotName = name
+		gotArgs = append([]string(nil), args...)
+		return exec.Command("sh", "-c", "true")
+	}
+	t.Cleanup(func() { execCommandContext = oldExecCommandContext })
+
+	if err := ResizePaneContext(ctx, "session", "orchestrator", 132, 31); err != nil {
+		t.Fatalf("ResizePaneContext: %v", err)
+	}
+	if gotCtx != ctx {
+		t.Fatal("ResizePaneContext did not pass caller context")
+	}
+	wantArgs := []string{"resize-window", "-t", "session:orchestrator", "-x", "132", "-y", "31"}
+	if gotName != "tmux" || !reflect.DeepEqual(gotArgs, wantArgs) {
+		t.Fatalf("command = %s %#v, want tmux %#v", gotName, gotArgs, wantArgs)
+	}
+}
+
 func TestSendKeysContextRejectsCanceledContextBeforeCommand(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
