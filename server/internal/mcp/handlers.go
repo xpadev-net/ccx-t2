@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"net/url"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
@@ -74,6 +75,10 @@ const (
 	cleanupTaskBranchTimeout   = 10 * time.Second
 	completionFileProbeTimeout = 5 * time.Second
 	completionFileDiffTimeout  = 10 * time.Second
+
+	workerMCPSecretEnvName  = "CCX_MCP_SECRET"
+	workerMCPSecretToken    = "{secret}"
+	workerMCPSecretEnvToken = "__CCX_MCP_SECRET_ENV__"
 )
 
 type workerCleanupOps struct {
@@ -123,6 +128,7 @@ type spawnWorkerOps struct {
 	killWindow               func(ctx context.Context, session, window string) error
 	removeWorktree           func(ctx context.Context, repoPath, worktreePath string) error
 	deleteTaskBranch         func(ctx context.Context, repoPath, branch, taskID string) error
+	writeSecretFile          func(pattern, contents string) (string, error)
 	sendKeys                 func(ctx context.Context, session, window, keys string) error
 	waitForHarnessProcess    func(ctx context.Context, session, window string, timeout time.Duration) error
 }
@@ -151,6 +157,9 @@ func (ops spawnWorkerOps) withDefaults() spawnWorkerOps {
 	}
 	if ops.deleteTaskBranch == nil {
 		ops.deleteTaskBranch = cleanupTaskBranchContext
+	}
+	if ops.writeSecretFile == nil {
+		ops.writeSecretFile = writeTempFile
 	}
 	if ops.sendKeys == nil {
 		ops.sendKeys = tmux.SendKeysContext
@@ -880,7 +889,11 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 		// Split the *template* before expanding {url}/{secret} so that the expanded
 		// values (which may contain spaces or other shell metacharacters) are treated
 		// as atomic tokens. Each token then has its placeholders substituted individually.
-		mcpTokens, err := buildMCPTokens(hCfg.McpArgs, toolDeps.BaseURL+"/mcp/worker", toolDeps.Config.Server.McpSecret)
+		secretReplacement := toolDeps.Config.Server.McpSecret
+		if toolDeps.Config.Server.McpSecret != "" && strings.Contains(hCfg.McpArgs, workerMCPSecretToken) {
+			secretReplacement = workerMCPSecretEnvToken
+		}
+		mcpTokens, err := buildMCPTokens(hCfg.McpArgs, toolDeps.BaseURL+"/mcp/worker", secretReplacement)
 		if err != nil {
 			return nil, fmt.Errorf("invalid mcp_args shell syntax: %w", err)
 		}
@@ -983,12 +996,26 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 		// Step 4: Launch harness with MCP args.
 		// Rebuild the command by single-quoting each split token so that expanded
 		// URL/secret values with shell metacharacters are not interpreted by the shell.
-		harnessCmd := buildHarnessCommand(hCfg.Command, mcpTokens)
+		secretPath := ""
+		if secretReplacement == workerMCPSecretEnvToken {
+			secretPath, err = ops.writeSecretFile("ccx-worker-secret-*", toolDeps.Config.Server.McpSecret)
+			if err != nil {
+				rollbackSpawnAfterLedgerUpdate(spawnCtx, ops, toolDeps, workerID, branch, taskID, repoPath, worktreePath)
+				return nil, fmt.Errorf("write worker secret: %w", err)
+			}
+		}
+		harnessCmd := buildHarnessLaunchCommand(hCfg.Command, mcpTokens, secretPath)
 		if err := ops.sendKeys(spawnCtx, toolDeps.Session, workerID, harnessCmd); err != nil {
+			if secretPath != "" {
+				_ = os.Remove(secretPath)
+			}
 			rollbackSpawnAfterLedgerUpdate(spawnCtx, ops, toolDeps, workerID, branch, taskID, repoPath, worktreePath)
 			return nil, fmt.Errorf("send harness command: %w", err)
 		}
 		if err := ops.waitForHarnessProcess(spawnCtx, toolDeps.Session, workerID, harnessStartupTimeout); err != nil {
+			if secretPath != "" {
+				_ = os.Remove(secretPath)
+			}
 			rollbackSpawnAfterLedgerUpdate(spawnCtx, ops, toolDeps, workerID, branch, taskID, repoPath, worktreePath)
 			return nil, fmt.Errorf("wait for harness process: %w", err)
 		}
@@ -2177,6 +2204,43 @@ func buildHarnessCommand(command string, mcpTokens []string) string {
 	return strings.Join(parts, " ")
 }
 
+func buildHarnessCommandWithSecretEnv(command string, mcpTokens []string) string {
+	parts := make([]string, 0, 1+len(mcpTokens))
+	parts = append(parts, shellQuoteArg(command))
+	for _, tok := range mcpTokens {
+		parts = append(parts, shellQuoteArgWithWorkerSecretEnv(tok))
+	}
+	return strings.Join(parts, " ")
+}
+
+func buildHarnessLaunchCommand(command string, mcpTokens []string, secretPath string) string {
+	if secretPath == "" {
+		return buildHarnessCommand(command, mcpTokens)
+	}
+	quotedSecretPath := shellQuoteArg(secretPath)
+	return workerMCPSecretEnvName + "=$(cat " + quotedSecretPath + "; printf x); " +
+		workerMCPSecretEnvName + "=${" + workerMCPSecretEnvName + "%x}; export " + workerMCPSecretEnvName +
+		"; rm -f " + quotedSecretPath + "; exec " + buildHarnessCommandWithSecretEnv(command, mcpTokens)
+}
+
+func writeTempFile(pattern, contents string) (string, error) {
+	f, err := os.CreateTemp("", pattern)
+	if err != nil {
+		return "", err
+	}
+	path := f.Name()
+	if _, err := f.WriteString(contents); err != nil {
+		_ = f.Close()
+		_ = os.Remove(path)
+		return "", err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(path)
+		return "", err
+	}
+	return path, nil
+}
+
 func waitForHarnessProcessContext(ctx context.Context, session, window string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for {
@@ -2274,4 +2338,23 @@ Instructions:
 // metacharacters in expanded values (URL, secret) are not interpreted.
 func shellQuoteArg(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
+}
+
+func shellQuoteArgWithWorkerSecretEnv(s string) string {
+	if !strings.Contains(s, workerMCPSecretEnvToken) {
+		return shellQuoteArg(s)
+	}
+	var quoted strings.Builder
+	for {
+		before, after, ok := strings.Cut(s, workerMCPSecretEnvToken)
+		if before != "" {
+			quoted.WriteString(shellQuoteArg(before))
+		}
+		if !ok {
+			break
+		}
+		quoted.WriteString(`"$` + workerMCPSecretEnvName + `"`)
+		s = after
+	}
+	return quoted.String()
 }

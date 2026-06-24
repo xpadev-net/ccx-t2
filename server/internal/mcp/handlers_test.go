@@ -69,6 +69,48 @@ func TestBuildHarnessCommandPreservesExpandedMCPValuesAsSingleArgs(t *testing.T)
 	}
 }
 
+func TestBuildHarnessLaunchCommandExpandsWorkerSecretFromTempFile(t *testing.T) {
+	dir := t.TempDir()
+	secretPath := filepath.Join(dir, "secret")
+	outputPath := filepath.Join(dir, "argv")
+	secret := "tok en ' \"$HOME\" $(echo nope); *\n\n"
+	want := "prefix:" + secret + ":suffix"
+
+	if err := os.WriteFile(secretPath, []byte(secret), 0o600); err != nil {
+		t.Fatalf("write secret: %v", err)
+	}
+
+	command := buildHarnessLaunchCommand("sh", []string{
+		"-c",
+		`printf '%s' "$1" > "$0"`,
+		outputPath,
+		"prefix:" + workerMCPSecretEnvToken + ":suffix",
+	}, secretPath)
+	if strings.Contains(command, secret) {
+		t.Fatalf("command exposes MCP secret: %q", command)
+	}
+	if strings.Contains(command, workerMCPSecretEnvToken) {
+		t.Fatalf("command contains unresolved MCP secret sentinel: %q", command)
+	}
+	if !strings.Contains(command, `"$`+workerMCPSecretEnvName+`"`) {
+		t.Fatalf("command does not expand MCP secret env: %q", command)
+	}
+
+	if out, err := exec.Command("sh", "-c", command).CombinedOutput(); err != nil {
+		t.Fatalf("run launch command: %v\n%s", err, out)
+	}
+	gotBytes, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatalf("read harness argv: %v", err)
+	}
+	if got := string(gotBytes); got != want {
+		t.Fatalf("harness arg = %q, want %q", got, want)
+	}
+	if _, err := os.Stat(secretPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("secret temp file still exists or stat failed: %v", err)
+	}
+}
+
 func TestBuildMCPTokensRejectsInvalidTemplateShellSyntax(t *testing.T) {
 	_, err := buildMCPTokens("--mcp-url '{url}", "http://localhost:8080/mcp/worker", "")
 	if err == nil {
@@ -1118,6 +1160,70 @@ func TestHandleSpawnWorkerCreateWindowFailureDoesNotKillMissingWindow(t *testing
 	if !removeCalled || !deleteBranchCalled {
 		t.Fatalf("cleanup calls remove=%v deleteBranch=%v, want both true", removeCalled, deleteBranchCalled)
 	}
+}
+
+func TestHandleSpawnWorkerHidesWorkerMCPSecretInLaunchCommand(t *testing.T) {
+	dir := t.TempDir()
+	l := ledger.NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
+	if err := l.Add(ledger.Task{ID: "task-001", Title: "Task", Status: "unstarted"}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	deps := testMCPDeps(dir, l)
+	secret := `worker secret with spaces; $(echo nope)`
+	secretPath := filepath.Join(dir, "worker-secret")
+	deps.Config.Server.McpSecret = secret
+	deps.Config.Harnesses = map[string]config.HarnessConfig{
+		"sh": {Command: "sh", McpArgs: "--mcp-url {url} --mcp-secret {secret} --header 'Bearer {secret}'"},
+	}
+	var sentKeys []string
+	deps.spawn = spawnWorkerOps{
+		validateBranchName:       func(context.Context, string) error { return nil },
+		ensureBranchCreationSafe: func(context.Context, string, string) error { return nil },
+		headRef:                  func(context.Context, string) (string, error) { return "abc123", nil },
+		createWorktree:           func(context.Context, string, string, string, string) error { return nil },
+		createWindow:             func(context.Context, string, string, string) error { return nil },
+		writeSecretFile: func(_, contents string) (string, error) {
+			if contents != secret {
+				t.Fatalf("writeSecretFile contents = %q, want configured worker secret", contents)
+			}
+			if err := os.WriteFile(secretPath, []byte(contents), 0o600); err != nil {
+				return "", err
+			}
+			return secretPath, nil
+		},
+		sendKeys: func(_ context.Context, _, _ string, keys string) error {
+			sentKeys = append(sentKeys, keys)
+			return nil
+		},
+		waitForHarnessProcess: func(context.Context, string, string, time.Duration) error { return nil },
+	}
+
+	if _, err := handleSpawnWorker(deps)(context.Background(), map[string]any{
+		"task_id":       "task-001",
+		"branch":        "feature/task-001-work",
+		"allowed_files": []any{"server/internal/mcp"},
+	}); err != nil {
+		t.Fatalf("handleSpawnWorker: %v", err)
+	}
+	if len(sentKeys) != 2 {
+		t.Fatalf("sentKeys = %d, want harness command and prompt", len(sentKeys))
+	}
+	harnessCmd := sentKeys[0]
+	if strings.Contains(harnessCmd, secret) {
+		t.Fatalf("harness command exposes worker MCP secret: %q", harnessCmd)
+	}
+	if strings.Contains(harnessCmd, workerMCPSecretEnvToken) {
+		t.Fatalf("harness command contains unresolved MCP secret sentinel: %q", harnessCmd)
+	}
+	if !strings.Contains(harnessCmd, secretPath) || !strings.Contains(harnessCmd, "export "+workerMCPSecretEnvName) {
+		t.Fatalf("harness command = %q, want temp file/env indirection", harnessCmd)
+	}
+	if gotBytes, err := os.ReadFile(secretPath); err != nil {
+		t.Fatalf("read temp secret: %v", err)
+	} else if got := string(gotBytes); got != secret {
+		t.Fatalf("temp secret = %q, want configured worker secret", got)
+	}
+	_ = os.Remove(secretPath)
 }
 
 func TestRollbackSpawnAfterLedgerUpdateDoesNotRemoveReplacementRegistryEntry(t *testing.T) {
