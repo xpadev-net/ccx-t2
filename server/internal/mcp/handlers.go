@@ -55,6 +55,7 @@ type Deps struct {
 
 	notifyAfterOwnershipPreflight func()
 	cleanup                       workerCleanupOps
+	followup                      workerFollowupOps
 	spawn                         spawnWorkerOps
 }
 
@@ -94,6 +95,21 @@ func (ops workerCleanupOps) withDefaults() workerCleanupOps {
 	}
 	if ops.deleteTaskBranch == nil {
 		ops.deleteTaskBranch = cleanupTaskBranch
+	}
+	return ops
+}
+
+type workerFollowupOps struct {
+	isWindowAlive func(session, window string) (bool, error)
+	sendKeys      func(session, window, keys string) error
+}
+
+func (ops workerFollowupOps) withDefaults() workerFollowupOps {
+	if ops.isWindowAlive == nil {
+		ops.isWindowAlive = tmux.IsWindowAlive
+	}
+	if ops.sendKeys == nil {
+		ops.sendKeys = tmux.SendKeys
 	}
 	return ops
 }
@@ -1031,11 +1047,11 @@ func handleStopWorker(deps *Deps) ToolHandler {
 			}
 		}
 
-		// If neither the registry nor the ledger knows this worker, return an
-		// error so the caller knows the ID was wrong. Best-effort kill the tmux
-		// window in case it exists as an orphan.
+		// If neither the selected project's registry nor ledger knows this
+		// worker, return an error so the caller knows the ID was wrong. Project
+		// scoped stop_worker must not clean up arbitrary tmux windows from a
+		// shared session.
 		if taskID == "" {
-			_ = tmux.KillWindow(toolDeps.Session, workerID)
 			return nil, fmt.Errorf("worker %q not found in registry or ledger", workerID)
 		}
 
@@ -1110,10 +1126,11 @@ func handleFollowupWorker(deps *Deps) ToolHandler {
 		if err := ensureWorkerTaskActive(toolDeps.Ledger, workerID); err != nil {
 			return nil, err
 		}
+		ops := toolDeps.followup.withDefaults()
 
 		// Verify window exists.
 		windowName := workerID
-		alive, err := tmux.IsWindowAlive(toolDeps.Session, windowName)
+		alive, err := ops.isWindowAlive(toolDeps.Session, windowName)
 		if err != nil {
 			return nil, fmt.Errorf("check window: %w", err)
 		}
@@ -1124,7 +1141,7 @@ func handleFollowupWorker(deps *Deps) ToolHandler {
 			return nil, err
 		}
 
-		if err := tmux.SendKeys(toolDeps.Session, windowName, message); err != nil {
+		if err := ops.sendKeys(toolDeps.Session, windowName, message); err != nil {
 			return nil, fmt.Errorf("send keys: %w", err)
 		}
 		return map[string]any{"sent": true}, nil
@@ -1589,6 +1606,7 @@ func depsForProject(deps *Deps, slug string) (*Deps, error) {
 		ProjectSlug:   project.Slug,
 		NotifyTrigger: notifyTrigger,
 		cleanup:       deps.cleanup,
+		followup:      deps.followup,
 		spawn:         deps.spawn,
 	}, nil
 }
