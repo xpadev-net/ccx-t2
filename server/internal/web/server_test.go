@@ -2170,8 +2170,8 @@ func TestWorkerLogWebSocketStreamsLines(t *testing.T) {
 		if err := conn.ReadJSON(&msg); err != nil {
 			t.Fatalf("ReadJSON: %v", err)
 		}
-		if msg.Type != "line" || msg.Data != want {
-			t.Fatalf("message = %#v, want line %q", msg, want)
+		if msg.Type != "chunk" || msg.Data != want {
+			t.Fatalf("message = %#v, want chunk %q", msg, want)
 		}
 	}
 	var closed wsMessage
@@ -2256,8 +2256,8 @@ func TestProjectWorkerLogWebSocketStreamsProjectWorker(t *testing.T) {
 	if err := conn.ReadJSON(&msg); err != nil {
 		t.Fatalf("ReadJSON: %v", err)
 	}
-	if msg.Type != "line" || msg.Data != "alpha ready" {
-		t.Fatalf("message = %#v, want alpha worker line", msg)
+	if msg.Type != "chunk" || msg.Data != "alpha ready" {
+		t.Fatalf("message = %#v, want alpha worker chunk", msg)
 	}
 }
 
@@ -2301,8 +2301,8 @@ func TestWorkerLogWebSocketStreamsSelectedProjectWorker(t *testing.T) {
 	if err := conn.ReadJSON(&msg); err != nil {
 		t.Fatalf("ReadJSON: %v", err)
 	}
-	if msg.Type != "line" || msg.Data != "alpha root ready" {
-		t.Fatalf("message = %#v, want selected project worker line", msg)
+	if msg.Type != "chunk" || msg.Data != "alpha root ready" {
+		t.Fatalf("message = %#v, want selected project worker chunk", msg)
 	}
 }
 
@@ -2507,9 +2507,143 @@ func TestProjectOrchestratorLogWebSocketStreamsProjectWindow(t *testing.T) {
 	if err := conn.ReadJSON(&msg); err != nil {
 		t.Fatalf("ReadJSON: %v", err)
 	}
-	if msg.Type != "line" || msg.Data != "orchestrator ready" {
-		t.Fatalf("message = %#v, want orchestrator line", msg)
+	if msg.Type != "chunk" || msg.Data != "orchestrator ready" {
+		t.Fatalf("message = %#v, want orchestrator chunk", msg)
 	}
+}
+
+func TestProjectOrchestratorLogWebSocketSendsInitialPaneSnapshot(t *testing.T) {
+	cfg, manager := newTestProjectManager(t, "alpha")
+	lines := make(chan []byte)
+	defer close(lines)
+	server := httptest.NewServer(New(Deps{
+		Config:  cfg,
+		Manager: manager,
+		IsSessionAlive: func(ctx context.Context, session string) (bool, error) {
+			return true, nil
+		},
+		IsWindowAlive: func(ctx context.Context, session, window string) (bool, error) {
+			return true, nil
+		},
+		PipeBytes: func(session, window string) (<-chan []byte, func(), error) {
+			return lines, func() {}, nil
+		},
+		CapturePane: func(ctx context.Context, session, window string) ([]byte, error) {
+			if session != "ccx-test" || window != "alpha-orchestrator" {
+				t.Fatalf("capture args = %q %q, want ccx-test alpha-orchestrator", session, window)
+			}
+			return []byte("existing shell\r\n$ "), nil
+		},
+		AuthDisabled: true,
+	}))
+	defer server.Close()
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(server.URL, "/ws/projects/alpha/orchestrator"), nil)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer conn.Close()
+
+	var msg wsMessage
+	if err := conn.ReadJSON(&msg); err != nil {
+		t.Fatalf("ReadJSON: %v", err)
+	}
+	if msg.Type != "chunk" || msg.Data != "existing shell\r\n$ " {
+		t.Fatalf("message = %#v, want initial shell snapshot", msg)
+	}
+}
+
+func TestProjectOrchestratorLogWebSocketForwardsTerminalInput(t *testing.T) {
+	cfg, manager := newTestProjectManager(t, "alpha")
+	lines := make(chan string)
+	sent := make(chan string, 1)
+	server := httptest.NewServer(New(Deps{
+		Config:  cfg,
+		Manager: manager,
+		IsSessionAlive: func(ctx context.Context, session string) (bool, error) {
+			return true, nil
+		},
+		IsWindowAlive: func(ctx context.Context, session, window string) (bool, error) {
+			return true, nil
+		},
+		PipeOutput: func(session, window string) (<-chan string, func(), error) {
+			if session != "ccx-test" || window != "alpha-orchestrator" {
+				t.Fatalf("pipe args = %q %q, want ccx-test alpha-orchestrator", session, window)
+			}
+			return lines, func() {}, nil
+		},
+		SendRawKeys: func(ctx context.Context, session, window, keys string) error {
+			if session != "ccx-test" || window != "alpha-orchestrator" {
+				t.Fatalf("send args = %q %q, want ccx-test alpha-orchestrator", session, window)
+			}
+			sent <- keys
+			return nil
+		},
+		AuthDisabled: true,
+	}))
+	defer server.Close()
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(server.URL, "/ws/projects/alpha/orchestrator"), nil)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer conn.Close()
+
+	if err := conn.WriteJSON(wsMessage{Type: "input", Data: "\x1b[B"}); err != nil {
+		t.Fatalf("WriteJSON: %v", err)
+	}
+	select {
+	case got := <-sent:
+		if got != "\x1b[B" {
+			t.Fatalf("sent keys = %q, want arrow-down escape", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("terminal input was not forwarded")
+	}
+}
+
+func TestProjectOrchestratorLogWebSocketForwardsResize(t *testing.T) {
+	cfg, manager := newTestProjectManager(t, "alpha")
+	lines := make(chan string)
+	resized := make(chan [2]int, 1)
+	server := httptest.NewServer(New(Deps{
+		Config:  cfg,
+		Manager: manager,
+		IsSessionAlive: func(ctx context.Context, session string) (bool, error) {
+			return true, nil
+		},
+		IsWindowAlive: func(ctx context.Context, session, window string) (bool, error) {
+			return true, nil
+		},
+		PipeOutput: func(session, window string) (<-chan string, func(), error) {
+			return lines, func() {}, nil
+		},
+		ResizePane: func(ctx context.Context, session, window string, cols, rows int) error {
+			if session != "ccx-test" || window != "alpha-orchestrator" {
+				t.Fatalf("resize args = %q %q, want ccx-test alpha-orchestrator", session, window)
+			}
+			resized <- [2]int{cols, rows}
+			return nil
+		},
+		AuthDisabled: true,
+	}))
+	defer server.Close()
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(server.URL, "/ws/projects/alpha/orchestrator"), nil)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer conn.Close()
+
+	if err := conn.WriteJSON(wsMessage{Type: "resize", Cols: 132, Rows: 31}); err != nil {
+		t.Fatalf("WriteJSON: %v", err)
+	}
+	select {
+	case got := <-resized:
+		if got != [2]int{132, 31} {
+			t.Fatalf("resize = %#v, want 132x31", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("terminal resize was not forwarded")
+	}
+	close(lines)
 }
 
 func TestProjectOrchestratorLogWebSocketRejectsMissingSession(t *testing.T) {
@@ -2575,7 +2709,7 @@ func TestProjectOrchestratorLogWebSocketRejectsMissingWindow(t *testing.T) {
 	}
 }
 
-func TestProjectOrchestratorLogWebSocketRejectsSecondSubscriber(t *testing.T) {
+func TestProjectOrchestratorLogWebSocketAllowsMultipleSubscribers(t *testing.T) {
 	dir := t.TempDir()
 	cfg := testConfig()
 	cfg.Runtime = config.RuntimeConfig{TmuxSession: "ccx-test", WorktreeBase: filepath.Join(dir, "worktrees")}
@@ -2615,12 +2749,21 @@ func TestProjectOrchestratorLogWebSocketRejectsSecondSubscriber(t *testing.T) {
 	}
 	defer first.Close()
 
-	_, resp, err := websocket.DefaultDialer.Dial(wsURL(server.URL, "/ws/projects/alpha/orchestrator"), nil)
-	if err == nil {
-		t.Fatal("second Dial error = nil, want conflict")
+	second, _, err := websocket.DefaultDialer.Dial(wsURL(server.URL, "/ws/projects/alpha/orchestrator"), nil)
+	if err != nil {
+		t.Fatalf("second Dial: %v", err)
 	}
-	if resp == nil || resp.StatusCode != http.StatusConflict {
-		t.Fatalf("response = %#v, want 409", resp)
+	defer second.Close()
+
+	lines <- "shared output"
+	for _, conn := range []*websocket.Conn{first, second} {
+		var msg wsMessage
+		if err := conn.ReadJSON(&msg); err != nil {
+			t.Fatalf("ReadJSON: %v", err)
+		}
+		if msg.Type != "chunk" || msg.Data != "shared output" {
+			t.Fatalf("message = %#v, want shared chunk", msg)
+		}
 	}
 	close(lines)
 }
@@ -2707,7 +2850,7 @@ func TestWebSocketAllowsConfiguredOrigin(t *testing.T) {
 	conn.Close()
 }
 
-func TestWorkerLogWebSocketRejectsSecondSubscriber(t *testing.T) {
+func TestWorkerLogWebSocketAllowsMultipleSubscribers(t *testing.T) {
 	lines := make(chan string)
 	registry := worker.NewRegistry()
 	registry.Register(worker.Info{WorkerID: "worker-task-001", TaskID: "task-001"})
@@ -2726,12 +2869,21 @@ func TestWorkerLogWebSocketRejectsSecondSubscriber(t *testing.T) {
 	}
 	defer first.Close()
 
-	_, resp, err := websocket.DefaultDialer.Dial(wsURL(server.URL, "/ws/worker/worker-task-001"), nil)
-	if err == nil {
-		t.Fatal("second Dial error = nil, want conflict")
+	second, _, err := websocket.DefaultDialer.Dial(wsURL(server.URL, "/ws/worker/worker-task-001"), nil)
+	if err != nil {
+		t.Fatalf("second Dial: %v", err)
 	}
-	if resp == nil || resp.StatusCode != http.StatusConflict {
-		t.Fatalf("response = %#v, want 409", resp)
+	defer second.Close()
+
+	lines <- "worker output"
+	for _, conn := range []*websocket.Conn{first, second} {
+		var msg wsMessage
+		if err := conn.ReadJSON(&msg); err != nil {
+			t.Fatalf("ReadJSON: %v", err)
+		}
+		if msg.Type != "chunk" || msg.Data != "worker output" {
+			t.Fatalf("message = %#v, want shared worker chunk", msg)
+		}
 	}
 	close(lines)
 }
