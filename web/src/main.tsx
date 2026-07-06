@@ -1501,7 +1501,7 @@ function TerminalPane({
     const terminal = new Terminal({
       allowProposedApi: false,
       convertEol: false,
-      cursorBlink: false,
+      cursorBlink: Boolean(onData),
       disableStdin: !onData,
       fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace',
       fontSize: 12,
@@ -1566,7 +1566,10 @@ function TerminalPane({
   const placeholder = chunks.length ? "" : logDisplayText(chunks, connection, emptyText, idleText);
 
   return (
-    <div className="terminal-pane">
+    <div
+      className={`terminal-pane ${onData ? "interactive" : ""}`}
+      onMouseDown={() => terminalRef.current?.focus()}
+    >
       <div ref={containerRef} className="terminal-surface" />
       {placeholder && <div className="terminal-placeholder">{placeholder}</div>}
     </div>

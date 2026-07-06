@@ -6,6 +6,13 @@ task-pr-orchestrator / task-pr-worker スキルのフローを複数のエージ
 
 ハーネスは単一プロセスで起動し、グローバル設定ファイルに登録された複数プロジェクトを同時に扱う。プロジェクトごとの `config.yaml` は作成しない。Web UI、REST API、MCP サーバー、WebSocket、scheduler は同じプロセス内で動作し、リクエストまたはイベントに含まれる `project_slug` で対象プロジェクトを解決する。
 
+現在の ccx-t2 は、過去ログで実際に運用していた worker-merge 型の task-pr フローを基準にする。
+Worker は専用 worktree と branch で実装、検証、PR 作成、`gh-review-hook`、PR マージまで行い、
+マージ後に `notify(type="completed")` で PR URL と merge commit を報告する。
+Orchestrator は親スレッドとしてタスク整理、分割、worker 起動、完了タスクの archive を担う。
+Go ハーネスはこのフローのうち、人手で繰り返していた台帳更新、プロセス管理、イベント処理、
+ログ配信、状態検査、cleanup を担保する。
+
 ---
 
 ## 役割分担
@@ -16,6 +23,7 @@ task-pr-orchestrator / task-pr-worker スキルのフローを複数のエージ
 - Worktree の生成・削除
 - Worker プロセス（tmux ウィンドウ）の起動・停止
 - Worker へのフォローアップメッセージ送信（tmux send-keys）
+- Orchestrator へのブラウザ Web shell からのraw terminal input送信（WebSocket → tmux）
 - Worker からのイベント受信・直列キュー処理
 - Orchestrator の起動トリガー（ハートビート・イベント駆動）
 - GitHub API による PR 状態取得
@@ -282,7 +290,7 @@ Orchestrator 起動時は対象プロジェクトの設定、台帳スナップ�
 | 機能 | 説明 |
 |---|---|
 | タスク台帳 CRUD | タスクの追加・編集・削除。削除は in_progress タスクに対して stop_worker と worktree 削除を連動して実行する。追加は Orchestrator 経由。 |
-| Orchestrator console | 選択中プロジェクトの Orchestrator（tmux ウィンドウ）のログをリアルタイムストリーミング |
+| Orchestrator web shell | 選択中プロジェクトの Orchestrator（tmux ウィンドウ）をリアルタイムストリーミングし、ブラウザ上の terminal からraw inputを送信 |
 | Worker ダッシュボード | 各 Worker（tmux ウィンドウ）のログをリアルタイムストリーミングし、active Worker へ followup 入力を送信 |
 | タスク追加フォーム | 自然言語でタスクを入力 → Orchestrator がコードベースを調査して台帳に反映 |
 | ハーネス設定 | 利用可能ハーネスの登録・usage 確認 |
