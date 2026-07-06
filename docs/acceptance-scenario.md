@@ -12,6 +12,7 @@
 6. Worker が `notify(type="completed")` を送り、Go ハーネスが台帳を更新し、Orchestrator を再起動する。
 7. Orchestrator が完了タスクを `archive_task` で `tasks/archive/` へ移し、台帳にはアクティブタスクだけが残る。
 8. Web UI / API / tmux console で Orchestrator と Worker のログを確認でき、親リポジトリと worker worktree が分離されていることを確認できる。
+9. ユーザーが Web UI の Orchestrator web shell で、ネイティブshellと同様にOrchestratorセッションへ直接入力し、タスク追加・削除・整理のような調整を継続できる。
 
 ## 自動テスト範囲
 
@@ -36,7 +37,7 @@ go test ./...
 | Worker notify と台帳更新 | `TestQueueRunProcessesEventsFIFOAndTriggers`, `TestQueueProcessCompletedClearsBlockedReason`, `TestHandleNotifyCompletedThenArchivePreservesMergeMetadata` | `notify(completed)` 後に status が `completed`、`pr_url` が台帳へ反映され、`merge_commit` は archive 用 metadata として保持され、Orchestrator trigger が再度呼ばれる。 |
 | split / blocked の派生フロー | `TestWorkerSplitRequestThroughMCPIntegration`, `TestQueueProcessSplitRequestCreatesChildrenAndSplitsParent`, `TestQueueProcessBlockedClearsOmittedReason` | split_request は親を `split` にして子タスクを追加し、blocked は reason を更新する。 |
 | archive | `TestArchiveMovesFile`, `TestArchiveCompletedOnly`, `TestArchiveAlreadyArchivedTaskIsIdempotent`, `TestHandleArchiveTaskAlreadyArchivedIsIdempotent` | completed だけが archive に移動し、台帳から消え、二重 archive は安全に扱われる。 |
-| tmux console 表示 | `TestProjectOrchestratorLogWebSocketStreamsProjectWindow`, `TestWorkerLogWebSocketStreamsLines`, `TestProjectWorkerFollowupSendsToActiveWorkerWindow` | WebSocket が `{project}-orchestrator` と worker window の行を配信し、followup は active worker window に送信される。 |
+| tmux console 表示と入力 | `TestProjectOrchestratorLogWebSocketStreamsProjectWindow`, `TestProjectOrchestratorLogWebSocketForwardsTerminalInput`, `TestWorkerLogWebSocketStreamsLines`, `TestProjectWorkerFollowupSendsToActiveWorkerWindow` | WebSocket が `{project}-orchestrator` と worker window の行を配信し、ブラウザのWeb shellから Orchestrator window へraw terminal inputを送信できる。 |
 | worktree 分離と履歴保護 | `TestCreateCreatesDedicatedBranchWorktree`, `TestDeleteTaskBranchIfSafeSkipsDefaultBranch`, `TestDeleteTaskBranchIfSafeSkipsRemoteBranchAsPullRequestRisk`, `TestDefaultWorkerCleanerSkipsUnsafeDefaultBranchDelete` | worker は専用 worktree/branch で動き、default branch や remote/upstream 付き branch は cleanup で削除されない。 |
 
 不足分:
@@ -114,6 +115,7 @@ Web UI で確認する場合:
 
 - Orchestrator console を開く。
 - 自然文 intake の task ID、台帳 snapshot、調査指示、MCP endpoint が表示されることを確認する。
+- Orchestrator web shell にフォーカスし、「現在のタスクを整理して、不要な blocked を確認して下さい」のような指示を直接入力して、tmux pane に反映されることを確認する。
 
 期待ログ:
 

@@ -12,7 +12,21 @@ worker の tmux セッション、worktree、MCP エンドポイント、PR 状�
 - orchestrator / worker 向け MCP HTTP エンドポイント
 - worker 完了通知、フォローアップ、PR 状態確認
 - WebSocket による台帳、orchestrator ログ、worker ログの更新通知
-- React Web UI によるプロジェクト切り替え、タスク、orchestrator/worker console、worker followup、harness、設定の操作
+- React Web UI によるプロジェクト切り替え、タスク、orchestrator/worker web shell、worker followup、harness、設定の操作
+
+## 現在の運用方針
+
+このプロジェクトは、過去の `task-pr-orchestrator` / `task-pr-worker` 運用に合わせて、
+Worker が専用 worktree 内で実装、検証、PR 作成、`gh-review-hook`、PR マージまで完了し、
+その後 `notify(type="completed")` で PR URL と merge commit を Go ハーネスへ通知する
+モデルを採用します。Go ハーネスは worktree / tmux / 台帳 / notify / archive などの機械的な
+状態管理を担い、Orchestrator Agent はタスク整理、分割、worker 起動、完了タスクの archive を
+MCP ツール経由で判断します。
+
+Orchestrator セッションは Web UI の Orchestrator パネルで、ログ閲覧用の画面ではなく
+tmux window に接続された対話可能な Web shell として操作できます。タスク追加、削除、
+整理のような継続的な調整は、ブラウザ上の shell に直接入力して選択中プロジェクトの
+orchestrator window へ送ります。
 
 ## リポジトリ構成
 
