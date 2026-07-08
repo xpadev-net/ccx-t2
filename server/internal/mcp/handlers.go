@@ -71,6 +71,7 @@ const (
 
 	spawnWorkerTimeout         = 2 * time.Minute
 	harnessStartupTimeout      = 10 * time.Second
+	workerPromptDelay          = 5 * time.Second
 	spawnWorkerRollbackTimeout = 15 * time.Second
 	cleanupTaskBranchTimeout   = 10 * time.Second
 	completionFileProbeTimeout = 5 * time.Second
@@ -131,6 +132,7 @@ type spawnWorkerOps struct {
 	writeSecretFile          func(pattern, contents string) (string, error)
 	sendKeys                 func(ctx context.Context, session, window, keys string) error
 	waitForHarnessProcess    func(ctx context.Context, session, window string, timeout time.Duration) error
+	waitBeforePrompt         func(ctx context.Context, delay time.Duration) error
 }
 
 func (ops spawnWorkerOps) withDefaults() spawnWorkerOps {
@@ -166,6 +168,9 @@ func (ops spawnWorkerOps) withDefaults() spawnWorkerOps {
 	}
 	if ops.waitForHarnessProcess == nil {
 		ops.waitForHarnessProcess = waitForHarnessProcessContext
+	}
+	if ops.waitBeforePrompt == nil {
+		ops.waitBeforePrompt = sleepContext
 	}
 	return ops
 }
@@ -1018,6 +1023,13 @@ func handleSpawnWorker(deps *Deps) ToolHandler {
 			}
 			rollbackSpawnAfterLedgerUpdate(spawnCtx, ops, toolDeps, workerID, branch, taskID, repoPath, worktreePath)
 			return nil, fmt.Errorf("wait for harness process: %w", err)
+		}
+		if err := ops.waitBeforePrompt(spawnCtx, workerPromptDelay); err != nil {
+			if secretPath != "" {
+				_ = os.Remove(secretPath)
+			}
+			rollbackSpawnAfterLedgerUpdate(spawnCtx, ops, toolDeps, workerID, branch, taskID, repoPath, worktreePath)
+			return nil, fmt.Errorf("wait before task prompt: %w", err)
 		}
 
 		// Step 5: Send task prompt (best-effort — worker is already running).
@@ -2226,7 +2238,7 @@ func buildHarnessLaunchCommand(command string, mcpTokens []string, secretPath st
 }
 
 func codexMCPConfigTokens(command string, mcpTokens []string) []string {
-	if filepath.Base(command) != "codex" {
+	if !isCodexCommand(command) {
 		return mcpTokens
 	}
 	mcpURL := ""
@@ -2267,6 +2279,10 @@ func codexMCPConfigTokens(command string, mcpTokens []string) []string {
 		)
 	}
 	return tokens
+}
+
+func isCodexCommand(command string) bool {
+	return filepath.Base(command) == "codex"
 }
 
 func writeTempFile(pattern, contents string) (string, error) {
@@ -2310,6 +2326,20 @@ func waitForHarnessProcessContext(ctx context.Context, session, window string, t
 			return ctx.Err()
 		case <-timer.C:
 		}
+	}
+}
+
+func sleepContext(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return ctx.Err()
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
 	}
 }
 

@@ -779,6 +779,7 @@ func TestHandleSpawnWorkerDefaultsOmittedSingleHarness(t *testing.T) {
 			return nil
 		},
 		waitForHarnessProcess: func(context.Context, string, string, time.Duration) error { return nil },
+		waitBeforePrompt:      func(context.Context, time.Duration) error { return nil },
 	}
 
 	if _, err := handleSpawnWorker(deps)(context.Background(), map[string]any{
@@ -801,6 +802,126 @@ func TestHandleSpawnWorkerDefaultsOmittedSingleHarness(t *testing.T) {
 	info, ok := deps.Registry.Get("worker-task-001")
 	if !ok || info.Harness != "sh" {
 		t.Fatalf("registry info = %#v/%v, want sh harness", info, ok)
+	}
+}
+
+func TestHandleSpawnWorkerWaitsBeforePrompt(t *testing.T) {
+	dir := t.TempDir()
+	l := ledger.NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
+	if err := l.Add(ledger.Task{ID: "task-001", Title: "Task", Status: "unstarted"}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	deps := testMCPDeps(dir, l)
+	deps.Config.WorkerHarnesses = []string{"sh"}
+	deps.Config.Harnesses = map[string]config.HarnessConfig{
+		"sh": {Command: "sh", McpArgs: "--mcp-url {url}"},
+	}
+	var events []string
+	deps.spawn = spawnWorkerOps{
+		validateBranchName:       func(context.Context, string) error { return nil },
+		ensureBranchCreationSafe: func(context.Context, string, string) error { return nil },
+		headRef:                  func(context.Context, string) (string, error) { return "abc123", nil },
+		createWorktree:           func(context.Context, string, string, string, string) error { return nil },
+		createWindow:             func(context.Context, string, string, string) error { return nil },
+		sendKeys: func(_ context.Context, _, _ string, keys string) error {
+			if strings.HasPrefix(keys, "You are a Worker agent.") {
+				events = append(events, "sendPrompt")
+				return nil
+			}
+			events = append(events, "sendHarness")
+			return nil
+		},
+		waitForHarnessProcess: func(context.Context, string, string, time.Duration) error {
+			events = append(events, "waitHarness")
+			return nil
+		},
+		waitBeforePrompt: func(_ context.Context, delay time.Duration) error {
+			if delay != workerPromptDelay {
+				t.Fatalf("waitBeforePrompt delay = %v, want %v", delay, workerPromptDelay)
+			}
+			events = append(events, "waitPrompt")
+			return nil
+		},
+	}
+
+	if _, err := handleSpawnWorker(deps)(context.Background(), map[string]any{
+		"task_id":       "task-001",
+		"branch":        "feature/task-001-work",
+		"allowed_files": []any{"server/internal/mcp"},
+	}); err != nil {
+		t.Fatalf("handleSpawnWorker: %v", err)
+	}
+	wantEvents := []string{"sendHarness", "waitHarness", "waitPrompt", "sendPrompt"}
+	if !reflect.DeepEqual(events, wantEvents) {
+		t.Fatalf("events = %#v, want %#v", events, wantEvents)
+	}
+}
+
+func TestHandleSpawnWorkerPromptWaitCancellationRollsBack(t *testing.T) {
+	dir := t.TempDir()
+	l := ledger.NewLedger(filepath.Join(dir, "ledger.md"), filepath.Join(dir, "archive"))
+	if err := l.Add(ledger.Task{ID: "task-001", Title: "Task", Status: "unstarted"}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	deps := testMCPDeps(dir, l)
+	deps.Config.WorkerHarnesses = []string{"sh"}
+	deps.Config.Harnesses = map[string]config.HarnessConfig{
+		"sh": {Command: "sh", McpArgs: "--mcp-url {url}"},
+	}
+	var cleanupCalls []string
+	sendCalls := 0
+	deps.spawn = spawnWorkerOps{
+		validateBranchName:       func(context.Context, string) error { return nil },
+		ensureBranchCreationSafe: func(context.Context, string, string) error { return nil },
+		headRef:                  func(context.Context, string) (string, error) { return "abc123", nil },
+		createWorktree:           func(context.Context, string, string, string, string) error { return nil },
+		createWindow:             func(context.Context, string, string, string) error { return nil },
+		killWindow: func(context.Context, string, string) error {
+			cleanupCalls = append(cleanupCalls, "killWindow")
+			return nil
+		},
+		removeWorktree: func(context.Context, string, string) error {
+			cleanupCalls = append(cleanupCalls, "removeWorktree")
+			return nil
+		},
+		deleteTaskBranch: func(context.Context, string, string, string) error {
+			cleanupCalls = append(cleanupCalls, "deleteTaskBranch")
+			return nil
+		},
+		sendKeys: func(context.Context, string, string, string) error {
+			sendCalls++
+			return nil
+		},
+		waitForHarnessProcess: func(context.Context, string, string, time.Duration) error { return nil },
+		waitBeforePrompt: func(context.Context, time.Duration) error {
+			return context.Canceled
+		},
+	}
+
+	_, err := handleSpawnWorker(deps)(context.Background(), map[string]any{
+		"task_id":       "task-001",
+		"branch":        "feature/task-001-work",
+		"allowed_files": []any{"server/internal/mcp"},
+	})
+	if !errors.Is(err, context.Canceled) || !strings.Contains(err.Error(), "wait before task prompt") {
+		t.Fatalf("handleSpawnWorker error = %v, want wrapped context.Canceled wait failure", err)
+	}
+	if sendCalls != 1 {
+		t.Fatalf("sendKeys calls = %d, want only harness command", sendCalls)
+	}
+	wantCleanupCalls := []string{"killWindow", "removeWorktree", "deleteTaskBranch"}
+	if !reflect.DeepEqual(cleanupCalls, wantCleanupCalls) {
+		t.Fatalf("cleanup calls = %#v, want %#v", cleanupCalls, wantCleanupCalls)
+	}
+	tasks, err := l.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(tasks) != 1 || tasks[0].Status != "unstarted" || tasks[0].Branch != "" || tasks[0].WorkerID != "" || tasks[0].Harness != "" {
+		t.Fatalf("task after prompt wait rollback = %#v, want lifecycle fields reset", tasks)
+	}
+	if _, ok := deps.Registry.Get("worker-task-001"); ok {
+		t.Fatal("worker registry entry remained after prompt wait rollback")
 	}
 }
 
@@ -1280,6 +1401,7 @@ func TestHandleSpawnWorkerHidesWorkerMCPSecretInLaunchCommand(t *testing.T) {
 			return nil
 		},
 		waitForHarnessProcess: func(context.Context, string, string, time.Duration) error { return nil },
+		waitBeforePrompt:      func(context.Context, time.Duration) error { return nil },
 	}
 
 	if _, err := handleSpawnWorker(deps)(context.Background(), map[string]any{
