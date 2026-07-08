@@ -369,7 +369,7 @@ function App() {
       setError("");
     }
     try {
-      const data = await api<Task[]>(tasksPath(projectSlug), {}, authToken);
+      const data = normalizeArray(await api<Task[] | null>(tasksPath(projectSlug), {}, authToken));
       if (!isCurrentRefresh(projectSlug, authToken)) {
         return;
       }
@@ -399,7 +399,7 @@ function App() {
       return;
     }
     try {
-      const data = await api<WorkerInfo[]>(workersPath(projectSlug), {}, authToken);
+      const data = normalizeArray(await api<WorkerInfo[] | null>(workersPath(projectSlug), {}, authToken));
       if (!isCurrentRefresh(projectSlug, authToken)) {
         return;
       }
@@ -445,16 +445,18 @@ function App() {
     try {
       const [configData, harnessData, projectData] = await Promise.all([
         api<ConfigResponse>("/api/config", {}, authToken),
-        api<HarnessInfo[]>("/api/harnesses", {}, authToken),
-        api<ProjectInfo[]>("/api/projects", {}, authToken)
+        api<HarnessInfo[] | null>("/api/harnesses", {}, authToken),
+        api<ProjectInfo[] | null>("/api/projects", {}, authToken)
       ]);
+      const projects = normalizeArray(projectData);
+      const availableHarnesses = normalizeArray(harnessData);
       if (authToken !== tokenRef.current) {
         return selectedProjectSlugRef.current;
       }
       setConfig(configData);
-      setProjects(projectData);
+      setProjects(projects);
       const normalizedProjectSlug = normalizedProjectSelection(
-        projectData,
+        projects,
         selectedProjectSlugRef.current,
         preferredProjectSlug
       );
@@ -464,7 +466,7 @@ function App() {
         settingsDirtyRef.current = false;
         setSettingsDirty(false);
       }
-      setHarnesses(harnessData);
+      setHarnesses(availableHarnesses);
       return normalizedProjectSlug;
     } catch (err) {
       if (authToken !== tokenRef.current) {
@@ -1647,6 +1649,10 @@ function formatRetryDelay(delay?: number) {
     return `${delay}ms`;
   }
   return `${delay / 1000}s`;
+}
+
+function normalizeArray<T>(value: T[] | null | undefined): T[] {
+  return Array.isArray(value) ? value : [];
 }
 
 function configToDraft(config: ConfigResponse): ConfigDraft {

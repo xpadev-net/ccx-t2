@@ -1536,6 +1536,19 @@ func TestGetConfigReturnsEmptyWorkerHarnessesArray(t *testing.T) {
 	}
 }
 
+func TestGetHarnessesReturnsEmptyArray(t *testing.T) {
+	cfg := testConfig()
+	cfg.WorkerHarnesses = nil
+
+	resp := performRequest(New(Deps{Config: cfg, AuthDisabled: true}), http.MethodGet, "/api/harnesses")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	if got := strings.TrimSpace(resp.Body.String()); got != "[]" {
+		t.Fatalf("harnesses response = %s, want []", got)
+	}
+}
+
 func TestApplyConfigPatchPreservesExplicitEmptyWorkerHarnesses(t *testing.T) {
 	cfg := testConfig()
 	empty := []string{}
