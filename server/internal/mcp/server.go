@@ -103,7 +103,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		})
 
 	case "notifications/initialized":
-		writeResult(w, req.ID, map[string]any{})
+		writeAccepted(w)
 
 	case "tools/list":
 		writeResult(w, req.ID, map[string]any{"tools": s.toolDefs})
@@ -114,6 +114,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeError(w, req.ID, -32601, "method not found: "+req.Method)
 	}
+}
+
+func writeAccepted(w http.ResponseWriter) {
+	w.WriteHeader(http.StatusAccepted)
 }
 
 func (s *Server) handleToolCall(ctx context.Context, w http.ResponseWriter, req jsonrpcRequest) {

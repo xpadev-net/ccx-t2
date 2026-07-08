@@ -25,6 +25,7 @@ const (
 	maxReasonLen     = 200
 	maxQueuedReasons = 256
 	cleanupTmuxLimit = 5 * time.Second
+	codexPromptDelay = 5 * time.Second
 	secretEnvName    = "CCX_MCP_SECRET"
 	secretToken      = "{secret}"
 	secretEnvToken   = "__CCX_MCP_SECRET_ENV__"
@@ -85,6 +86,7 @@ type Orchestrator struct {
 	baseURL      string
 	tmux         tmuxClient
 	pollInterval time.Duration
+	promptDelay  time.Duration
 	done         chan struct{}
 	closeOnce    sync.Once
 	cond         *sync.Cond
@@ -118,6 +120,7 @@ func NewProject(l *ledger.Ledger, cfg *config.Config, session, baseURL, window s
 		baseURL:      strings.TrimRight(strings.TrimSpace(baseURL), "/"),
 		tmux:         realTmux{},
 		pollInterval: time.Second,
+		promptDelay:  codexPromptDelay,
 		done:         make(chan struct{}),
 	}
 	o.cond = sync.NewCond(&o.mu)
@@ -504,11 +507,14 @@ func (o *Orchestrator) start(ctx context.Context, reason string) (bool, error) {
 			return false, fmt.Errorf("write orchestrator secret: %w", err)
 		}
 	}
-	promptPath, err := o.writePromptFile(prompt)
-	if err != nil {
-		_ = os.Remove(secretPath)
-		o.cleanupStartedWindow()
-		return false, fmt.Errorf("write orchestrator prompt: %w", err)
+	promptPath := ""
+	if !isCodexCommand(hCfg.Command) {
+		promptPath, err = o.writePromptFile(prompt)
+		if err != nil {
+			_ = os.Remove(secretPath)
+			o.cleanupStartedWindow()
+			return false, fmt.Errorf("write orchestrator prompt: %w", err)
+		}
 	}
 	if err := o.tmux.SendKeys(ctx, o.session, o.window, buildHarnessLaunchCommand(hCfg.Command, tokens, promptPath, secretPath)); err != nil {
 		_ = os.Remove(secretPath)
@@ -516,8 +522,32 @@ func (o *Orchestrator) start(ctx context.Context, reason string) (bool, error) {
 		o.cleanupStartedWindow()
 		return false, fmt.Errorf("send orchestrator command: %w", err)
 	}
+	if isCodexCommand(hCfg.Command) {
+		if err := sleepContext(ctx, o.promptDelay); err != nil {
+			o.cleanupStartedWindow()
+			return false, err
+		}
+		if err := o.tmux.SendKeys(ctx, o.session, o.window, prompt); err != nil {
+			o.cleanupStartedWindow()
+			return false, fmt.Errorf("send orchestrator prompt: %w", err)
+		}
+	}
 	o.markRunStarted()
 	return true, nil
+}
+
+func sleepContext(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return ctx.Err()
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func (o *Orchestrator) writePromptFile(prompt string) (string, error) {
@@ -678,17 +708,20 @@ func buildHarnessCommandWithSecretEnv(command string, mcpTokens []string) string
 }
 
 func buildHarnessLaunchCommand(command string, mcpTokens []string, promptPath, secretPath string) string {
-	quotedPromptPath := shellQuoteArg(promptPath)
 	prefix := ""
 	if secretPath != "" {
 		quotedSecretPath := shellQuoteArg(secretPath)
 		prefix = secretEnvName + "=$(cat " + quotedSecretPath + "); export " + secretEnvName + "; rm -f " + quotedSecretPath + "; "
 	}
+	if isCodexCommand(command) {
+		return prefix + "exec " + buildHarnessCommandWithSecretEnv(command, mcpTokens)
+	}
+	quotedPromptPath := shellQuoteArg(promptPath)
 	return prefix + "{ rm -f " + quotedPromptPath + "; exec " + buildHarnessCommandWithSecretEnv(command, mcpTokens) + "; } < " + quotedPromptPath
 }
 
 func codexMCPConfigTokens(command string, mcpTokens []string) []string {
-	if filepath.Base(command) != "codex" {
+	if !isCodexCommand(command) {
 		return mcpTokens
 	}
 	mcpURL := ""
@@ -729,6 +762,10 @@ func codexMCPConfigTokens(command string, mcpTokens []string) []string {
 		)
 	}
 	return tokens
+}
+
+func isCodexCommand(command string) bool {
+	return filepath.Base(command) == "codex"
 }
 
 func shellQuoteArg(s string) string {

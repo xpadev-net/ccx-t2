@@ -100,21 +100,25 @@ func serve(args []string) error {
 		mux.Handle("/", handler)
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	manager.Start(ctx)
-	defer manager.Close()
-
 	server := &http.Server{
 		Addr:              listenAddr,
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
+	listener, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		return err
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	errCh := make(chan error, 1)
 	go func() {
 		log.Printf("ccx serving on %s (listen %s)", baseURL, listenAddr)
-		errCh <- server.ListenAndServe()
+		errCh <- server.Serve(listener)
 	}()
+	manager.Start(ctx)
+	defer manager.Close()
 
 	select {
 	case <-ctx.Done():

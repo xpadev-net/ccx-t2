@@ -2786,6 +2786,47 @@ func TestProjectOrchestratorLogWebSocketStartsWhenWindowMissing(t *testing.T) {
 	}
 }
 
+func TestProjectOrchestratorLogWebSocketAllowsSlowStart(t *testing.T) {
+	windowStarted := false
+	trigger := &fakeTrigger{fn: func(ctx context.Context, reason string) error {
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			t.Fatal("trigger context has no deadline")
+		}
+		if time.Until(deadline) <= followupTmuxOperationTimeout {
+			t.Fatalf("trigger timeout = %v, want longer than tmux operation timeout", time.Until(deadline))
+		}
+		time.Sleep(followupTmuxOperationTimeout + 50*time.Millisecond)
+		windowStarted = true
+		return nil
+	}}
+	server := New(Deps{
+		Config:  testConfig(),
+		Trigger: trigger,
+		IsSessionAlive: func(ctx context.Context, session string) (bool, error) {
+			return true, nil
+		},
+		IsWindowAlive: func(ctx context.Context, session, window string) (bool, error) {
+			return windowStarted, nil
+		},
+		AuthDisabled: true,
+	})
+
+	if err := server.ensureOrchestratorAttached(context.Background(), "ccx-test", "alpha-orchestrator"); err != nil {
+		t.Fatalf("ensureOrchestratorAttached: %v", err)
+	}
+	if len(trigger.reasons) != 1 {
+		t.Fatalf("trigger count = %d, want 1", len(trigger.reasons))
+	}
+}
+
+func TestOrchestratorAttachStatusMapsDeadlineExceededToGatewayTimeout(t *testing.T) {
+	err := fmt.Errorf("start orchestrator for web shell: %w", context.DeadlineExceeded)
+	if got := orchestratorAttachStatus(err); got != http.StatusGatewayTimeout {
+		t.Fatalf("status = %d, want %d", got, http.StatusGatewayTimeout)
+	}
+}
+
 func TestProjectServerUsesProjectOrchestratorWhenParentTriggerConfigured(t *testing.T) {
 	cfg, manager := newTestProjectManager(t, "alpha")
 	parentTrigger := &fakeTrigger{}

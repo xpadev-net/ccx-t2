@@ -219,7 +219,7 @@ func orchestratorAttachStatus(err error) int {
 	switch {
 	case errors.Is(err, errOrchestratorMissingTrigger):
 		return http.StatusNotFound
-	case errors.Is(err, errOrchestratorAttachTimeout):
+	case errors.Is(err, errOrchestratorAttachTimeout), errors.Is(err, context.DeadlineExceeded):
 		return http.StatusGatewayTimeout
 	default:
 		return http.StatusInternalServerError
@@ -246,7 +246,7 @@ func (s *Server) ensureOrchestratorAttached(ctx context.Context, session, window
 	if s.trigger == nil {
 		return errOrchestratorMissingTrigger
 	}
-	triggerCtx, cancel := context.WithTimeout(ctx, followupTmuxOperationTimeout)
+	triggerCtx, cancel := context.WithTimeout(ctx, orchestratorStartTimeout)
 	err = s.trigger.Trigger(triggerCtx, "browser orchestrator web shell opened")
 	cancel()
 	if err != nil {
@@ -309,7 +309,7 @@ func (s *Server) orchestratorNeedsStart(ctx context.Context, session, window str
 }
 
 func (s *Server) waitForOrchestratorWindow(ctx context.Context, session, window string) error {
-	deadline := time.NewTimer(followupTmuxOperationTimeout)
+	deadline := time.NewTimer(orchestratorStartTimeout)
 	defer deadline.Stop()
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()

@@ -68,6 +68,11 @@ func (f *fakeTmux) SendKeys(ctx context.Context, session, window, keys string) e
 			return err
 		}
 	}
+	if strings.HasPrefix(keys, "You are the Orchestrator agent for this repository.") {
+		f.mu.Lock()
+		f.prompts = append(f.prompts, keys)
+		f.mu.Unlock()
+	}
 	return nil
 }
 
@@ -284,6 +289,67 @@ func TestTriggerInstructsOrchestratorToInvestigateNaturalLanguageIntake(t *testi
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("prompt does not contain %q:\n%s", want, prompt)
 		}
+	}
+}
+
+func TestTriggerStartsCodexInteractivelyAndSendsPromptViaTmux(t *testing.T) {
+	l, cfg := newTestDeps(t)
+	cfg.Harnesses["orch"] = config.HarnessConfig{
+		Command: "codex",
+		McpArgs: "--mcp-url {url} --mcp-secret {secret}",
+	}
+	if err := l.Add(ledger.Task{ID: "task-001", Title: "Task", Status: "unstarted", Body: "Do it"}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	fake := &fakeTmux{idle: true}
+	o := New(l, cfg, "proj", "http://localhost:8080")
+	o.tmux = fake
+	o.promptDelay = 0
+
+	if err := o.Trigger(context.Background(), "browser orchestrator web shell opened"); err != nil {
+		t.Fatalf("Trigger: %v", err)
+	}
+
+	creates, commands, prompts := fake.counts()
+	if creates != 1 {
+		t.Fatalf("creates = %d, want 1", creates)
+	}
+	if commands != 2 {
+		t.Fatalf("commands count = %d, want launch command plus prompt", commands)
+	}
+	if prompts != 1 {
+		t.Fatalf("prompts count = %d, want prompt sent via tmux", prompts)
+	}
+	fake.mu.Lock()
+	launchCommand := fake.commands[0]
+	promptCommand := fake.commands[1]
+	prompt := fake.prompts[0]
+	fake.mu.Unlock()
+	if strings.Contains(launchCommand, " < ") || strings.Contains(launchCommand, "ccx-orchestrator-prompt-") {
+		t.Fatalf("codex launch command uses stdin prompt redirection: %q", launchCommand)
+	}
+	if strings.Contains(launchCommand, "codex' 'exec") || strings.Contains(launchCommand, "codex exec") {
+		t.Fatalf("codex launch command uses non-interactive exec mode: %q", launchCommand)
+	}
+	args, err := shellquote.Split(codexHarnessCommandFromLaunchCommand(launchCommand))
+	if err != nil {
+		t.Fatalf("codex command shell syntax: %v", err)
+	}
+	wantArgs := []string{
+		"codex",
+		"-c",
+		`mcp_servers.ccx_t2.url="http://localhost:8080/mcp/orchestrator"`,
+		"-c",
+		`mcp_servers.ccx_t2.bearer_token_env_var="CCX_MCP_SECRET"`,
+	}
+	if !reflect.DeepEqual(args, wantArgs) {
+		t.Fatalf("codex args = %#v, want %#v", args, wantArgs)
+	}
+	if !strings.HasPrefix(promptCommand, "You are the Orchestrator agent for this repository.") {
+		t.Fatalf("second tmux send did not contain orchestrator prompt:\n%s", promptCommand)
+	}
+	if !strings.Contains(prompt, `project_slug="proj"`) || !strings.Contains(prompt, `"id": "task-001"`) {
+		t.Fatalf("prompt missing project/task context:\n%s", prompt)
 	}
 }
 
@@ -1011,10 +1077,26 @@ func secretFileFromLaunchCommand(command string) string {
 func harnessCommandFromLaunchCommand(command string) string {
 	_, rest, ok := strings.Cut(command, "; exec ")
 	if !ok {
-		return ""
+		rest, ok = strings.CutPrefix(command, "exec ")
+		if !ok {
+			return ""
+		}
+		return rest
 	}
 	harnessCommand, _, _ := strings.Cut(rest, "; } < ")
 	return harnessCommand
+}
+
+func codexHarnessCommandFromLaunchCommand(command string) string {
+	rest, ok := strings.CutPrefix(command, "exec ")
+	if ok {
+		return rest
+	}
+	_, rest, ok = strings.Cut(command, "; exec ")
+	if !ok {
+		return ""
+	}
+	return rest
 }
 
 func singleQuotedValue(s string) string {
@@ -1069,7 +1151,7 @@ func TestBuildHarnessLaunchCommandConvertsCodexMCPArgsToConfigOverrides(t *testi
 		t.Fatalf("command exposes MCP secret: %q", command)
 	}
 
-	got, err := shellquote.Split(strings.TrimSuffix(strings.TrimPrefix(command, secretEnvName+"=$(cat "+shellQuoteArg(secretPath)+"); export "+secretEnvName+"; rm -f "+shellQuoteArg(secretPath)+"; { rm -f "+shellQuoteArg(promptPath)+"; exec "), "; } < "+shellQuoteArg(promptPath)))
+	got, err := shellquote.Split(codexHarnessCommandFromLaunchCommand(command))
 	if err != nil {
 		t.Fatalf("generated codex command is not valid shell syntax: %v\n%s", err, command)
 	}
@@ -1111,7 +1193,7 @@ func TestBuildHarnessLaunchCommandConvertsCodexHeaderSecretToBearerEnv(t *testin
 		t.Fatalf("command exposes MCP secret: %q", command)
 	}
 
-	got, err := shellquote.Split(strings.TrimSuffix(strings.TrimPrefix(command, secretEnvName+"=$(cat "+shellQuoteArg(secretPath)+"); export "+secretEnvName+"; rm -f "+shellQuoteArg(secretPath)+"; { rm -f "+shellQuoteArg(promptPath)+"; exec "), "; } < "+shellQuoteArg(promptPath)))
+	got, err := shellquote.Split(codexHarnessCommandFromLaunchCommand(command))
 	if err != nil {
 		t.Fatalf("generated codex command is not valid shell syntax: %v\n%s", err, command)
 	}
@@ -1151,7 +1233,7 @@ func TestBuildHarnessLaunchCommandConvertsCodexEqualsMCPArgsToConfigOverrides(t 
 		t.Fatalf("command exposes MCP secret: %q", command)
 	}
 
-	got, err := shellquote.Split(strings.TrimSuffix(strings.TrimPrefix(command, secretEnvName+"=$(cat "+shellQuoteArg(secretPath)+"); export "+secretEnvName+"; rm -f "+shellQuoteArg(secretPath)+"; { rm -f "+shellQuoteArg(promptPath)+"; exec "), "; } < "+shellQuoteArg(promptPath)))
+	got, err := shellquote.Split(codexHarnessCommandFromLaunchCommand(command))
 	if err != nil {
 		t.Fatalf("generated codex command is not valid shell syntax: %v\n%s", err, command)
 	}

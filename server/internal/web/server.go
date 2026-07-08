@@ -63,6 +63,7 @@ const deleteCleanupLease = 5 * time.Minute
 const deleteCleanupTimeout = 4 * time.Minute
 const maxFollowupMessageBytes = 20000
 const followupTmuxOperationTimeout = 5 * time.Second
+const orchestratorStartTimeout = 30 * time.Second
 
 // Deps contains dependencies needed by the web API.
 type Deps struct {
