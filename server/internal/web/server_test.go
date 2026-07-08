@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -2674,43 +2675,84 @@ func TestProjectOrchestratorLogWebSocketForwardsResize(t *testing.T) {
 	close(lines)
 }
 
-func TestProjectOrchestratorLogWebSocketRejectsMissingSession(t *testing.T) {
-	cfg, manager := newTestProjectManager(t, "alpha")
-	server := httptest.NewServer(New(Deps{
-		Config:  cfg,
-		Manager: manager,
+func TestProjectOrchestratorLogWebSocketStartsWhenPaneIdle(t *testing.T) {
+	idle := true
+	trigger := &fakeTrigger{fn: func(ctx context.Context, reason string) error {
+		idle = false
+		return nil
+	}}
+	server := New(Deps{
+		Config:  testConfig(),
+		Trigger: trigger,
+		IsSessionAlive: func(ctx context.Context, session string) (bool, error) {
+			return true, nil
+		},
+		IsWindowAlive: func(ctx context.Context, session, window string) (bool, error) {
+			return true, nil
+		},
+		IsPaneIdle: func(ctx context.Context, session, window string) (bool, error) {
+			if session != "ccx-test" || window != "alpha-orchestrator" {
+				t.Fatalf("idle args = %q %q, want ccx-test alpha-orchestrator", session, window)
+			}
+			return idle, nil
+		},
+		AuthDisabled: true,
+	})
+
+	if err := server.ensureOrchestratorAttached(context.Background(), "ccx-test", "alpha-orchestrator"); err != nil {
+		t.Fatalf("ensureOrchestratorAttached: %v", err)
+	}
+	if len(trigger.reasons) != 1 {
+		t.Fatalf("trigger count = %d, want 1", len(trigger.reasons))
+	}
+}
+
+func TestProjectOrchestratorLogWebSocketStartsWhenSessionMissing(t *testing.T) {
+	sessionStarted := false
+	windowStarted := false
+	trigger := &fakeTrigger{fn: func(ctx context.Context, reason string) error {
+		if reason != "browser orchestrator web shell opened" {
+			t.Fatalf("trigger reason = %q, want browser web shell reason", reason)
+		}
+		sessionStarted = true
+		windowStarted = true
+		return nil
+	}}
+	server := New(Deps{
+		Config:  testConfig(),
+		Trigger: trigger,
 		IsSessionAlive: func(ctx context.Context, session string) (bool, error) {
 			if session != "ccx-test" {
 				t.Fatalf("session args = %q, want ccx-test", session)
 			}
-			return false, nil
+			return sessionStarted, nil
 		},
 		IsWindowAlive: func(ctx context.Context, session, window string) (bool, error) {
-			t.Fatal("IsWindowAlive called after missing session")
-			return false, nil
-		},
-		PipeOutput: func(session, window string) (<-chan string, func(), error) {
-			t.Fatalf("PipeOutput called for missing tmux session %q window %q", session, window)
-			return nil, nil, nil
+			if session != "ccx-test" || window != "alpha-orchestrator" {
+				t.Fatalf("alive args = %q %q, want ccx-test alpha-orchestrator", session, window)
+			}
+			return windowStarted, nil
 		},
 		AuthDisabled: true,
-	}))
-	defer server.Close()
+	})
 
-	_, resp, err := websocket.DefaultDialer.Dial(wsURL(server.URL, "/ws/projects/alpha/orchestrator"), nil)
-	if err == nil {
-		t.Fatal("Dial error = nil, want not found")
+	if err := server.ensureOrchestratorAttached(context.Background(), "ccx-test", "alpha-orchestrator"); err != nil {
+		t.Fatalf("ensureOrchestratorAttached: %v", err)
 	}
-	if resp == nil || resp.StatusCode != http.StatusNotFound {
-		t.Fatalf("response = %#v, want 404", resp)
+	if len(trigger.reasons) != 1 {
+		t.Fatalf("trigger count = %d, want 1", len(trigger.reasons))
 	}
 }
 
-func TestProjectOrchestratorLogWebSocketRejectsMissingWindow(t *testing.T) {
-	cfg, manager := newTestProjectManager(t, "alpha")
-	server := httptest.NewServer(New(Deps{
-		Config:  cfg,
-		Manager: manager,
+func TestProjectOrchestratorLogWebSocketStartsWhenWindowMissing(t *testing.T) {
+	windowStarted := false
+	trigger := &fakeTrigger{fn: func(ctx context.Context, reason string) error {
+		windowStarted = true
+		return nil
+	}}
+	server := New(Deps{
+		Config:  testConfig(),
+		Trigger: trigger,
 		IsSessionAlive: func(ctx context.Context, session string) (bool, error) {
 			return true, nil
 		},
@@ -2718,22 +2760,92 @@ func TestProjectOrchestratorLogWebSocketRejectsMissingWindow(t *testing.T) {
 			if session != "ccx-test" || window != "alpha-orchestrator" {
 				t.Fatalf("alive args = %q %q, want ccx-test alpha-orchestrator", session, window)
 			}
-			return false, nil
-		},
-		PipeOutput: func(session, window string) (<-chan string, func(), error) {
-			t.Fatalf("PipeOutput called for missing orchestrator window %q in session %q", window, session)
-			return nil, nil, nil
+			return windowStarted, nil
 		},
 		AuthDisabled: true,
-	}))
-	defer server.Close()
+	})
 
-	_, resp, err := websocket.DefaultDialer.Dial(wsURL(server.URL, "/ws/projects/alpha/orchestrator"), nil)
-	if err == nil {
-		t.Fatal("Dial error = nil, want not found")
+	if err := server.ensureOrchestratorAttached(context.Background(), "ccx-test", "alpha-orchestrator"); err != nil {
+		t.Fatalf("ensureOrchestratorAttached: %v", err)
 	}
-	if resp == nil || resp.StatusCode != http.StatusNotFound {
-		t.Fatalf("response = %#v, want 404", resp)
+	if len(trigger.reasons) != 1 {
+		t.Fatalf("trigger count = %d, want 1", len(trigger.reasons))
+	}
+}
+
+func TestProjectServerUsesProjectOrchestratorWhenParentTriggerConfigured(t *testing.T) {
+	cfg, manager := newTestProjectManager(t, "alpha")
+	parentTrigger := &fakeTrigger{}
+	server := New(Deps{Config: cfg, Manager: manager, Trigger: parentTrigger, AuthDisabled: true})
+	projectServer, err := server.projectServer("alpha")
+	if err != nil {
+		t.Fatalf("projectServer: %v", err)
+	}
+	project, err := manager.Project("alpha")
+	if err != nil {
+		t.Fatalf("Project alpha: %v", err)
+	}
+	if projectServer.trigger != project.Orchestrator {
+		t.Fatalf("project trigger = %#v, want project orchestrator %#v", projectServer.trigger, project.Orchestrator)
+	}
+}
+
+func TestEnsureOrchestratorAttachedCoalescesConcurrentStarts(t *testing.T) {
+	var mu sync.Mutex
+	windowStarted := false
+	paneIdle := true
+	triggerCount := 0
+	server := New(Deps{
+		Config: testConfig(),
+		Trigger: triggerFunc(func(ctx context.Context, reason string) error {
+			mu.Lock()
+			triggerCount++
+			windowStarted = true
+			mu.Unlock()
+			go func() {
+				time.Sleep(50 * time.Millisecond)
+				mu.Lock()
+				paneIdle = false
+				mu.Unlock()
+			}()
+			return nil
+		}),
+		IsSessionAlive: func(ctx context.Context, session string) (bool, error) {
+			return true, nil
+		},
+		IsWindowAlive: func(ctx context.Context, session, window string) (bool, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			return windowStarted, nil
+		},
+		IsPaneIdle: func(ctx context.Context, session, window string) (bool, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			return paneIdle, nil
+		},
+		AuthDisabled: true,
+	})
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 8)
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- server.ensureOrchestratorAttached(context.Background(), "ccx-test", "alpha-orchestrator")
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("ensureOrchestratorAttached: %v", err)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if triggerCount != 1 {
+		t.Fatalf("trigger count = %d, want 1", triggerCount)
 	}
 }
 
@@ -3499,6 +3611,12 @@ func (f *fakeTrigger) Trigger(ctx context.Context, reason string) error {
 		return f.fn(ctx, reason)
 	}
 	return f.err
+}
+
+type triggerFunc func(context.Context, string) error
+
+func (f triggerFunc) Trigger(ctx context.Context, reason string) error {
+	return f(ctx, reason)
 }
 
 type fakeCleaner struct {

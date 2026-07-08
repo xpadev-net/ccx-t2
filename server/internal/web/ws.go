@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"net/url"
@@ -30,6 +31,8 @@ type SendRawKeysFunc func(ctx context.Context, session, window, keys string) err
 type SessionAliveFunc func(ctx context.Context, session string) (bool, error)
 
 type WindowAliveFunc func(ctx context.Context, session, window string) (bool, error)
+
+type PaneIdleFunc func(ctx context.Context, session, window string) (bool, error)
 
 type ResizePaneFunc func(ctx context.Context, session, window string, cols, rows int) error
 
@@ -73,6 +76,11 @@ type tmuxSharedStream struct {
 	cleanupOnce sync.Once
 	subscribers map[chan []byte]struct{}
 	closed      bool
+}
+
+type orchestratorStartLocks struct {
+	mu    sync.Mutex
+	locks map[string]*sync.Mutex
 }
 
 const wsWriteTimeout = 5 * time.Second
@@ -195,29 +203,138 @@ func (s *Server) handleOrchestratorLogWS(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	aliveCtx, cancel := context.WithTimeout(r.Context(), followupTmuxOperationTimeout)
-	sessionAlive, err := s.isSessionAlive(aliveCtx, session)
-	cancel()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "check tmux session")
-		return
-	}
-	if !sessionAlive {
-		writeError(w, http.StatusNotFound, "tmux session not found")
-		return
-	}
-	aliveCtx, cancel = context.WithTimeout(r.Context(), followupTmuxOperationTimeout)
-	windowAlive, err := s.isWindowAlive(aliveCtx, session, window)
-	cancel()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "check orchestrator tmux window")
-		return
-	}
-	if !windowAlive {
-		writeError(w, http.StatusNotFound, "orchestrator tmux window not found")
+	if err := s.ensureOrchestratorAttached(r.Context(), session, window); err != nil {
+		writeError(w, orchestratorAttachStatus(err), err.Error())
 		return
 	}
 	s.handleTmuxLogWS(w, r, window, "orchestrator")
+}
+
+var (
+	errOrchestratorMissingTrigger = errors.New("orchestrator trigger is not configured")
+	errOrchestratorAttachTimeout  = errors.New("orchestrator tmux pane did not become active")
+)
+
+func orchestratorAttachStatus(err error) int {
+	switch {
+	case errors.Is(err, errOrchestratorMissingTrigger):
+		return http.StatusNotFound
+	case errors.Is(err, errOrchestratorAttachTimeout):
+		return http.StatusGatewayTimeout
+	default:
+		return http.StatusInternalServerError
+	}
+}
+
+func (s *Server) ensureOrchestratorAttached(ctx context.Context, session, window string) error {
+	needsStart, err := s.orchestratorNeedsStart(ctx, session, window)
+	if err != nil {
+		return err
+	}
+	if !needsStart {
+		return nil
+	}
+	unlock := s.lockOrchestratorStart(session, window)
+	defer unlock()
+	needsStart, err = s.orchestratorNeedsStart(ctx, session, window)
+	if err != nil {
+		return err
+	}
+	if !needsStart {
+		return nil
+	}
+	if s.trigger == nil {
+		return errOrchestratorMissingTrigger
+	}
+	triggerCtx, cancel := context.WithTimeout(ctx, followupTmuxOperationTimeout)
+	err = s.trigger.Trigger(triggerCtx, "browser orchestrator web shell opened")
+	cancel()
+	if err != nil {
+		return fmt.Errorf("start orchestrator for web shell: %w", err)
+	}
+	return s.waitForOrchestratorWindow(ctx, session, window)
+}
+
+func (s *Server) lockOrchestratorStart(session, window string) func() {
+	if s.startLocks == nil {
+		s.startLocks = &orchestratorStartLocks{}
+	}
+	return s.startLocks.lock(session + "\x00" + window)
+}
+
+func (l *orchestratorStartLocks) lock(key string) func() {
+	l.mu.Lock()
+	if l.locks == nil {
+		l.locks = make(map[string]*sync.Mutex)
+	}
+	lock := l.locks[key]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		l.locks[key] = lock
+	}
+	l.mu.Unlock()
+	lock.Lock()
+	return lock.Unlock
+}
+
+func (s *Server) orchestratorNeedsStart(ctx context.Context, session, window string) (bool, error) {
+	aliveCtx, cancel := context.WithTimeout(ctx, followupTmuxOperationTimeout)
+	sessionAlive, err := s.isSessionAlive(aliveCtx, session)
+	cancel()
+	if err != nil {
+		return false, fmt.Errorf("check tmux session: %w", err)
+	}
+	if !sessionAlive {
+		return true, nil
+	}
+	aliveCtx, cancel = context.WithTimeout(ctx, followupTmuxOperationTimeout)
+	windowAlive, err := s.isWindowAlive(aliveCtx, session, window)
+	cancel()
+	if err != nil {
+		return false, fmt.Errorf("check orchestrator tmux window: %w", err)
+	}
+	if !windowAlive {
+		return true, nil
+	}
+	if s.isPaneIdle == nil {
+		return false, nil
+	}
+	idleCtx, cancel := context.WithTimeout(ctx, followupTmuxOperationTimeout)
+	idle, err := s.isPaneIdle(idleCtx, session, window)
+	cancel()
+	if err != nil {
+		return false, fmt.Errorf("check orchestrator tmux pane: %w", err)
+	}
+	return idle, nil
+}
+
+func (s *Server) waitForOrchestratorWindow(ctx context.Context, session, window string) error {
+	deadline := time.NewTimer(followupTmuxOperationTimeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		checkCtx, cancel := context.WithTimeout(ctx, followupTmuxOperationTimeout)
+		alive, err := s.isWindowAlive(checkCtx, session, window)
+		idle := false
+		if err == nil && alive && s.isPaneIdle != nil {
+			idle, err = s.isPaneIdle(checkCtx, session, window)
+		}
+		cancel()
+		if err != nil {
+			return fmt.Errorf("check started orchestrator tmux pane: %w", err)
+		}
+		if alive && !idle {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-deadline.C:
+			return errOrchestratorAttachTimeout
+		case <-ticker.C:
+		}
+	}
 }
 
 func (s *Server) handleTmuxLogWS(w http.ResponseWriter, r *http.Request, window, label string) {
