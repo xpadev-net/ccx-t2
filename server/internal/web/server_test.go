@@ -1522,6 +1522,34 @@ func TestGetConfigRedactsSecrets(t *testing.T) {
 	}
 }
 
+func TestGetConfigReturnsEmptyWorkerHarnessesArray(t *testing.T) {
+	cfg := testConfig()
+	cfg.WorkerHarnesses = nil
+
+	resp := performRequest(New(Deps{Config: cfg, AuthDisabled: true}), http.MethodGet, "/api/config")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	if !strings.Contains(resp.Body.String(), `"worker_harnesses":[]`) {
+		t.Fatalf("config response = %s, want worker_harnesses empty array", resp.Body.String())
+	}
+}
+
+func TestApplyConfigPatchPreservesExplicitEmptyWorkerHarnesses(t *testing.T) {
+	cfg := testConfig()
+	empty := []string{}
+
+	if err := applyConfigPatch(cfg, configPatchRequest{WorkerHarnesses: &empty}); err != nil {
+		t.Fatalf("applyConfigPatch: %v", err)
+	}
+	if cfg.WorkerHarnesses == nil {
+		t.Fatal("WorkerHarnesses = nil, want explicit empty slice")
+	}
+	if len(cfg.WorkerHarnesses) != 0 {
+		t.Fatalf("WorkerHarnesses = %#v, want empty", cfg.WorkerHarnesses)
+	}
+}
+
 func TestPatchConfigUpdatesAndPersistsEditableFields(t *testing.T) {
 	t.Setenv("CCX_TEST_SECRET", "secret-value")
 	dir := t.TempDir()

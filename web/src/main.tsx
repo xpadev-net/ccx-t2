@@ -72,7 +72,7 @@ type ConfigResponse = {
     heartbeat_interval: string;
     timeout: string;
   };
-  worker_harnesses: string[];
+  worker_harnesses: string[] | null;
   harnesses: Record<string, { command: string }>;
   github: {
     owner?: string;
@@ -1650,6 +1650,8 @@ function formatRetryDelay(delay?: number) {
 }
 
 function configToDraft(config: ConfigResponse): ConfigDraft {
+  const workerHarnesses = Array.isArray(config.worker_harnesses) ? config.worker_harnesses : [];
+
   return {
     projectSlug: config.project.slug,
     repoPath: config.project.repo_path,
@@ -1659,7 +1661,7 @@ function configToDraft(config: ConfigResponse): ConfigDraft {
     orchestratorHarness: config.orchestrator.harness,
     heartbeatInterval: config.orchestrator.heartbeat_interval,
     timeout: config.orchestrator.timeout,
-    workerHarnesses: config.worker_harnesses.join(", "),
+    workerHarnesses: workerHarnesses.join(", "),
     harnesses: Object.fromEntries(Object.entries(config.harnesses).map(([name, harness]) => [name, harness.command])),
     githubOwner: config.github.owner ?? "",
     githubRepo: config.github.repo ?? ""
