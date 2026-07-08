@@ -1043,6 +1043,130 @@ func TestBuildMCPTokensRejectsInvalidTemplateShellSyntax(t *testing.T) {
 	}
 }
 
+func TestBuildHarnessLaunchCommandConvertsCodexMCPArgsToConfigOverrides(t *testing.T) {
+	dir := t.TempDir()
+	promptPath := filepath.Join(dir, "prompt")
+	secretPath := filepath.Join(dir, "secret")
+	secret := `tok en ' "$HOME" $(echo nope); *`
+
+	if err := os.WriteFile(promptPath, []byte("prompt"), 0o600); err != nil {
+		t.Fatalf("write prompt: %v", err)
+	}
+	if err := os.WriteFile(secretPath, []byte(secret), 0o600); err != nil {
+		t.Fatalf("write secret: %v", err)
+	}
+
+	command := buildHarnessLaunchCommand("codex", []string{
+		"--mcp-url",
+		"http://localhost:8080/mcp/orchestrator",
+		"--mcp-secret",
+		secretEnvToken,
+	}, promptPath, secretPath)
+	if strings.Contains(command, "--mcp-url") || strings.Contains(command, "--mcp-secret") {
+		t.Fatalf("command still passes unsupported codex MCP args: %q", command)
+	}
+	if strings.Contains(command, secret) {
+		t.Fatalf("command exposes MCP secret: %q", command)
+	}
+
+	got, err := shellquote.Split(strings.TrimSuffix(strings.TrimPrefix(command, secretEnvName+"=$(cat "+shellQuoteArg(secretPath)+"); export "+secretEnvName+"; rm -f "+shellQuoteArg(secretPath)+"; { rm -f "+shellQuoteArg(promptPath)+"; exec "), "; } < "+shellQuoteArg(promptPath)))
+	if err != nil {
+		t.Fatalf("generated codex command is not valid shell syntax: %v\n%s", err, command)
+	}
+	want := []string{
+		"codex",
+		"-c",
+		`mcp_servers.ccx_t2.url="http://localhost:8080/mcp/orchestrator"`,
+		"-c",
+		`mcp_servers.ccx_t2.bearer_token_env_var="CCX_MCP_SECRET"`,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("generated args mismatch\ngot:  %#v\nwant: %#v\ncommand: %s", got, want, command)
+	}
+}
+
+func TestBuildHarnessLaunchCommandConvertsCodexHeaderSecretToBearerEnv(t *testing.T) {
+	dir := t.TempDir()
+	promptPath := filepath.Join(dir, "prompt")
+	secretPath := filepath.Join(dir, "secret")
+	secret := `tok en ' "$HOME" $(echo nope); *`
+
+	if err := os.WriteFile(promptPath, []byte("prompt"), 0o600); err != nil {
+		t.Fatalf("write prompt: %v", err)
+	}
+	if err := os.WriteFile(secretPath, []byte(secret), 0o600); err != nil {
+		t.Fatalf("write secret: %v", err)
+	}
+
+	command := buildHarnessLaunchCommand("codex", []string{
+		"--mcp-url",
+		"http://localhost:8080/mcp/orchestrator",
+		"--header",
+		"Authorization: Bearer " + secretEnvToken,
+	}, promptPath, secretPath)
+	if strings.Contains(command, "--mcp-url") || strings.Contains(command, "--header") {
+		t.Fatalf("command still passes unsupported codex MCP args: %q", command)
+	}
+	if strings.Contains(command, secret) {
+		t.Fatalf("command exposes MCP secret: %q", command)
+	}
+
+	got, err := shellquote.Split(strings.TrimSuffix(strings.TrimPrefix(command, secretEnvName+"=$(cat "+shellQuoteArg(secretPath)+"); export "+secretEnvName+"; rm -f "+shellQuoteArg(secretPath)+"; { rm -f "+shellQuoteArg(promptPath)+"; exec "), "; } < "+shellQuoteArg(promptPath)))
+	if err != nil {
+		t.Fatalf("generated codex command is not valid shell syntax: %v\n%s", err, command)
+	}
+	want := []string{
+		"codex",
+		"-c",
+		`mcp_servers.ccx_t2.url="http://localhost:8080/mcp/orchestrator"`,
+		"-c",
+		`mcp_servers.ccx_t2.bearer_token_env_var="CCX_MCP_SECRET"`,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("generated args mismatch\ngot:  %#v\nwant: %#v\ncommand: %s", got, want, command)
+	}
+}
+
+func TestBuildHarnessLaunchCommandConvertsCodexEqualsMCPArgsToConfigOverrides(t *testing.T) {
+	dir := t.TempDir()
+	promptPath := filepath.Join(dir, "prompt")
+	secretPath := filepath.Join(dir, "secret")
+	secret := `tok en ' "$HOME" $(echo nope); *`
+
+	if err := os.WriteFile(promptPath, []byte("prompt"), 0o600); err != nil {
+		t.Fatalf("write prompt: %v", err)
+	}
+	if err := os.WriteFile(secretPath, []byte(secret), 0o600); err != nil {
+		t.Fatalf("write secret: %v", err)
+	}
+
+	command := buildHarnessLaunchCommand("codex", []string{
+		"--mcp-url=http://localhost:8080/mcp/orchestrator",
+		"--mcp-secret=" + secretEnvToken,
+	}, promptPath, secretPath)
+	if strings.Contains(command, "--mcp-url") || strings.Contains(command, "--mcp-secret") {
+		t.Fatalf("command still passes unsupported codex MCP args: %q", command)
+	}
+	if strings.Contains(command, secret) {
+		t.Fatalf("command exposes MCP secret: %q", command)
+	}
+
+	got, err := shellquote.Split(strings.TrimSuffix(strings.TrimPrefix(command, secretEnvName+"=$(cat "+shellQuoteArg(secretPath)+"); export "+secretEnvName+"; rm -f "+shellQuoteArg(secretPath)+"; { rm -f "+shellQuoteArg(promptPath)+"; exec "), "; } < "+shellQuoteArg(promptPath)))
+	if err != nil {
+		t.Fatalf("generated codex command is not valid shell syntax: %v\n%s", err, command)
+	}
+	want := []string{
+		"codex",
+		"-c",
+		`mcp_servers.ccx_t2.url="http://localhost:8080/mcp/orchestrator"`,
+		"-c",
+		`mcp_servers.ccx_t2.bearer_token_env_var="CCX_MCP_SECRET"`,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("generated args mismatch\ngot:  %#v\nwant: %#v\ncommand: %s", got, want, command)
+	}
+}
+
 func TestBuildHarnessLaunchCommandExpandsSecretEnvInHarnessArg(t *testing.T) {
 	dir := t.TempDir()
 	promptPath := filepath.Join(dir, "prompt")
