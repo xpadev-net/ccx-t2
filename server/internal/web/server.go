@@ -1707,7 +1707,7 @@ func harnessResponsesFromConfig(cfg *config.Config) []harnessResponse {
 }
 
 func configResponseFromConfig(cfg *config.Config) configResponse {
-	workerHarnesses := append([]string(nil), cfg.WorkerHarnesses...)
+	workerHarnesses := append([]string{}, cfg.WorkerHarnesses...)
 	harnesses := make(map[string]harnessConfigResponse, len(cfg.Harnesses))
 	for name, h := range cfg.Harnesses {
 		harnesses[name] = harnessConfigResponse{Command: h.Command}
