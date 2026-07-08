@@ -1535,6 +1535,21 @@ func TestGetConfigReturnsEmptyWorkerHarnessesArray(t *testing.T) {
 	}
 }
 
+func TestApplyConfigPatchPreservesExplicitEmptyWorkerHarnesses(t *testing.T) {
+	cfg := testConfig()
+	empty := []string{}
+
+	if err := applyConfigPatch(cfg, configPatchRequest{WorkerHarnesses: &empty}); err != nil {
+		t.Fatalf("applyConfigPatch: %v", err)
+	}
+	if cfg.WorkerHarnesses == nil {
+		t.Fatal("WorkerHarnesses = nil, want explicit empty slice")
+	}
+	if len(cfg.WorkerHarnesses) != 0 {
+		t.Fatalf("WorkerHarnesses = %#v, want empty", cfg.WorkerHarnesses)
+	}
+}
+
 func TestPatchConfigUpdatesAndPersistsEditableFields(t *testing.T) {
 	t.Setenv("CCX_TEST_SECRET", "secret-value")
 	dir := t.TempDir()

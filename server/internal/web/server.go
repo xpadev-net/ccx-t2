@@ -1830,7 +1830,7 @@ func applyConfigPatch(cfg *config.Config, req configPatchRequest) error {
 		}
 	}
 	if req.WorkerHarnesses != nil {
-		cfg.WorkerHarnesses = append([]string(nil), *req.WorkerHarnesses...)
+		cfg.WorkerHarnesses = append([]string{}, *req.WorkerHarnesses...)
 		for i := range cfg.WorkerHarnesses {
 			cfg.WorkerHarnesses[i] = strings.TrimSpace(cfg.WorkerHarnesses[i])
 		}
