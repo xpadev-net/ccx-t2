@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -666,6 +668,7 @@ func buildMCPTokens(template, mcpURL, secret string) ([]string, error) {
 }
 
 func buildHarnessCommandWithSecretEnv(command string, mcpTokens []string) string {
+	mcpTokens = codexMCPConfigTokens(command, mcpTokens)
 	parts := make([]string, 0, 1+len(mcpTokens))
 	parts = append(parts, shellQuoteArg(command))
 	for _, tok := range mcpTokens {
@@ -682,6 +685,50 @@ func buildHarnessLaunchCommand(command string, mcpTokens []string, promptPath, s
 		prefix = secretEnvName + "=$(cat " + quotedSecretPath + "); export " + secretEnvName + "; rm -f " + quotedSecretPath + "; "
 	}
 	return prefix + "{ rm -f " + quotedPromptPath + "; exec " + buildHarnessCommandWithSecretEnv(command, mcpTokens) + "; } < " + quotedPromptPath
+}
+
+func codexMCPConfigTokens(command string, mcpTokens []string) []string {
+	if filepath.Base(command) != "codex" {
+		return mcpTokens
+	}
+	mcpURL := ""
+	hasSecret := false
+	for i := 0; i < len(mcpTokens); i++ {
+		switch mcpTokens[i] {
+		case "--mcp-url":
+			if i+1 < len(mcpTokens) {
+				mcpURL = mcpTokens[i+1]
+				i++
+			}
+		case "--mcp-secret":
+			if i+1 < len(mcpTokens) {
+				hasSecret = mcpTokens[i+1] != ""
+				i++
+			}
+		default:
+			if value, ok := strings.CutPrefix(mcpTokens[i], "--mcp-url="); ok {
+				mcpURL = value
+			}
+			if value, ok := strings.CutPrefix(mcpTokens[i], "--mcp-secret="); ok && value != "" {
+				hasSecret = true
+			}
+			hasSecret = hasSecret || strings.Contains(mcpTokens[i], secretEnvToken)
+		}
+	}
+	if mcpURL == "" {
+		return mcpTokens
+	}
+	tokens := []string{
+		"-c",
+		"mcp_servers.ccx_t2.url=" + strconv.Quote(mcpURL),
+	}
+	if hasSecret {
+		tokens = append(tokens,
+			"-c",
+			"mcp_servers.ccx_t2.bearer_token_env_var="+strconv.Quote(secretEnvName),
+		)
+	}
+	return tokens
 }
 
 func shellQuoteArg(s string) string {

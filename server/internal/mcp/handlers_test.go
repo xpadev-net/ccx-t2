@@ -39,11 +39,11 @@ func (r *recordingNotifyTrigger) Trigger(_ context.Context, reason string) error
 	return r.err
 }
 
-func TestBuildHarnessCommandPreservesExpandedMCPValuesAsSingleArgs(t *testing.T) {
+func TestBuildHarnessCommandConvertsCodexMCPArgsToConfigOverrides(t *testing.T) {
 	tokens, err := buildMCPTokens(
 		"--mcp-url {url} --mcp-secret {secret} --header 'Authorization: Bearer {secret}'",
 		"http://localhost:8080/mcp/worker",
-		"secret with spaces; echo 'nope'",
+		workerMCPSecretEnvToken,
 	)
 	if err != nil {
 		t.Fatalf("buildMCPTokens() error = %v", err)
@@ -57,6 +57,90 @@ func TestBuildHarnessCommandPreservesExpandedMCPValuesAsSingleArgs(t *testing.T)
 
 	want := []string{
 		"codex",
+		"-c",
+		`mcp_servers.ccx_t2.url="http://localhost:8080/mcp/worker"`,
+		"-c",
+		`mcp_servers.ccx_t2.bearer_token_env_var="CCX_MCP_SECRET"`,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("generated args mismatch\ngot:  %#v\nwant: %#v", got, want)
+	}
+}
+
+func TestBuildHarnessCommandConvertsCodexHeaderSecretToBearerEnv(t *testing.T) {
+	tokens, err := buildMCPTokens(
+		"--mcp-url {url} --header 'Authorization: Bearer {secret}'",
+		"http://localhost:8080/mcp/worker",
+		workerMCPSecretEnvToken,
+	)
+	if err != nil {
+		t.Fatalf("buildMCPTokens() error = %v", err)
+	}
+
+	command := buildHarnessCommand("codex", tokens)
+	got, err := shellquote.Split(command)
+	if err != nil {
+		t.Fatalf("generated command is not valid shell syntax: %v", err)
+	}
+
+	want := []string{
+		"codex",
+		"-c",
+		`mcp_servers.ccx_t2.url="http://localhost:8080/mcp/worker"`,
+		"-c",
+		`mcp_servers.ccx_t2.bearer_token_env_var="CCX_MCP_SECRET"`,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("generated args mismatch\ngot:  %#v\nwant: %#v", got, want)
+	}
+}
+
+func TestBuildHarnessCommandConvertsCodexEqualsMCPArgsToConfigOverrides(t *testing.T) {
+	tokens, err := buildMCPTokens(
+		"--mcp-url={url} --mcp-secret={secret}",
+		"http://localhost:8080/mcp/worker",
+		workerMCPSecretEnvToken,
+	)
+	if err != nil {
+		t.Fatalf("buildMCPTokens() error = %v", err)
+	}
+
+	command := buildHarnessCommand("codex", tokens)
+	got, err := shellquote.Split(command)
+	if err != nil {
+		t.Fatalf("generated command is not valid shell syntax: %v", err)
+	}
+
+	want := []string{
+		"codex",
+		"-c",
+		`mcp_servers.ccx_t2.url="http://localhost:8080/mcp/worker"`,
+		"-c",
+		`mcp_servers.ccx_t2.bearer_token_env_var="CCX_MCP_SECRET"`,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("generated args mismatch\ngot:  %#v\nwant: %#v", got, want)
+	}
+}
+
+func TestBuildHarnessCommandPreservesExpandedMCPValuesAsSingleArgsForOtherHarnesses(t *testing.T) {
+	tokens, err := buildMCPTokens(
+		"--mcp-url {url} --mcp-secret {secret} --header 'Authorization: Bearer {secret}'",
+		"http://localhost:8080/mcp/worker",
+		"secret with spaces; echo 'nope'",
+	)
+	if err != nil {
+		t.Fatalf("buildMCPTokens() error = %v", err)
+	}
+
+	command := buildHarnessCommand("claude", tokens)
+	got, err := shellquote.Split(command)
+	if err != nil {
+		t.Fatalf("generated command is not valid shell syntax: %v", err)
+	}
+
+	want := []string{
+		"claude",
 		"--mcp-url",
 		"http://localhost:8080/mcp/worker",
 		"--mcp-secret",
