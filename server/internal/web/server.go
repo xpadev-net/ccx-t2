@@ -1227,7 +1227,7 @@ func (s *Server) harnessSnapshot() ([]harnessResponse, bool) {
 	if s.cfg == nil {
 		return nil, false
 	}
-	return append([]harnessResponse(nil), s.harnesses...), true
+	return append([]harnessResponse{}, s.harnesses...), true
 }
 
 func (s *Server) getConfig(w http.ResponseWriter, r *http.Request) {
