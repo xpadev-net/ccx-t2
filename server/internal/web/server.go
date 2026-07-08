@@ -44,6 +44,7 @@ type Server struct {
 	resizePane      ResizePaneFunc
 	isSessionAlive  SessionAliveFunc
 	isWindowAlive   WindowAliveFunc
+	isPaneIdle      PaneIdleFunc
 	tmuxSession     string
 	projectScoped   bool
 	pendingTriggers *pendingTriggerSet
@@ -55,6 +56,7 @@ type Server struct {
 	ledgerClientsMu sync.Mutex
 	ledgerClients   map[string]map[*ledgerWSClient]struct{}
 	tmuxStreams     *tmuxStreamRegistry
+	startLocks      *orchestratorStartLocks
 }
 
 const deleteCleanupLease = 5 * time.Minute
@@ -79,6 +81,7 @@ type Deps struct {
 	ResizePane     ResizePaneFunc
 	IsSessionAlive SessionAliveFunc
 	IsWindowAlive  WindowAliveFunc
+	IsPaneIdle     PaneIdleFunc
 	Session        string
 	Secret         string
 	AuthDisabled   bool
@@ -103,6 +106,7 @@ func New(deps Deps) *Server {
 		resizePane:     deps.ResizePane,
 		isSessionAlive: deps.IsSessionAlive,
 		isWindowAlive:  deps.IsWindowAlive,
+		isPaneIdle:     deps.IsPaneIdle,
 		tmuxSession:    deps.Session,
 		secret:         deps.Secret,
 		authDisabled:   deps.AuthDisabled,
@@ -110,6 +114,7 @@ func New(deps Deps) *Server {
 		harnesses:      harnessResponsesFromConfig(cfg),
 		mux:            http.NewServeMux(),
 		tmuxStreams:    &tmuxStreamRegistry{},
+		startLocks:     &orchestratorStartLocks{},
 		pendingTriggers: &pendingTriggerSet{
 			tasks: make(map[string]triggerState),
 		},
@@ -142,6 +147,9 @@ func New(deps Deps) *Server {
 	}
 	if s.isWindowAlive == nil {
 		s.isWindowAlive = tmux.IsWindowAliveContext
+	}
+	if s.isPaneIdle == nil && deps.IsSessionAlive == nil && deps.IsWindowAlive == nil {
+		s.isPaneIdle = tmux.IsPaneIdleContext
 	}
 	if s.ledger != nil {
 		s.ledger.SetOnChange(s.broadcastLedgerChange)
@@ -569,6 +577,7 @@ func (s *Server) projectServer(slug string) (*Server, error) {
 		resizePane:      s.resizePane,
 		isSessionAlive:  s.isSessionAlive,
 		isWindowAlive:   s.isWindowAlive,
+		isPaneIdle:      s.isPaneIdle,
 		tmuxSession:     project.Session,
 		projectScoped:   true,
 		pendingTriggers: s.pendingTriggers,
@@ -577,6 +586,7 @@ func (s *Server) projectServer(slug string) (*Server, error) {
 		allowedOrigins:  s.allowedOrigins,
 		harnesses:       s.harnesses,
 		tmuxStreams:     s.tmuxStreams,
+		startLocks:      s.startLocks,
 	}
 	out.cleaner = defaultWorkerCleaner{
 		deps: func() cleanupDependencies {
