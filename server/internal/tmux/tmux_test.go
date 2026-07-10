@@ -551,6 +551,7 @@ func TestCreateProjectWindowContextPreservesWinnerAfterPostRenameDuplicate(t *te
 	created := false
 	external := false
 	renamed := false
+	postRenameLists := 0
 	pendingName := ""
 	killed := false
 	tmuxOutput := func(output string) *exec.Cmd {
@@ -578,12 +579,16 @@ func TestCreateProjectWindowContextPreservesWinnerAfterPostRenameDuplicate(t *te
 			case !created:
 				return tmuxOutput("")
 			case external:
+				postRenameLists++
+				if postRenameLists > 1 {
+					return tmuxOutput("2\t@1\n")
+				}
 				return tmuxOutput("2\t@1\n3\t@2\n")
 			default:
 				return tmuxOutput("2\t@1\n")
 			}
 		case args[0] == "list-windows" && args[len(args)-1] == "#{window_id}":
-			if external {
+			if external && postRenameLists == 1 {
 				return tmuxOutput("@1\n@2\n")
 			}
 			return tmuxOutput("@1\n")
@@ -607,6 +612,9 @@ func TestCreateProjectWindowContextPreservesWinnerAfterPostRenameDuplicate(t *te
 	}
 	if killed {
 		t.Fatal("winner-preserving duplicate handling killed the winning owned window")
+	}
+	if postRenameLists < 2 {
+		t.Fatalf("post-rename window list calls = %d, want convergence recheck", postRenameLists)
 	}
 }
 

@@ -440,11 +440,43 @@ func verifyRenamedWindowContext(ctx context.Context, session, windowID, windowNa
 			cleanupCreatedWindow(windowID)
 			return WindowInfo{}, fmt.Errorf("%w: %s", ErrWindowNameTaken, windowName)
 		}
+		// The caller won the deterministic race, but a losing creator may not
+		// have finished its cleanup yet. Do not report success while the name
+		// still resolves to multiple windows; name-targeted operations would
+		// otherwise remain ambiguous.
+		return waitForSoleRenamedWindow(ctx, session, windowID, windowName, repoPath)
 	}
 	if own.ID != windowID || own.Name != windowName || !pathsMatch(own.CurrentPath, repoPath) {
 		return WindowInfo{}, fmt.Errorf("created tmux window %q could not be verified after rename", windowName)
 	}
 	return own, nil
+}
+
+func waitForSoleRenamedWindow(ctx context.Context, session, windowID, windowName, repoPath string) (WindowInfo, error) {
+	reconcileCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), projectWindowReconcileTimeout)
+	defer cancel()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		windows, err := ListWindowsContext(reconcileCtx, session)
+		if err != nil {
+			return WindowInfo{}, err
+		}
+		requested := make([]WindowInfo, 0, 1)
+		for _, window := range windows {
+			if window.Name == windowName {
+				requested = append(requested, window)
+			}
+		}
+		if len(requested) == 1 && requested[0].ID == windowID && pathsMatch(requested[0].CurrentPath, repoPath) {
+			return requested[0], nil
+		}
+		select {
+		case <-reconcileCtx.Done():
+			return WindowInfo{}, fmt.Errorf("created tmux window %q did not converge to a unique name: %w", windowName, reconcileCtx.Err())
+		case <-ticker.C:
+		}
+	}
 }
 
 func listWindowsForRecovery(ctx context.Context, session string) ([]WindowInfo, error) {
