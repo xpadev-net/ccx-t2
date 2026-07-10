@@ -121,11 +121,14 @@
 - Task_2 is complete only when both Task_8 and Task_9 are merged and validated.
 
 ### Task_8: mergeable WebSocket transport stability subset
-- status: in_progress
+- status: complete
 - type: impl
 - branch: `codex/webshell-ws-stability`
 - thread: `019f4d7d-a6b5-71f1-acda-e0e404f28bfb`
 - pr: `https://github.com/xpadev-net/ccx-t2/pull/66`
+- merged_head: `eadde1ebf652663cd628058696111c1e58cd7fdc`
+- merge_commit: `6439fb12a3d6e3185d7d6280cbd1ab04ff398189`
+- evidence: worker and orchestrator normal/race/vet/stress validation passed; worker and orchestrator `gh-review-hook` exited 0; Greptile and independent Reviewer APPROVED; all six GitHub checks passed.
 - owns:
   - `server/internal/web/ws.go`
   - `server/internal/web/ws_test.go`
@@ -396,6 +399,7 @@
 - 2026-07-11: Expanded to seven tasks with file ownership, dependencies, acceptance, validation, PR gates, and E2E spec. Wave 1 pending delegation.
 - 2026-07-11: Wave 1 delegated in separate worktrees using `gpt-5.6-luna` / `high`. Task_1 startup system error received one required resume; Task_2 passed startup stability check.
 - 2026-07-11: Task_2 split after repeated parent deep-review proved the independent snapshot/pipe interfaces cannot establish an atomic no-gap/no-duplicate boundary. PR #66 continues as Task_8 reduced transport stability; Task_9 owns the new tmux attachment contract after Task_1 and Task_8 merge.
+- 2026-07-11: Task_8 merged via PR #66 at `6439fb12a3d6e3185d7d6280cbd1ab04ff398189` after reduced-scope parent deep-review APPROVED, independent Reviewer APPROVED, hook exit 0, normal/race/vet/stress passes, and all GitHub checks green. Worker archival initiated.
 
 ## Decision Log
 - 2026-07-11: WebShell is the product UI; harness/task concepts remain backend-compatible but are removed from primary navigation.
