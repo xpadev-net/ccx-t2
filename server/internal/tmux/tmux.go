@@ -528,7 +528,7 @@ func duplicateResolutionCause(windows []WindowInfo, ownID string, cause error) e
 }
 
 func resolutionRollbackError(ctx context.Context, session, windowID, pendingName, repoPath string, requested []WindowInfo, windowName string, cause error) error {
-	if rollbackErr := rollbackProjectWindows(ctx, session, windowID, requested); rollbackErr == nil {
+	if rollbackErr := rollbackProjectWindows(ctx, session, windowID, pendingName, repoPath, requested); rollbackErr == nil {
 		return fmt.Errorf("%w: created tmux window %q did not converge: %w", errProjectWindowNameUnresolved, windowName, cause)
 	} else if restoreErr := restorePendingWindowContext(ctx, session, windowID, pendingName, repoPath); restoreErr == nil {
 		return fmt.Errorf("%w: created tmux window %q did not converge; owned window was restored to its unique pending identity: %v: %w", errProjectWindowNameUnresolved, windowName, rollbackErr, cause)
@@ -540,6 +540,13 @@ func resolutionRollbackError(ctx context.Context, session, windowID, pendingName
 func restorePendingWindowContext(ctx context.Context, session, windowID, pendingName, repoPath string) error {
 	recoveryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), projectWindowReconcileTimeout)
 	defer cancel()
+	owned, err := rollbackWindowOwnershipContext(recoveryCtx, session, windowID, pendingName, repoPath)
+	if err != nil {
+		return err
+	}
+	if !owned {
+		return nil
+	}
 	if err := runCtx(recoveryCtx, "tmux", "rename-window", "-t", windowID, pendingName); err != nil {
 		present, presentErr := windowInSessionContext(recoveryCtx, session, windowID)
 		if presentErr == nil && !present {
@@ -559,18 +566,29 @@ func restorePendingWindowContext(ctx context.Context, session, windowID, pending
 	return fmt.Errorf("pending window %q could not be verified after rollback", pendingName)
 }
 
-func rollbackProjectWindows(ctx context.Context, session, windowID string, windows []WindowInfo) error {
+func rollbackProjectWindows(ctx context.Context, session, windowID, pendingName, repoPath string, windows []WindowInfo) error {
 	rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), projectWindowReconcileTimeout)
 	defer cancel()
 	ids := map[string]struct{}{windowID: {}}
+	markers := map[string]string{windowID: pendingName}
 	for _, window := range windows {
 		if isProjectCreationMarker(window.CreationMarker) {
 			ids[window.ID] = struct{}{}
+			markers[window.ID] = window.CreationMarker
 		}
 	}
 	for {
 		for id := range ids {
-			_ = cleanupCreatedWindowContext(rollbackCtx, id)
+			owned, err := rollbackWindowOwnershipContext(rollbackCtx, session, id, markers[id], repoPath)
+			if err != nil {
+				return err
+			}
+			if !owned {
+				continue
+			}
+			if err := killWindowIfOwnedContext(rollbackCtx, id, markers[id]); err != nil {
+				return err
+			}
 		}
 		allGone := true
 		for id := range ids {
@@ -594,6 +612,49 @@ func rollbackProjectWindows(ctx context.Context, session, windowID string, windo
 		case <-time.After(10 * time.Millisecond):
 		}
 	}
+}
+
+func killWindowIfOwnedContext(ctx context.Context, windowID, marker string) error {
+	if !isSafeWindowID(windowID) {
+		return fmt.Errorf("unsafe tmux window ID %q", windowID)
+	}
+	if !isProjectCreationMarker(marker) {
+		return fmt.Errorf("unsafe tmux project marker %q", marker)
+	}
+	condition := fmt.Sprintf("#{==:%s,%s}", projectWindowMarkerFormat, marker)
+	command := "kill-window -t " + windowID
+	return runCtx(ctx, "tmux", "if-shell", "-t", windowID, "-F", condition, command, "")
+}
+
+func rollbackWindowOwnershipContext(ctx context.Context, session, windowID, marker, repoPath string) (bool, error) {
+	windows, err := ListWindowsContext(ctx, session)
+	if err != nil {
+		if errors.Is(err, ErrSessionNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	for _, window := range windows {
+		if window.ID != windowID {
+			continue
+		}
+		if window.CreationMarker != marker {
+			return false, fmt.Errorf("rollback ownership marker changed for window %q", windowID)
+		}
+		if !pathsMatch(window.CurrentPath, repoPath) {
+			return false, fmt.Errorf("rollback repository path changed for window %q", windowID)
+		}
+		return true, nil
+	}
+	return false, nil
+}
+
+func isSafeWindowID(windowID string) bool {
+	if !strings.HasPrefix(windowID, "@") || len(windowID) == 1 {
+		return false
+	}
+	_, err := strconv.Atoi(strings.TrimPrefix(windowID, "@"))
+	return err == nil
 }
 
 func listWindowsForRecovery(ctx context.Context, session string) ([]WindowInfo, error) {
@@ -695,7 +756,16 @@ const projectWindowMarkerFormat = "#{@ccx-project-window-attempt}"
 var projectWindowReconcileTimeout = 5 * time.Second
 
 func isProjectCreationMarker(marker string) bool {
-	return strings.HasPrefix(marker, pendingProjectWindowPrefix)
+	suffix := strings.TrimPrefix(marker, pendingProjectWindowPrefix)
+	if suffix == marker || len(suffix) != 24 {
+		return false
+	}
+	for _, char := range suffix {
+		if !((char >= '0' && char <= '9') || (char >= 'a' && char <= 'f')) {
+			return false
+		}
+	}
+	return true
 }
 
 func acquireProjectShellCreation(ctx context.Context, session, projectSlug string) (func(), error) {

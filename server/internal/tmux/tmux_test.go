@@ -540,6 +540,8 @@ func TestCreateProjectWindowContextCleansOnlyOwnedWindowOnRenameDuplicate(t *tes
 			return tmuxOutput("/repo\n")
 		case args[0] == "display-message" && args[len(args)-1] == "#{pane_current_command}":
 			return tmuxOutput("bash\n")
+		case args[0] == "display-message" && args[len(args)-1] == projectWindowMarkerFormat:
+			return tmuxOutput(pendingName + "\n")
 		default:
 			return exec.Command("sh", "-c", "true")
 		}
@@ -632,13 +634,14 @@ func TestCreateProjectWindowContextPreservesWinnerAfterPostRenameDuplicate(t *te
 func TestCreateProjectWindowContextRollsBackWinnerWhenDuplicateDoesNotConverge(t *testing.T) {
 	oldExecCommandContext := execCommandContext
 	oldReconcileTimeout := projectWindowReconcileTimeout
-	projectWindowReconcileTimeout = 20 * time.Millisecond
+	projectWindowReconcileTimeout = 2 * time.Second
 	createCalls := 0
 	renamed := false
 	rolledBack := false
 	pendingName := ""
 	killedOwn := false
 	killedLoser := false
+	ifShellCalled := false
 	tmuxOutput := func(output string) *exec.Cmd {
 		return exec.Command("sh", "-c", "printf '%s' \"$1\"", "sh", output)
 	}
@@ -658,6 +661,15 @@ func TestCreateProjectWindowContextRollsBackWinnerWhenDuplicateDoesNotConverge(t
 			return tmuxOutput("@3\n")
 		case args[0] == "rename-window":
 			renamed = true
+			return exec.Command("sh", "-c", "true")
+		case args[0] == "if-shell":
+			ifShellCalled = true
+			if strings.Contains(args[len(args)-2], "@1") {
+				rolledBack = true
+				killedOwn = true
+			} else if strings.Contains(args[len(args)-2], "@2") {
+				killedLoser = true
+			}
 			return exec.Command("sh", "-c", "true")
 		case args[0] == "kill-window":
 			if args[2] == "@1" {
@@ -703,7 +715,7 @@ func TestCreateProjectWindowContextRollsBackWinnerWhenDuplicateDoesNotConverge(t
 			return tmuxOutput("bash\n")
 		case args[0] == "display-message" && args[len(args)-1] == projectWindowMarkerFormat:
 			if args[2] == "@2" {
-				return tmuxOutput(pendingProjectWindowPrefix + "external\n")
+				return tmuxOutput(pendingProjectWindowPrefix + "0123456789abcdef01234567\n")
 			}
 			return tmuxOutput(pendingName + "\n")
 		default:
@@ -720,7 +732,7 @@ func TestCreateProjectWindowContextRollsBackWinnerWhenDuplicateDoesNotConverge(t
 		t.Fatalf("CreateProjectWindowContext error = %v, want non-convergence error", err)
 	}
 	if !killedOwn {
-		t.Fatal("non-converging duplicate cleanup did not kill the committed winner")
+		t.Fatalf("non-converging duplicate cleanup did not kill the committed winner (if-shell=%v)", ifShellCalled)
 	}
 	if killedLoser {
 		t.Fatal("winner rollback killed another creator's marked window")
@@ -730,6 +742,45 @@ func TestCreateProjectWindowContextRollsBackWinnerWhenDuplicateDoesNotConverge(t
 	}
 	if createCalls != 2 {
 		t.Fatalf("new-window calls = %d, want one retry after rollback", createCalls)
+	}
+}
+
+func TestRollbackProjectWindowsSkipsChangedAttemptMarker(t *testing.T) {
+	oldExecCommandContext := execCommandContext
+	killed := false
+	tmuxOutput := func(output string) *exec.Cmd {
+		return exec.Command("sh", "-c", "printf '%s' \"$1\"", "sh", output)
+	}
+	execCommandContext = func(_ context.Context, _ string, args ...string) *exec.Cmd {
+		switch {
+		case args[0] == "list-windows" && args[len(args)-1] == windowListFormat:
+			return tmuxOutput("2\t@1\n")
+		case args[0] == "list-windows" && args[len(args)-1] == "#{window_id}":
+			return tmuxOutput("@1\n")
+		case args[0] == "display-message" && args[len(args)-1] == "#{window_name}":
+			return tmuxOutput("alpha-shell-1\n")
+		case args[0] == "display-message" && args[len(args)-1] == "#{pane_current_path}":
+			return tmuxOutput("/repo\n")
+		case args[0] == "display-message" && args[len(args)-1] == "#{pane_current_command}":
+			return tmuxOutput("bash\n")
+		case args[0] == "display-message" && args[len(args)-1] == projectWindowMarkerFormat:
+			return tmuxOutput("foreign-marker\n")
+		case args[0] == "kill-window":
+			killed = true
+			return exec.Command("sh", "-c", "true")
+		default:
+			return exec.Command("sh", "-c", "true")
+		}
+	}
+	t.Cleanup(func() { execCommandContext = oldExecCommandContext })
+
+	pendingName := pendingProjectWindowPrefix + "0123456789abcdef01234567"
+	err := rollbackProjectWindows(context.Background(), "ccx-t2", "@1", pendingName, "/repo", []WindowInfo{{ID: "@1", CreationMarker: pendingName}})
+	if err == nil {
+		t.Fatal("rollbackProjectWindows error = nil, want changed-marker failure")
+	}
+	if killed {
+		t.Fatal("rollbackProjectWindows killed a window after its attempt marker changed")
 	}
 }
 
@@ -753,6 +804,9 @@ func TestCreateProjectWindowContextCleansOwnedWindowWhenRenameFails(t *testing.T
 			return tmuxOutput("@9\n")
 		case args[0] == "rename-window":
 			return exec.Command("sh", "-c", "printf '%s' 'rename failed' >&2; exit 1")
+		case args[0] == "if-shell":
+			killedTarget = "@9"
+			return exec.Command("sh", "-c", "true")
 		case args[0] == "kill-window":
 			killedTarget = args[2]
 			return exec.Command("sh", "-c", "true")
@@ -772,6 +826,8 @@ func TestCreateProjectWindowContextCleansOwnedWindowWhenRenameFails(t *testing.T
 			return tmuxOutput("/repo\n")
 		case args[0] == "display-message" && args[len(args)-1] == "#{pane_current_command}":
 			return tmuxOutput("bash\n")
+		case args[0] == "display-message" && args[len(args)-1] == projectWindowMarkerFormat:
+			return tmuxOutput(pendingName + "\n")
 		default:
 			return exec.Command("sh", "-c", "true")
 		}
