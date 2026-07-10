@@ -173,6 +173,8 @@ func TestCreateProjectShellWindowContextChoosesDeterministicFreeName(t *testing.
 	var gotContexts []context.Context
 	var gotArgs [][]string
 	created := false
+	renamed := false
+	pendingName := ""
 	oldExecCommandContext := execCommandContext
 	execCommandContext = func(ctx context.Context, name string, args ...string) *exec.Cmd {
 		gotContexts = append(gotContexts, ctx)
@@ -198,6 +200,8 @@ func TestCreateProjectShellWindowContextChoosesDeterministicFreeName(t *testing.
 				output = "alpha-shell-1\n"
 			} else if strings.HasSuffix(args[2], "@1") {
 				output = "alpha-shell-3\n"
+			} else if strings.HasSuffix(args[2], "@2") && !renamed {
+				output = pendingName + "\n"
 			} else {
 				output = "alpha-shell-2\n"
 			}
@@ -207,7 +211,15 @@ func TestCreateProjectShellWindowContextChoosesDeterministicFreeName(t *testing.
 			output = "bash\n"
 		case args[0] == "new-window":
 			created = true
+			for i := 0; i+1 < len(args); i++ {
+				if args[i] == "-n" {
+					pendingName = args[i+1]
+				}
+			}
 			output = "@2\n"
+		case args[0] == "rename-window":
+			renamed = true
+			return exec.Command("sh", "-c", "true")
 		default:
 			return exec.Command("sh", "-c", "true")
 		}
@@ -215,14 +227,13 @@ func TestCreateProjectShellWindowContextChoosesDeterministicFreeName(t *testing.
 	}
 	t.Cleanup(func() { execCommandContext = oldExecCommandContext })
 
-	window, err := CreateProjectShellWindowContext(ctx, "ccx-t2", "alpha", "/repo with spaces/$HOME")
+	window, err := CreateProjectShellWindowContext(ctx, "ccx-t2", "alpha", "/repo with spaces")
 	if err != nil {
 		t.Fatalf("CreateProjectShellWindowContext: %v", err)
 	}
 	if window.Name != "alpha-shell-2" || window.CurrentPath != "/repo with spaces" {
 		t.Fatalf("window = %#v, want alpha-shell-2 with hydrated repository path", window)
 	}
-	wantCreateArgs := []string{"new-window", "-t", "ccx-t2:", "-n", "alpha-shell-2", "-c", "/repo with spaces/$HOME", "-P", "-F", "#{window_id}"}
 	var createArgs []string
 	for _, args := range gotArgs {
 		if len(args) > 0 && args[0] == "new-window" {
@@ -230,8 +241,21 @@ func TestCreateProjectShellWindowContextChoosesDeterministicFreeName(t *testing.
 			break
 		}
 	}
-	if !reflect.DeepEqual(createArgs, wantCreateArgs) {
-		t.Fatalf("create args = %#v, want %#v", createArgs, wantCreateArgs)
+	if len(createArgs) == 0 || createArgs[0] != "new-window" {
+		t.Fatalf("create args = %#v, want new-window", createArgs)
+	}
+	if pendingName == "" || !strings.HasPrefix(pendingName, pendingProjectWindowPrefix) {
+		t.Fatalf("pending name = %q, want unique pending prefix", pendingName)
+	}
+	var renameArgs []string
+	for _, args := range gotArgs {
+		if len(args) > 0 && args[0] == "rename-window" {
+			renameArgs = args
+			break
+		}
+	}
+	if !reflect.DeepEqual(renameArgs, []string{"rename-window", "-t", "@2", "alpha-shell-2"}) {
+		t.Fatalf("rename args = %#v, want rename to alpha-shell-2", renameArgs)
 	}
 	for i, gotCtx := range gotContexts {
 		if len(gotArgs[i]) >= 2 && gotArgs[i][0] == "wait-for" && gotArgs[i][1] == "-U" {
@@ -272,6 +296,8 @@ func installExternalDuplicateTmuxStub(t *testing.T, allowRetry bool) *int {
 	t.Helper()
 	oldExecCommandContext := execCommandContext
 	created := 0
+	pendingName := ""
+	renamed := false
 	tmuxOutput := func(output string) *exec.Cmd {
 		return exec.Command("sh", "-c", "printf '%s' \"$1\"", "sh", output)
 	}
@@ -285,6 +311,11 @@ func installExternalDuplicateTmuxStub(t *testing.T, allowRetry bool) *int {
 			return exec.Command("sh", "-c", "true")
 		case args[0] == "new-window":
 			created++
+			for i := 0; i+1 < len(args); i++ {
+				if args[i] == "-n" {
+					pendingName = args[i+1]
+				}
+			}
 			if created == 1 || !allowRetry {
 				output = "@1\n"
 			} else {
@@ -308,15 +339,22 @@ func installExternalDuplicateTmuxStub(t *testing.T, allowRetry bool) *int {
 				output = "@3\n"
 			}
 		case args[0] == "display-message" && args[len(args)-1] == "#{window_name}":
-			if strings.HasSuffix(args[2], "@3") {
-				output = "alpha-shell-2\n"
-			} else {
+			if strings.HasSuffix(args[2], "@2") {
 				output = "alpha-shell-1\n"
+			} else if strings.HasSuffix(args[2], "@3") && renamed {
+				output = "alpha-shell-2\n"
+			} else if strings.HasSuffix(args[2], "@1") || strings.HasSuffix(args[2], "@3") {
+				output = pendingName + "\n"
+			} else {
+				output = pendingName + "\n"
 			}
 		case args[0] == "display-message" && args[len(args)-1] == "#{pane_current_path}":
 			output = "/repo\n"
 		case args[0] == "display-message" && args[len(args)-1] == "#{pane_current_command}":
 			output = "bash\n"
+		case args[0] == "rename-window":
+			renamed = true
+			return exec.Command("sh", "-c", "true")
 		}
 		return tmuxOutput(output)
 	}
@@ -350,6 +388,8 @@ func TestCreateProjectWindowContextReconcilesCreatedWindowAfterClientError(t *te
 	oldExecCommandContext := execCommandContext
 	created := false
 	killed := false
+	renamed := false
+	pendingName := ""
 	tmuxOutput := func(output string) *exec.Cmd {
 		return exec.Command("sh", "-c", "printf '%s' \"$1\"", "sh", output)
 	}
@@ -357,6 +397,11 @@ func TestCreateProjectWindowContextReconcilesCreatedWindowAfterClientError(t *te
 		switch {
 		case args[0] == "new-window":
 			created = true
+			for i := 0; i+1 < len(args); i++ {
+				if args[i] == "-n" {
+					pendingName = args[i+1]
+				}
+			}
 			return exec.Command("sh", "-c", "printf '%s' 'client output lost' >&2; exit 1")
 		case args[0] == "kill-window":
 			killed = true
@@ -372,11 +417,17 @@ func TestCreateProjectWindowContextReconcilesCreatedWindowAfterClientError(t *te
 			}
 			return tmuxOutput("")
 		case args[0] == "display-message" && args[len(args)-1] == "#{window_name}":
-			return tmuxOutput("alpha-shell-1\n")
+			if renamed {
+				return tmuxOutput("alpha-shell-1\n")
+			}
+			return tmuxOutput(pendingName + "\n")
 		case args[0] == "display-message" && args[len(args)-1] == "#{pane_current_path}":
 			return tmuxOutput("/repo\n")
 		case args[0] == "display-message" && args[len(args)-1] == "#{pane_current_command}":
 			return tmuxOutput("bash\n")
+		case args[0] == "rename-window":
+			renamed = true
+			return exec.Command("sh", "-c", "true")
 		default:
 			return exec.Command("sh", "-c", "true")
 		}
@@ -391,6 +442,215 @@ func TestCreateProjectWindowContextReconcilesCreatedWindowAfterClientError(t *te
 	}
 	if killed {
 		t.Fatal("reconciliation killed a window without ownership evidence")
+	}
+}
+
+func TestCreateProjectWindowContextDoesNotClaimExternalWindowAfterCreateError(t *testing.T) {
+	oldExecCommandContext := execCommandContext
+	external := false
+	killed := false
+	tmuxOutput := func(output string) *exec.Cmd {
+		return exec.Command("sh", "-c", "printf '%s' \"$1\"", "sh", output)
+	}
+	execCommandContext = func(_ context.Context, _ string, args ...string) *exec.Cmd {
+		switch {
+		case args[0] == "new-window":
+			external = true
+			return exec.Command("sh", "-c", "printf '%s' 'client failed before create' >&2; exit 1")
+		case args[0] == "kill-window":
+			killed = true
+			return exec.Command("sh", "-c", "true")
+		case args[0] == "list-windows" && args[len(args)-1] == windowListFormat:
+			if external {
+				return tmuxOutput("2\t@8\n")
+			}
+			return tmuxOutput("")
+		case args[0] == "list-windows" && args[len(args)-1] == "#{window_id}":
+			if external {
+				return tmuxOutput("@8\n")
+			}
+			return tmuxOutput("")
+		case args[0] == "display-message" && args[len(args)-1] == "#{window_name}":
+			return tmuxOutput("alpha-shell-1\n")
+		case args[0] == "display-message" && args[len(args)-1] == "#{pane_current_path}":
+			return tmuxOutput("/repo\n")
+		case args[0] == "display-message" && args[len(args)-1] == "#{pane_current_command}":
+			return tmuxOutput("bash\n")
+		default:
+			return exec.Command("sh", "-c", "true")
+		}
+	}
+	t.Cleanup(func() { execCommandContext = oldExecCommandContext })
+
+	err := CreateProjectWindowContext(context.Background(), "ccx-t2", "alpha", "alpha-shell-1", "/repo")
+	if err == nil {
+		t.Fatal("CreateProjectWindowContext error = nil, want original create error")
+	}
+	if killed {
+		t.Fatal("external same-name window was incorrectly killed")
+	}
+}
+
+func TestCreateProjectWindowContextCleansOnlyOwnedWindowOnRenameDuplicate(t *testing.T) {
+	oldExecCommandContext := execCommandContext
+	created := false
+	pendingName := ""
+	killedTarget := ""
+	tmuxOutput := func(output string) *exec.Cmd {
+		return exec.Command("sh", "-c", "printf '%s' \"$1\"", "sh", output)
+	}
+	execCommandContext = func(_ context.Context, _ string, args ...string) *exec.Cmd {
+		switch {
+		case args[0] == "new-window":
+			created = true
+			for i := 0; i+1 < len(args); i++ {
+				if args[i] == "-n" {
+					pendingName = args[i+1]
+				}
+			}
+			return tmuxOutput("@9\n")
+		case args[0] == "kill-window":
+			killedTarget = args[2]
+			return exec.Command("sh", "-c", "true")
+		case args[0] == "list-windows" && args[len(args)-1] == windowListFormat:
+			if created {
+				return tmuxOutput("2\t@8\n3\t@9\n")
+			}
+			return tmuxOutput("")
+		case args[0] == "list-windows" && args[len(args)-1] == "#{window_id}":
+			if created {
+				return tmuxOutput("@8\n@9\n")
+			}
+			return tmuxOutput("")
+		case args[0] == "display-message" && args[len(args)-1] == "#{window_name}":
+			if strings.HasSuffix(args[2], "@9") {
+				return tmuxOutput(pendingName + "\n")
+			}
+			return tmuxOutput("alpha-shell-1\n")
+		case args[0] == "display-message" && args[len(args)-1] == "#{pane_current_path}":
+			return tmuxOutput("/repo\n")
+		case args[0] == "display-message" && args[len(args)-1] == "#{pane_current_command}":
+			return tmuxOutput("bash\n")
+		default:
+			return exec.Command("sh", "-c", "true")
+		}
+	}
+	t.Cleanup(func() { execCommandContext = oldExecCommandContext })
+
+	err := CreateProjectWindowContext(context.Background(), "ccx-t2", "alpha", "alpha-shell-1", "/repo")
+	if !errors.Is(err, ErrWindowNameTaken) {
+		t.Fatalf("CreateProjectWindowContext error = %v, want ErrWindowNameTaken", err)
+	}
+	if killedTarget != "@9" {
+		t.Fatalf("killed window = %q, want owned @9", killedTarget)
+	}
+}
+
+func TestCreateProjectWindowContextCleansOwnedWindowWhenRenameFails(t *testing.T) {
+	oldExecCommandContext := execCommandContext
+	created := false
+	pendingName := ""
+	killedTarget := ""
+	tmuxOutput := func(output string) *exec.Cmd {
+		return exec.Command("sh", "-c", "printf '%s' \"$1\"", "sh", output)
+	}
+	execCommandContext = func(_ context.Context, _ string, args ...string) *exec.Cmd {
+		switch {
+		case args[0] == "new-window":
+			created = true
+			for i := 0; i+1 < len(args); i++ {
+				if args[i] == "-n" {
+					pendingName = args[i+1]
+				}
+			}
+			return tmuxOutput("@9\n")
+		case args[0] == "rename-window":
+			return exec.Command("sh", "-c", "printf '%s' 'rename failed' >&2; exit 1")
+		case args[0] == "kill-window":
+			killedTarget = args[2]
+			return exec.Command("sh", "-c", "true")
+		case args[0] == "list-windows" && args[len(args)-1] == windowListFormat:
+			if created {
+				return tmuxOutput("2\t@9\n")
+			}
+			return tmuxOutput("")
+		case args[0] == "list-windows" && args[len(args)-1] == "#{window_id}":
+			if created {
+				return tmuxOutput("@9\n")
+			}
+			return tmuxOutput("")
+		case args[0] == "display-message" && args[len(args)-1] == "#{window_name}":
+			return tmuxOutput(pendingName + "\n")
+		case args[0] == "display-message" && args[len(args)-1] == "#{pane_current_path}":
+			return tmuxOutput("/repo\n")
+		case args[0] == "display-message" && args[len(args)-1] == "#{pane_current_command}":
+			return tmuxOutput("bash\n")
+		default:
+			return exec.Command("sh", "-c", "true")
+		}
+	}
+	t.Cleanup(func() { execCommandContext = oldExecCommandContext })
+
+	err := CreateProjectWindowContext(context.Background(), "ccx-t2", "alpha", "alpha-shell-1", "/repo")
+	if err == nil {
+		t.Fatal("CreateProjectWindowContext error = nil, want rename failure")
+	}
+	if killedTarget != "@9" {
+		t.Fatalf("killed window = %q, want owned @9", killedTarget)
+	}
+}
+
+func TestCreateProjectWindowContextCleansOwnedWindowOnCancellationBeforeRename(t *testing.T) {
+	oldExecCommandContext := execCommandContext
+	created := false
+	pendingName := ""
+	killedTarget := ""
+	ctx, cancel := context.WithCancel(context.Background())
+	tmuxOutput := func(output string) *exec.Cmd {
+		return exec.Command("sh", "-c", "printf '%s' \"$1\"", "sh", output)
+	}
+	execCommandContext = func(_ context.Context, _ string, args ...string) *exec.Cmd {
+		switch {
+		case args[0] == "new-window":
+			created = true
+			for i := 0; i+1 < len(args); i++ {
+				if args[i] == "-n" {
+					pendingName = args[i+1]
+				}
+			}
+			cancel()
+			return tmuxOutput("@9\n")
+		case args[0] == "kill-window":
+			killedTarget = args[2]
+			return exec.Command("sh", "-c", "true")
+		case args[0] == "list-windows" && args[len(args)-1] == windowListFormat:
+			if created {
+				return tmuxOutput("2\t@9\n")
+			}
+			return tmuxOutput("")
+		case args[0] == "list-windows" && args[len(args)-1] == "#{window_id}":
+			if created {
+				return tmuxOutput("@9\n")
+			}
+			return tmuxOutput("")
+		case args[0] == "display-message" && args[len(args)-1] == "#{window_name}":
+			return tmuxOutput(pendingName + "\n")
+		case args[0] == "display-message" && args[len(args)-1] == "#{pane_current_path}":
+			return tmuxOutput("/repo\n")
+		case args[0] == "display-message" && args[len(args)-1] == "#{pane_current_command}":
+			return tmuxOutput("bash\n")
+		default:
+			return exec.Command("sh", "-c", "true")
+		}
+	}
+	t.Cleanup(func() { execCommandContext = oldExecCommandContext })
+
+	err := CreateProjectWindowContext(ctx, "ccx-t2", "alpha", "alpha-shell-1", "/repo")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("CreateProjectWindowContext error = %v, want context.Canceled", err)
+	}
+	if killedTarget != "@9" {
+		t.Fatalf("killed window = %q, want owned @9", killedTarget)
 	}
 }
 
