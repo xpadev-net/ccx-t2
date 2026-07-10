@@ -3,6 +3,7 @@ package tmux
 import (
 	"context"
 	"errors"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
@@ -342,6 +343,69 @@ func TestCreateProjectWindowContextRejectsExternalDuplicate(t *testing.T) {
 	err := CreateProjectWindowContext(context.Background(), "ccx-t2", "alpha", "alpha-shell-1", "/repo")
 	if !errors.Is(err, ErrWindowNameTaken) {
 		t.Fatalf("CreateProjectWindowContext error = %v, want ErrWindowNameTaken", err)
+	}
+}
+
+func TestCreateProjectWindowContextReconcilesCreatedWindowAfterClientError(t *testing.T) {
+	oldExecCommandContext := execCommandContext
+	created := false
+	killed := false
+	tmuxOutput := func(output string) *exec.Cmd {
+		return exec.Command("sh", "-c", "printf '%s' \"$1\"", "sh", output)
+	}
+	execCommandContext = func(_ context.Context, _ string, args ...string) *exec.Cmd {
+		switch {
+		case args[0] == "new-window":
+			created = true
+			return exec.Command("sh", "-c", "printf '%s' 'client output lost' >&2; exit 1")
+		case args[0] == "kill-window":
+			killed = true
+			return exec.Command("sh", "-c", "true")
+		case args[0] == "list-windows" && args[len(args)-1] == windowListFormat:
+			if created {
+				return tmuxOutput("2\t@9\n")
+			}
+			return tmuxOutput("")
+		case args[0] == "list-windows" && args[len(args)-1] == "#{window_id}":
+			if created {
+				return tmuxOutput("@9\n")
+			}
+			return tmuxOutput("")
+		case args[0] == "display-message" && args[len(args)-1] == "#{window_name}":
+			return tmuxOutput("alpha-shell-1\n")
+		case args[0] == "display-message" && args[len(args)-1] == "#{pane_current_path}":
+			return tmuxOutput("/repo\n")
+		case args[0] == "display-message" && args[len(args)-1] == "#{pane_current_command}":
+			return tmuxOutput("bash\n")
+		default:
+			return exec.Command("sh", "-c", "true")
+		}
+	}
+	t.Cleanup(func() { execCommandContext = oldExecCommandContext })
+
+	if err := CreateProjectWindowContext(context.Background(), "ccx-t2", "alpha", "alpha-shell-1", "/repo"); err != nil {
+		t.Fatalf("CreateProjectWindowContext: %v", err)
+	}
+	if !created {
+		t.Fatal("new-window was not attempted")
+	}
+	if killed {
+		t.Fatal("reconciliation killed a window without ownership evidence")
+	}
+}
+
+func TestPathsMatchResolvesRepositorySymlinks(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "repo")
+	if err := os.Mkdir(target, 0o755); err != nil {
+		t.Fatalf("create target: %v", err)
+	}
+	link := filepath.Join(root, "link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("create symlink: %v", err)
+	}
+	if !pathsMatch(target, link) {
+		t.Fatalf("pathsMatch(%q, %q) = false, want true", target, link)
 	}
 }
 

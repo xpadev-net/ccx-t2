@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -244,7 +245,7 @@ func CreateProjectShellWindowContext(ctx context.Context, session, projectSlug, 
 		if _, exists := used[name]; exists {
 			continue
 		}
-		created, err := createProjectWindowContext(ctx, session, name, repoPath)
+		created, err := createProjectWindowContext(ctx, session, name, repoPath, windows)
 		if errors.Is(err, ErrWindowNameTaken) {
 			used[name] = struct{}{}
 			continue
@@ -281,7 +282,7 @@ func CreateProjectWindowContext(ctx context.Context, session, projectSlug, windo
 	if _, exists := windowNameSet(windows)[windowName]; exists {
 		return fmt.Errorf("%w: %s", ErrWindowNameTaken, windowName)
 	}
-	if _, err := createProjectWindowContext(ctx, session, windowName, repoPath); err != nil {
+	if _, err := createProjectWindowContext(ctx, session, windowName, repoPath, windows); err != nil {
 		if isMissingSessionError(err) {
 			return fmt.Errorf("%w: %s", ErrSessionNotFound, session)
 		}
@@ -290,13 +291,19 @@ func CreateProjectWindowContext(ctx context.Context, session, projectSlug, windo
 	return nil
 }
 
-func createProjectWindowContext(ctx context.Context, session, windowName, repoPath string) (WindowInfo, error) {
+func createProjectWindowContext(ctx context.Context, session, windowName, repoPath string, before []WindowInfo) (WindowInfo, error) {
 	out, err := outputCtx(ctx, "tmux", "new-window", "-t", sessionTarget(session), "-n", windowName, "-c", repoPath, "-P", "-F", "#{window_id}")
 	if err != nil {
+		if reconciled, ok := reconcileProjectWindowContext(ctx, session, windowName, repoPath, before); ok {
+			return reconciled, nil
+		}
 		return WindowInfo{}, err
 	}
 	windowID := strings.TrimSpace(out)
 	if windowID == "" {
+		if reconciled, ok := reconcileProjectWindowContext(ctx, session, windowName, repoPath, before); ok {
+			return reconciled, nil
+		}
 		return WindowInfo{}, fmt.Errorf("tmux new-window returned no window id for %q", windowName)
 	}
 	windows, err := ListWindowsContext(ctx, session)
@@ -319,6 +326,51 @@ func createProjectWindowContext(ctx context.Context, session, windowName, repoPa
 		return WindowInfo{}, fmt.Errorf("created tmux window %q could not be verified", windowName)
 	}
 	return matches[0], nil
+}
+
+func reconcileProjectWindowContext(ctx context.Context, session, windowName, repoPath string, before []WindowInfo) (WindowInfo, bool) {
+	reconcileCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), projectWindowReconcileTimeout)
+	defer cancel()
+	windows, err := ListWindowsContext(reconcileCtx, session)
+	if err != nil {
+		return WindowInfo{}, false
+	}
+	knownIDs := windowNameSetByID(before)
+	matches := make([]WindowInfo, 0, 1)
+	for _, window := range windows {
+		if _, known := knownIDs[window.ID]; window.Name != windowName || known || !pathsMatch(window.CurrentPath, repoPath) {
+			continue
+		}
+		matches = append(matches, window)
+	}
+	if len(matches) != 1 {
+		return WindowInfo{}, false
+	}
+	return matches[0], true
+}
+
+func windowNameSetByID(windows []WindowInfo) map[string]struct{} {
+	known := make(map[string]struct{}, len(windows))
+	for _, window := range windows {
+		known[window.ID] = struct{}{}
+	}
+	return known
+}
+
+func pathsMatch(left, right string) bool {
+	return canonicalPath(left) == canonicalPath(right)
+}
+
+func canonicalPath(path string) string {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return filepath.Clean(path)
+	}
+	resolved, err := filepath.EvalSymlinks(absolute)
+	if err == nil {
+		return filepath.Clean(resolved)
+	}
+	return filepath.Clean(absolute)
 }
 
 func cleanupCreatedWindow(windowID string) {
@@ -367,6 +419,7 @@ var projectShellCreationLocks = struct {
 }{locks: make(map[string]chan struct{})}
 
 const maxProjectShellCreationAttempts = 1024
+const projectWindowReconcileTimeout = 5 * time.Second
 
 func acquireProjectShellCreation(ctx context.Context, session, projectSlug string) (func(), error) {
 	key := session + "\x00" + projectSlug
