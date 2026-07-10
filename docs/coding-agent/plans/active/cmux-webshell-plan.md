@@ -40,10 +40,10 @@
 ## Task Ledger
 
 ### Task_1: tmux project-window primitives
-- status: unstarted
+- status: in_progress
 - type: impl
 - branch: `codex/webshell-tmux-primitives`
-- thread: pending
+- thread: `019f4d7d-a6b6-7642-8607-3ca97d2cb2c1`
 - owns:
   - `server/internal/tmux/tmux.go`
   - `server/internal/tmux/tmux_test.go`
@@ -77,10 +77,10 @@
     detail: `$deep-review`, independent subagent review, and `gh-review-hook` exit 0 before merge-ready report.
 
 ### Task_2: reliable terminal WebSocket transport
-- status: unstarted
+- status: in_progress
 - type: impl
 - branch: `codex/webshell-ws-stability`
-- thread: pending
+- thread: `019f4d7d-a6b5-71f1-acda-e0e404f28bfb`
 - owns:
   - `server/internal/web/ws.go`
   - `server/internal/web/ws_test.go`
@@ -311,6 +311,7 @@
 - 2026-07-11: Initial four-task draft created.
 - 2026-07-11: User approved execution and requested finer decomposition plus task-pr-orchestrator, separate threads, `luna high`.
 - 2026-07-11: Expanded to seven tasks with file ownership, dependencies, acceptance, validation, PR gates, and E2E spec. Wave 1 pending delegation.
+- 2026-07-11: Wave 1 delegated in separate worktrees using `gpt-5.6-luna` / `high`. Task_1 startup system error received one required resume; Task_2 passed startup stability check.
 
 ## Decision Log
 - 2026-07-11: WebShell is the product UI; harness/task concepts remain backend-compatible but are removed from primary navigation.
