@@ -47,6 +47,7 @@ type WindowInfo struct {
 	Name           string `json:"name"`
 	CurrentPath    string `json:"current_path"`
 	CurrentCommand string `json:"current_command"`
+	CreationMarker string `json:"creation_marker,omitempty"`
 }
 
 // Window is kept as a concise alias for callers that use tmux window terminology.
@@ -148,6 +149,7 @@ func ListWindowsContext(ctx context.Context, session string) ([]WindowInfo, erro
 			{name: "name", dest: &window.Name, format: "#{window_name}"},
 			{name: "current path", dest: &window.CurrentPath, format: "#{pane_current_path}"},
 			{name: "current command", dest: &window.CurrentCommand, format: "#{pane_current_command}"},
+			{name: "creation marker", dest: &window.CreationMarker, format: projectWindowMarkerFormat},
 		}
 		skipWindow := false
 		for _, field := range fields {
@@ -325,7 +327,15 @@ func createProjectWindowContext(ctx context.Context, session, windowName, repoPa
 		}
 		windowID = verified.ID
 	}
+	if err := markProjectWindowContext(ctx, windowID, pendingName); err != nil {
+		cleanupCreatedWindow(windowID)
+		return WindowInfo{}, err
+	}
 	return renameProjectWindowContext(ctx, session, windowID, pendingName, windowName, repoPath, before)
+}
+
+func markProjectWindowContext(ctx context.Context, windowID, marker string) error {
+	return runCtx(ctx, "tmux", "set-option", "-w", "-t", windowID, projectWindowMarkerOption, marker)
 }
 
 func newPendingWindowName() (string, error) {
@@ -387,7 +397,7 @@ func renameProjectWindowContext(ctx context.Context, session, windowID, pendingN
 	}
 	renameErr := runCtx(ctx, "tmux", "rename-window", "-t", windowID, windowName)
 	if renameErr != nil {
-		if reconciled, ok, reconcileErr := reconcileRenamedWindowContext(ctx, session, windowID, windowName, repoPath, before); ok {
+		if reconciled, ok, reconcileErr := reconcileRenamedWindowContext(ctx, session, windowID, windowName, pendingName, repoPath, before); ok {
 			return reconciled, nil
 		} else if reconcileErr != nil && errors.Is(reconcileErr, errProjectWindowNameUnresolved) {
 			return WindowInfo{}, reconcileErr
@@ -395,7 +405,7 @@ func renameProjectWindowContext(ctx context.Context, session, windowID, pendingN
 		cleanupCreatedWindow(windowID)
 		return WindowInfo{}, renameErr
 	}
-	verified, verifyErr := verifyRenamedWindowContext(ctx, session, windowID, windowName, repoPath, before)
+	verified, verifyErr := verifyRenamedWindowContext(ctx, session, windowID, windowName, pendingName, repoPath, before)
 	if verifyErr != nil {
 		if !errors.Is(verifyErr, errProjectWindowNameUnresolved) {
 			cleanupCreatedWindow(windowID)
@@ -409,15 +419,15 @@ func renameProjectWindowContext(ctx context.Context, session, windowID, pendingN
 	return verified, nil
 }
 
-func reconcileRenamedWindowContext(ctx context.Context, session, windowID, windowName, repoPath string, before []WindowInfo) (WindowInfo, bool, error) {
-	verified, err := verifyRenamedWindowContext(ctx, session, windowID, windowName, repoPath, before)
+func reconcileRenamedWindowContext(ctx context.Context, session, windowID, windowName, attemptMarker, repoPath string, before []WindowInfo) (WindowInfo, bool, error) {
+	verified, err := verifyRenamedWindowContext(ctx, session, windowID, windowName, attemptMarker, repoPath, before)
 	if err != nil {
 		return WindowInfo{}, false, err
 	}
 	return verified, true, nil
 }
 
-func verifyRenamedWindowContext(ctx context.Context, session, windowID, windowName, repoPath string, before []WindowInfo) (WindowInfo, error) {
+func verifyRenamedWindowContext(ctx context.Context, session, windowID, windowName, attemptMarker, repoPath string, before []WindowInfo) (WindowInfo, error) {
 	windows, err := listWindowsForRecovery(ctx, session)
 	if err != nil {
 		return WindowInfo{}, err
@@ -445,11 +455,17 @@ func verifyRenamedWindowContext(ctx context.Context, session, windowID, windowNa
 			cleanupCreatedWindow(windowID)
 			return WindowInfo{}, fmt.Errorf("%w: %s", ErrWindowNameTaken, windowName)
 		}
-		// The caller won the deterministic race, but a losing creator may not
-		// have finished its cleanup yet. Do not report success while the name
-		// still resolves to multiple windows; name-targeted operations would
-		// otherwise remain ambiguous.
-		return waitForSoleRenamedWindow(ctx, session, windowID, windowName, repoPath)
+		for _, duplicate := range requested[1:] {
+			if !isProjectCreationMarker(duplicate.CreationMarker) {
+				cleanupCreatedWindow(windowID)
+				return WindowInfo{}, fmt.Errorf("%w: %s", ErrWindowNameTaken, windowName)
+			}
+		}
+		if own.CreationMarker != attemptMarker {
+			cleanupCreatedWindow(windowID)
+			return WindowInfo{}, fmt.Errorf("created tmux window %q lost its ownership marker", windowName)
+		}
+		return waitForSoleRenamedWindow(ctx, session, windowID, windowName, attemptMarker, repoPath)
 	}
 	if own.ID != windowID || own.Name != windowName || !pathsMatch(own.CurrentPath, repoPath) {
 		return WindowInfo{}, fmt.Errorf("created tmux window %q could not be verified after rename", windowName)
@@ -457,32 +473,107 @@ func verifyRenamedWindowContext(ctx context.Context, session, windowID, windowNa
 	return own, nil
 }
 
-func waitForSoleRenamedWindow(ctx context.Context, session, windowID, windowName, repoPath string) (WindowInfo, error) {
+func waitForSoleRenamedWindow(ctx context.Context, session, windowID, windowName, attemptMarker, repoPath string) (WindowInfo, error) {
 	reconcileCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), projectWindowReconcileTimeout)
 	defer cancel()
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
+	var requested []WindowInfo
 	for {
 		windows, err := ListWindowsContext(reconcileCtx, session)
 		if err != nil {
 			if reconcileCtx.Err() != nil {
-				return WindowInfo{}, fmt.Errorf("%w: created tmux window %q did not converge to a unique name: %w", errProjectWindowNameUnresolved, windowName, reconcileCtx.Err())
+				return WindowInfo{}, resolutionRollbackError(reconcileCtx, session, windowID, attemptMarker, repoPath, requested, windowName, reconcileCtx.Err())
 			}
-			return WindowInfo{}, err
+			return WindowInfo{}, resolutionRollbackError(reconcileCtx, session, windowID, attemptMarker, repoPath, requested, windowName, err)
 		}
-		requested := make([]WindowInfo, 0, 1)
+		requested = requested[:0]
 		for _, window := range windows {
 			if window.Name == windowName {
 				requested = append(requested, window)
 			}
 		}
-		if len(requested) == 1 && requested[0].ID == windowID && pathsMatch(requested[0].CurrentPath, repoPath) {
+		if len(requested) == 1 && requested[0].ID == windowID && requested[0].CreationMarker == attemptMarker && pathsMatch(requested[0].CurrentPath, repoPath) {
 			return requested[0], nil
+		}
+		for _, duplicate := range requested {
+			if duplicate.ID != windowID && isProjectCreationMarker(duplicate.CreationMarker) {
+				_ = cleanupCreatedWindowContext(reconcileCtx, duplicate.ID)
+			}
 		}
 		select {
 		case <-reconcileCtx.Done():
-			return WindowInfo{}, fmt.Errorf("%w: created tmux window %q did not converge to a unique name: %w", errProjectWindowNameUnresolved, windowName, reconcileCtx.Err())
+			return WindowInfo{}, resolutionRollbackError(reconcileCtx, session, windowID, attemptMarker, repoPath, requested, windowName, reconcileCtx.Err())
 		case <-ticker.C:
+		}
+	}
+}
+
+func resolutionRollbackError(ctx context.Context, session, windowID, pendingName, repoPath string, requested []WindowInfo, windowName string, cause error) error {
+	if rollbackErr := rollbackProjectWindows(ctx, session, windowID, requested); rollbackErr == nil {
+		return fmt.Errorf("%w: created tmux window %q did not converge: %w", errProjectWindowNameUnresolved, windowName, cause)
+	} else if restoreErr := restorePendingWindowContext(ctx, session, windowID, pendingName, repoPath); restoreErr == nil {
+		return fmt.Errorf("%w: created tmux window %q did not converge; owned window was restored to its unique pending identity: %v", errProjectWindowNameUnresolved, windowName, rollbackErr)
+	} else {
+		return fmt.Errorf("%w: created tmux window %q did not converge and cleanup failed: %v; pending restore failed: %v", errProjectWindowNameUnresolved, windowName, rollbackErr, restoreErr)
+	}
+}
+
+func restorePendingWindowContext(ctx context.Context, session, windowID, pendingName, repoPath string) error {
+	recoveryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), projectWindowReconcileTimeout)
+	defer cancel()
+	if err := runCtx(recoveryCtx, "tmux", "rename-window", "-t", windowID, pendingName); err != nil {
+		present, presentErr := windowInSessionContext(recoveryCtx, session, windowID)
+		if presentErr == nil && !present {
+			return nil
+		}
+		return err
+	}
+	windows, err := ListWindowsContext(recoveryCtx, session)
+	if err != nil {
+		return err
+	}
+	for _, window := range windows {
+		if window.ID == windowID && window.Name == pendingName && window.CreationMarker == pendingName && pathsMatch(window.CurrentPath, repoPath) {
+			return nil
+		}
+	}
+	return fmt.Errorf("pending window %q could not be verified after rollback", pendingName)
+}
+
+func rollbackProjectWindows(ctx context.Context, session, windowID string, windows []WindowInfo) error {
+	rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), projectWindowReconcileTimeout)
+	defer cancel()
+	ids := map[string]struct{}{windowID: {}}
+	for _, window := range windows {
+		if isProjectCreationMarker(window.CreationMarker) {
+			ids[window.ID] = struct{}{}
+		}
+	}
+	for {
+		for id := range ids {
+			_ = cleanupCreatedWindowContext(rollbackCtx, id)
+		}
+		allGone := true
+		for id := range ids {
+			present, err := windowInSessionContext(rollbackCtx, session, id)
+			if err != nil {
+				if rollbackCtx.Err() != nil {
+					return rollbackCtx.Err()
+				}
+				return err
+			}
+			if present {
+				allGone = false
+			}
+		}
+		if allGone {
+			return nil
+		}
+		select {
+		case <-rollbackCtx.Done():
+			return rollbackCtx.Err()
+		case <-time.After(10 * time.Millisecond):
 		}
 	}
 }
@@ -520,10 +611,14 @@ func canonicalPath(path string) string {
 	return filepath.Clean(absolute)
 }
 
-func cleanupCreatedWindow(windowID string) {
+func cleanupCreatedWindow(windowID string) error {
 	cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_ = runCtx(cleanupCtx, "tmux", "kill-window", "-t", windowID)
+	return cleanupCreatedWindowContext(cleanupCtx, windowID)
+}
+
+func cleanupCreatedWindowContext(ctx context.Context, windowID string) error {
+	return runCtx(ctx, "tmux", "kill-window", "-t", windowID)
 }
 
 // ValidateProjectShellWindowName rejects malformed, foreign, or non-shell
@@ -567,8 +662,14 @@ var projectShellCreationLocks = struct {
 
 const maxProjectShellCreationAttempts = 1024
 const pendingProjectWindowPrefix = "ccx-shell-pending-"
+const projectWindowMarkerOption = "@ccx-project-window-attempt"
+const projectWindowMarkerFormat = "#{@ccx-project-window-attempt}"
 
 var projectWindowReconcileTimeout = 5 * time.Second
+
+func isProjectCreationMarker(marker string) bool {
+	return strings.HasPrefix(marker, pendingProjectWindowPrefix)
+}
 
 func acquireProjectShellCreation(ctx context.Context, session, projectSlug string) (func(), error) {
 	key := session + "\x00" + projectSlug
