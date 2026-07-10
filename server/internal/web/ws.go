@@ -729,14 +729,6 @@ func discardWSReads(ctx context.Context, conn *websocket.Conn, cancel context.Ca
 	}
 }
 
-func (s *Server) subscribeTmuxStream(session, window string) (<-chan []byte, func(), error) {
-	subscription, cleanup, err := s.subscribeTmuxStreamWithStatus(session, window)
-	if err != nil {
-		return nil, nil, err
-	}
-	return subscription.chunks, cleanup, nil
-}
-
 func (s *Server) subscribeTmuxStreamWithStatus(session, window string) (*tmuxStreamSubscription, func(), error) {
 	if s.tmuxStreams == nil {
 		chunks, cleanup, err := s.pipeBytes(session, window)
@@ -746,14 +738,6 @@ func (s *Server) subscribeTmuxStreamWithStatus(session, window string) (*tmuxStr
 		return &tmuxStreamSubscription{chunks: chunks}, cleanup, nil
 	}
 	return s.tmuxStreams.subscribeWithStatus(session+"\x00"+window, session, window, s.pipeBytes)
-}
-
-func (r *tmuxStreamRegistry) subscribe(key, session, window string, pipe PipeBytesFunc) (<-chan []byte, func(), error) {
-	subscription, cleanup, err := r.subscribeWithStatus(key, session, window, pipe)
-	if err != nil {
-		return nil, nil, err
-	}
-	return subscription.chunks, cleanup, nil
 }
 
 func (r *tmuxStreamRegistry) subscribeWithStatus(key, session, window string, pipe PipeBytesFunc) (*tmuxStreamSubscription, func(), error) {
