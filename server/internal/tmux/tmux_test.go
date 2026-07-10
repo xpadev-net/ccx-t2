@@ -22,18 +22,16 @@ func TestListWindowsContextParsesMetadataWithTabs(t *testing.T) {
 		gotCtx = ctx
 		gotArgs = append(gotArgs, append([]string(nil), args...))
 		var output string
-		switch len(gotArgs) {
-		case 1:
+		switch {
+		case args[0] == "list-windows" && args[len(args)-1] == windowListFormat:
 			output = "0\t@0\n"
-		case 2:
-			output = "@0\n"
-		case 3:
+		case args[0] == "display-message" && args[len(args)-1] == "#{window_name}":
 			output = "alpha shell\t1\n"
-		case 4:
+		case args[0] == "display-message" && args[len(args)-1] == "#{pane_current_path}":
 			output = "/Users/me/My Repo\t(a|b)\n"
-		case 5:
+		case args[0] == "display-message" && args[len(args)-1] == "#{pane_current_command}":
 			output = "zsh\n"
-		case 6:
+		case args[0] == "list-windows" && args[len(args)-1] == "#{window_id}":
 			output = "@0\n"
 		}
 		return exec.Command("sh", "-c", "printf '%s' \"$1\"", "sh", output)
@@ -130,6 +128,27 @@ func TestListWindowsContextClassifiesSessionLossDuringMetadataRead(t *testing.T)
 	}
 }
 
+func TestListWindowsContextSkipsWindowThatDisappearsDuringHydration(t *testing.T) {
+	oldExecCommandContext := execCommandContext
+	call := 0
+	execCommandContext = func(context.Context, string, ...string) *exec.Cmd {
+		call++
+		if call == 1 {
+			return exec.Command("sh", "-c", "printf '%s' '0\t@0\n'")
+		}
+		return exec.Command("sh", "-c", "printf '%s' \"can't find window: @0\" >&2; exit 1")
+	}
+	t.Cleanup(func() { execCommandContext = oldExecCommandContext })
+
+	windows, err := ListWindowsContext(context.Background(), "ccx-t2")
+	if err != nil {
+		t.Fatalf("ListWindowsContext: %v", err)
+	}
+	if windows == nil || len(windows) != 0 {
+		t.Fatalf("windows = %#v, want empty result after window churn", windows)
+	}
+}
+
 func TestValidateProjectShellWindowNames(t *testing.T) {
 	valid := []string{"alpha-shell-1", "alpha-shell-99"}
 	for _, name := range valid {
@@ -152,34 +171,42 @@ func TestCreateProjectShellWindowContextChoosesDeterministicFreeName(t *testing.
 	ctx := context.WithValue(context.Background(), tmuxTestContextKey{}, "marker")
 	var gotContexts []context.Context
 	var gotArgs [][]string
+	created := false
 	oldExecCommandContext := execCommandContext
 	execCommandContext = func(ctx context.Context, name string, args ...string) *exec.Cmd {
 		gotContexts = append(gotContexts, ctx)
 		gotArgs = append(gotArgs, append([]string(nil), args...))
 		var output string
-		switch len(gotArgs) {
-		case 1:
-			output = "0\t@0\n1\t@1\n"
-		case 2:
-			output = "@0\n"
-		case 3:
-			output = "alpha-shell-1\n"
-		case 4:
+		switch {
+		case args[0] == "wait-for":
+			return exec.Command("sh", "-c", "true")
+		case args[0] == "list-windows" && args[len(args)-1] == windowListFormat:
+			if created {
+				output = "2\t@2\n"
+			} else {
+				output = "0\t@0\n1\t@1\n"
+			}
+		case args[0] == "list-windows" && args[len(args)-1] == "#{window_id}":
+			if created {
+				output = "@2\n"
+			} else {
+				output = "@0\n@1\n"
+			}
+		case args[0] == "display-message" && args[len(args)-1] == "#{window_name}":
+			if strings.HasSuffix(args[2], "@0") {
+				output = "alpha-shell-1\n"
+			} else if strings.HasSuffix(args[2], "@1") {
+				output = "alpha-shell-3\n"
+			} else {
+				output = "alpha-shell-2\n"
+			}
+		case args[0] == "display-message" && args[len(args)-1] == "#{pane_current_path}":
 			output = "/repo with spaces\n"
-		case 5:
+		case args[0] == "display-message" && args[len(args)-1] == "#{pane_current_command}":
 			output = "bash\n"
-		case 6:
-			output = "@0\n"
-		case 7:
-			output = "@1\n"
-		case 8:
-			output = "alpha-shell-3\n"
-		case 9:
-			output = "/repo with spaces\n"
-		case 10:
-			output = "zsh\n"
-		case 11:
-			output = "@1\n"
+		case args[0] == "new-window":
+			created = true
+			output = "@2\n"
 		default:
 			return exec.Command("sh", "-c", "true")
 		}
@@ -191,17 +218,130 @@ func TestCreateProjectShellWindowContextChoosesDeterministicFreeName(t *testing.
 	if err != nil {
 		t.Fatalf("CreateProjectShellWindowContext: %v", err)
 	}
-	if window.Name != "alpha-shell-2" || window.CurrentPath != "/repo with spaces/$HOME" {
-		t.Fatalf("window = %#v, want alpha-shell-2 with exact repository path", window)
+	if window.Name != "alpha-shell-2" || window.CurrentPath != "/repo with spaces" {
+		t.Fatalf("window = %#v, want alpha-shell-2 with hydrated repository path", window)
 	}
-	wantCreateArgs := []string{"new-window", "-t", "ccx-t2:", "-n", "alpha-shell-2", "-c", "/repo with spaces/$HOME"}
-	if !reflect.DeepEqual(gotArgs[11], wantCreateArgs) {
-		t.Fatalf("create args = %#v, want %#v", gotArgs[11], wantCreateArgs)
+	wantCreateArgs := []string{"new-window", "-t", "ccx-t2:", "-n", "alpha-shell-2", "-c", "/repo with spaces/$HOME", "-P", "-F", "#{window_id}"}
+	var createArgs []string
+	for _, args := range gotArgs {
+		if len(args) > 0 && args[0] == "new-window" {
+			createArgs = args
+			break
+		}
+	}
+	if !reflect.DeepEqual(createArgs, wantCreateArgs) {
+		t.Fatalf("create args = %#v, want %#v", createArgs, wantCreateArgs)
 	}
 	for i, gotCtx := range gotContexts {
+		if len(gotArgs[i]) >= 2 && gotArgs[i][0] == "wait-for" && gotArgs[i][1] == "-U" {
+			continue
+		}
 		if gotCtx != ctx {
 			t.Fatalf("command %d context was not propagated", i)
 		}
+	}
+}
+
+func TestProjectWindowFilteringDoesNotCrossOverlappingSlugs(t *testing.T) {
+	prefix := ProjectWindowPrefix("my-project")
+	if !isKnownProjectWindowName("my-project", prefix, "my-project-orchestrator") {
+		t.Fatal("project orchestrator window was not recognized")
+	}
+	if !isKnownProjectWindowName("my-project", prefix, "my-project-shell-1") {
+		t.Fatal("project shell window was not recognized")
+	}
+	if isKnownProjectWindowName("my-project", prefix, "my-project-shell-orchestrator") {
+		t.Fatal("overlapping project orchestrator was incorrectly included")
+	}
+	if isKnownProjectWindowName("my-project", prefix, "my-project-worker-orchestrator") {
+		t.Fatal("overlapping worker-project orchestrator was incorrectly included")
+	}
+	for _, foreign := range []string{
+		"my-project-worker-abc-shell-1",
+		"my-project-worker-abc-worker-task",
+		"my-project-worker-worker-task",
+	} {
+		if isKnownProjectWindowName("my-project", prefix, foreign) {
+			t.Fatalf("overlapping project window %q was incorrectly included", foreign)
+		}
+	}
+}
+
+func installExternalDuplicateTmuxStub(t *testing.T, allowRetry bool) *int {
+	t.Helper()
+	oldExecCommandContext := execCommandContext
+	created := 0
+	tmuxOutput := func(output string) *exec.Cmd {
+		return exec.Command("sh", "-c", "printf '%s' \"$1\"", "sh", output)
+	}
+	execCommandContext = func(_ context.Context, _ string, args ...string) *exec.Cmd {
+		if len(args) == 0 {
+			return exec.Command("sh", "-c", "true")
+		}
+		var output string
+		switch {
+		case args[0] == "wait-for":
+			return exec.Command("sh", "-c", "true")
+		case args[0] == "new-window":
+			created++
+			if created == 1 || !allowRetry {
+				output = "@1\n"
+			} else {
+				output = "@3\n"
+			}
+		case args[0] == "kill-window":
+			return exec.Command("sh", "-c", "true")
+		case args[0] == "list-windows" && args[len(args)-1] == windowListFormat:
+			switch created {
+			case 0:
+				output = ""
+			case 1:
+				output = "0\t@1\n1\t@2\n"
+			default:
+				output = "2\t@3\n"
+			}
+		case args[0] == "list-windows" && args[len(args)-1] == "#{window_id}":
+			if created == 1 {
+				output = "@1\n@2\n"
+			} else if created > 1 {
+				output = "@3\n"
+			}
+		case args[0] == "display-message" && args[len(args)-1] == "#{window_name}":
+			if strings.HasSuffix(args[2], "@3") {
+				output = "alpha-shell-2\n"
+			} else {
+				output = "alpha-shell-1\n"
+			}
+		case args[0] == "display-message" && args[len(args)-1] == "#{pane_current_path}":
+			output = "/repo\n"
+		case args[0] == "display-message" && args[len(args)-1] == "#{pane_current_command}":
+			output = "bash\n"
+		}
+		return tmuxOutput(output)
+	}
+	t.Cleanup(func() { execCommandContext = oldExecCommandContext })
+	return &created
+}
+
+func TestCreateProjectShellWindowContextRetriesExternalDuplicate(t *testing.T) {
+	created := installExternalDuplicateTmuxStub(t, true)
+	window, err := CreateProjectShellWindowContext(context.Background(), "ccx-t2", "alpha", "/repo")
+	if err != nil {
+		t.Fatalf("CreateProjectShellWindowContext: %v", err)
+	}
+	if window.Name != "alpha-shell-2" {
+		t.Fatalf("window name = %q, want alpha-shell-2", window.Name)
+	}
+	if *created != 2 {
+		t.Fatalf("new-window calls = %d, want retry after duplicate", *created)
+	}
+}
+
+func TestCreateProjectWindowContextRejectsExternalDuplicate(t *testing.T) {
+	installExternalDuplicateTmuxStub(t, false)
+	err := CreateProjectWindowContext(context.Background(), "ccx-t2", "alpha", "alpha-shell-1", "/repo")
+	if !errors.Is(err, ErrWindowNameTaken) {
+		t.Fatalf("CreateProjectWindowContext error = %v, want ErrWindowNameTaken", err)
 	}
 }
 

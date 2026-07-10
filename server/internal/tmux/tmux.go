@@ -3,6 +3,7 @@ package tmux
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -136,17 +137,6 @@ func ListWindowsContext(ctx context.Context, session string) ([]WindowInfo, erro
 		if err != nil {
 			return nil, fmt.Errorf("parse tmux window metadata: %w", err)
 		}
-		target := session + ":" + strconv.Itoa(window.Index)
-		identity, identityErr := readWindowField(ctx, target, "#{window_id}")
-		if identityErr != nil {
-			if isMissingSessionError(identityErr) {
-				return nil, fmt.Errorf("%w: %s", ErrSessionNotFound, session)
-			}
-			return nil, fmt.Errorf("verify tmux window %q: %w", window.ID, identityErr)
-		}
-		if identity != window.ID {
-			return nil, fmt.Errorf("tmux window identity changed at %s: got %q, want %q", target, identity, window.ID)
-		}
 		fields := []struct {
 			name   string
 			dest   *string
@@ -156,25 +146,30 @@ func ListWindowsContext(ctx context.Context, session string) ([]WindowInfo, erro
 			{name: "current path", dest: &window.CurrentPath, format: "#{pane_current_path}"},
 			{name: "current command", dest: &window.CurrentCommand, format: "#{pane_current_command}"},
 		}
+		skipWindow := false
 		for _, field := range fields {
-			value, fieldErr := readWindowField(ctx, target, field.format)
+			value, fieldErr := readWindowField(ctx, window.ID, field.format)
 			if fieldErr != nil {
 				if isMissingSessionError(fieldErr) {
 					return nil, fmt.Errorf("%w: %s", ErrSessionNotFound, session)
+				}
+				if isMissingWindowError(fieldErr) {
+					skipWindow = true
+					break
 				}
 				return nil, fmt.Errorf("read tmux window %q %s: %w", window.ID, field.name, fieldErr)
 			}
 			*field.dest = value
 		}
-		identity, identityErr = readWindowField(ctx, target, "#{window_id}")
-		if identityErr != nil {
-			if isMissingSessionError(identityErr) {
-				return nil, fmt.Errorf("%w: %s", ErrSessionNotFound, session)
-			}
-			return nil, fmt.Errorf("verify hydrated tmux window %q: %w", window.ID, identityErr)
+		if skipWindow {
+			continue
 		}
-		if identity != window.ID {
-			return nil, fmt.Errorf("tmux window identity changed at %s: got %q, want %q", target, identity, window.ID)
+		present, presentErr := windowInSessionContext(ctx, session, window.ID)
+		if presentErr != nil {
+			return nil, presentErr
+		}
+		if !present {
+			continue
 		}
 		windows = append(windows, window)
 	}
@@ -202,7 +197,7 @@ func ListProjectWindowsContext(ctx context.Context, session, projectSlug string)
 	prefix := ProjectWindowPrefix(projectSlug)
 	projectWindows := windows[:0]
 	for _, window := range windows {
-		if strings.HasPrefix(window.Name, prefix) {
+		if isKnownProjectWindowName(projectSlug, prefix, window.Name) {
 			projectWindows = append(projectWindows, window)
 		}
 	}
@@ -250,13 +245,18 @@ func CreateProjectShellWindowContext(ctx context.Context, session, projectSlug, 
 		if _, exists := used[name]; exists {
 			continue
 		}
-		if err := CreateWindowContext(ctx, session, name, repoPath); err != nil {
+		created, err := createProjectWindowContext(ctx, session, name, repoPath)
+		if errors.Is(err, ErrWindowNameTaken) {
+			used[name] = struct{}{}
+			continue
+		}
+		if err != nil {
 			if isMissingSessionError(err) {
 				return WindowInfo{}, fmt.Errorf("%w: %s", ErrSessionNotFound, session)
 			}
 			return WindowInfo{}, err
 		}
-		return WindowInfo{Name: name, CurrentPath: repoPath}, nil
+		return created, nil
 	}
 }
 
@@ -281,13 +281,50 @@ func CreateProjectWindowContext(ctx context.Context, session, projectSlug, windo
 	if _, exists := windowNameSet(windows)[windowName]; exists {
 		return fmt.Errorf("%w: %s", ErrWindowNameTaken, windowName)
 	}
-	if err := CreateWindowContext(ctx, session, windowName, repoPath); err != nil {
+	if _, err := createProjectWindowContext(ctx, session, windowName, repoPath); err != nil {
 		if isMissingSessionError(err) {
 			return fmt.Errorf("%w: %s", ErrSessionNotFound, session)
 		}
 		return err
 	}
 	return nil
+}
+
+func createProjectWindowContext(ctx context.Context, session, windowName, repoPath string) (WindowInfo, error) {
+	out, err := outputCtx(ctx, "tmux", "new-window", "-t", sessionTarget(session), "-n", windowName, "-c", repoPath, "-P", "-F", "#{window_id}")
+	if err != nil {
+		return WindowInfo{}, err
+	}
+	windowID := strings.TrimSpace(out)
+	if windowID == "" {
+		return WindowInfo{}, fmt.Errorf("tmux new-window returned no window id for %q", windowName)
+	}
+	windows, err := ListWindowsContext(ctx, session)
+	if err != nil {
+		cleanupCreatedWindow(windowID)
+		return WindowInfo{}, err
+	}
+	matches := make([]WindowInfo, 0, 1)
+	for _, window := range windows {
+		if window.Name == windowName {
+			matches = append(matches, window)
+		}
+	}
+	if len(matches) > 1 {
+		cleanupCreatedWindow(windowID)
+		return WindowInfo{}, fmt.Errorf("%w: %s", ErrWindowNameTaken, windowName)
+	}
+	if len(matches) == 0 || matches[0].ID != windowID {
+		cleanupCreatedWindow(windowID)
+		return WindowInfo{}, fmt.Errorf("created tmux window %q could not be verified", windowName)
+	}
+	return matches[0], nil
+}
+
+func cleanupCreatedWindow(windowID string) {
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = runCtx(cleanupCtx, "tmux", "kill-window", "-t", windowID)
 }
 
 // ValidateProjectShellWindowName rejects malformed, foreign, or non-shell
@@ -338,12 +375,32 @@ func acquireProjectShellCreation(ctx context.Context, session, projectSlug strin
 		projectShellCreationLocks.locks[key] = gate
 	}
 	projectShellCreationLocks.Unlock()
+	var releaseLocal func()
 	select {
 	case gate <- struct{}{}:
-		return func() { <-gate }, nil
+		releaseLocal = func() { <-gate }
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
+	lockName := projectShellLockName(session, projectSlug)
+	if err := runCtx(ctx, "tmux", "wait-for", "-L", lockName); err != nil {
+		releaseLocal()
+		return nil, err
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			unlockCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = runCtx(unlockCtx, "tmux", "wait-for", "-U", lockName)
+			releaseLocal()
+		})
+	}, nil
+}
+
+func projectShellLockName(session, projectSlug string) string {
+	digest := sha256.Sum256([]byte(session + "\x00" + projectSlug))
+	return fmt.Sprintf("ccx-project-shell-%x", digest[:12])
 }
 
 func windowNameSet(windows []WindowInfo) map[string]struct{} {
@@ -360,6 +417,34 @@ func isMissingSessionError(err error) bool {
 	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "no such session") || strings.Contains(msg, "can't find session") || strings.Contains(msg, "no server running")
+}
+
+func isMissingWindowError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "no such window") || strings.Contains(msg, "can't find window")
+}
+
+func isKnownProjectWindowName(projectSlug, prefix, windowName string) bool {
+	if !strings.HasPrefix(windowName, prefix) {
+		return false
+	}
+	suffix := strings.TrimPrefix(windowName, prefix)
+	if suffix == "orchestrator" {
+		return true
+	}
+	if strings.HasPrefix(suffix, "worker-") {
+		taskID := strings.TrimPrefix(suffix, "worker-")
+		return taskID != "" && taskID != "orchestrator" &&
+			!strings.HasPrefix(taskID, "shell-") &&
+			!strings.HasPrefix(taskID, "worker-") &&
+			!strings.Contains(taskID, "-shell-") &&
+			!strings.Contains(taskID, "-worker-") &&
+			!strings.HasSuffix(taskID, "-orchestrator")
+	}
+	return ValidateProjectShellWindowName(projectSlug, windowName) == nil
 }
 
 func parseWindowIdentity(line string) (WindowInfo, error) {
@@ -383,6 +468,22 @@ func readWindowField(ctx context.Context, target, format string) (string, error)
 		return "", err
 	}
 	return strings.TrimSuffix(out, "\n"), nil
+}
+
+func windowInSessionContext(ctx context.Context, session, windowID string) (bool, error) {
+	out, err := outputCtx(ctx, "tmux", "list-windows", "-t", session, "-F", "#{window_id}")
+	if err != nil {
+		if isMissingSessionError(err) {
+			return false, fmt.Errorf("%w: %s", ErrSessionNotFound, session)
+		}
+		return false, err
+	}
+	for _, id := range strings.Split(strings.TrimSuffix(out, "\n"), "\n") {
+		if id == windowID {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // EnsureSession creates a tmux session with the given name if it does not exist.
