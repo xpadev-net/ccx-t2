@@ -345,7 +345,7 @@ func TestCreateProjectWindowContextRejectsExternalDuplicate(t *testing.T) {
 	}
 }
 
-func TestCreateProjectShellWindowContextStartsInteractiveShellInRepository(t *testing.T) {
+func TestCreateProjectShellWindowContextStartsInteractiveShellInRepositoryWithoutPersistentLock(t *testing.T) {
 	if _, err := exec.LookPath("tmux"); err != nil {
 		t.Skipf("tmux not installed: %v", err)
 	}
@@ -357,8 +357,17 @@ func TestCreateProjectShellWindowContextStartsInteractiveShellInRepository(t *te
 	t.Cleanup(func() {
 		_ = exec.Command("tmux", "kill-session", "-t", session).Run()
 	})
+	staleLock := "ccx-stale-project-shell-lock-" + strings.ReplaceAll(time.Now().Format("150405.000000000"), ".", "")
+	if err := exec.Command("tmux", "wait-for", "-L", staleLock).Run(); err != nil {
+		t.Fatalf("create stale tmux lock: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = exec.Command("tmux", "wait-for", "-U", staleLock).Run()
+	})
 
-	created, err := CreateProjectShellWindowContext(context.Background(), session, "alpha", repoPath)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	created, err := CreateProjectShellWindowContext(ctx, session, "alpha", repoPath)
 	if err != nil {
 		t.Fatalf("CreateProjectShellWindowContext: %v", err)
 	}

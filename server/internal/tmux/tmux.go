@@ -3,7 +3,6 @@ package tmux
 import (
 	"bufio"
 	"context"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -240,7 +239,7 @@ func CreateProjectShellWindowContext(ctx context.Context, session, projectSlug, 
 		return WindowInfo{}, err
 	}
 	used := windowNameSet(windows)
-	for number := 1; ; number++ {
+	for number := 1; number <= maxProjectShellCreationAttempts; number++ {
 		name := fmt.Sprintf("%sshell-%d", ProjectWindowPrefix(projectSlug), number)
 		if _, exists := used[name]; exists {
 			continue
@@ -258,6 +257,7 @@ func CreateProjectShellWindowContext(ctx context.Context, session, projectSlug, 
 		}
 		return created, nil
 	}
+	return WindowInfo{}, fmt.Errorf("could not allocate a project shell window after %d attempts", maxProjectShellCreationAttempts)
 }
 
 // CreateProjectWindowContext creates a specifically named interactive shell
@@ -366,6 +366,8 @@ var projectShellCreationLocks = struct {
 	locks map[string]chan struct{}
 }{locks: make(map[string]chan struct{})}
 
+const maxProjectShellCreationAttempts = 1024
+
 func acquireProjectShellCreation(ctx context.Context, session, projectSlug string) (func(), error) {
 	key := session + "\x00" + projectSlug
 	projectShellCreationLocks.Lock()
@@ -382,25 +384,7 @@ func acquireProjectShellCreation(ctx context.Context, session, projectSlug strin
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
-	lockName := projectShellLockName(session, projectSlug)
-	if err := runCtx(ctx, "tmux", "wait-for", "-L", lockName); err != nil {
-		releaseLocal()
-		return nil, err
-	}
-	var once sync.Once
-	return func() {
-		once.Do(func() {
-			unlockCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			_ = runCtx(unlockCtx, "tmux", "wait-for", "-U", lockName)
-			releaseLocal()
-		})
-	}, nil
-}
-
-func projectShellLockName(session, projectSlug string) string {
-	digest := sha256.Sum256([]byte(session + "\x00" + projectSlug))
-	return fmt.Sprintf("ccx-project-shell-%x", digest[:12])
+	return releaseLocal, nil
 }
 
 func windowNameSet(windows []WindowInfo) map[string]struct{} {
