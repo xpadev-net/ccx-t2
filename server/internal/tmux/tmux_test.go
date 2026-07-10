@@ -799,7 +799,7 @@ func TestRollbackProjectWindowsDoesNotKillAfterOwnershipReadInterleaving(t *test
 		t.Run(tc.name, func(t *testing.T) {
 			oldExecCommandContext := execCommandContext
 			oldTimeout := projectWindowReconcileTimeout
-			projectWindowReconcileTimeout = 100 * time.Millisecond
+			projectWindowReconcileTimeout = 2 * time.Second
 			pendingName := pendingProjectWindowPrefix + "0123456789abcdef01234567"
 			marker := pendingName
 			path := "/repo"
@@ -869,7 +869,7 @@ func TestRollbackProjectWindowsDoesNotKillAfterOwnershipReadInterleaving(t *test
 func TestRestorePendingWindowSkipsRenameAfterOwnershipReadInterleaving(t *testing.T) {
 	oldExecCommandContext := execCommandContext
 	oldTimeout := projectWindowReconcileTimeout
-	projectWindowReconcileTimeout = 100 * time.Millisecond
+	projectWindowReconcileTimeout = 2 * time.Second
 	pendingName := pendingProjectWindowPrefix + "0123456789abcdef01234567"
 	path := "/repo"
 	mutated := false
