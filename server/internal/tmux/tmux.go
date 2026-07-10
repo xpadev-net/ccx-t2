@@ -29,7 +29,8 @@ var (
 	ErrInvalidWindowPrefix = errors.New("invalid tmux window prefix")
 	// ErrWindowNameTaken indicates that a requested project window already
 	// exists in the target session.
-	ErrWindowNameTaken = errors.New("tmux window name is already taken")
+	ErrWindowNameTaken             = errors.New("tmux window name is already taken")
+	errProjectWindowNameUnresolved = errors.New("project window name did not converge")
 )
 
 const (
@@ -386,15 +387,19 @@ func renameProjectWindowContext(ctx context.Context, session, windowID, pendingN
 	}
 	renameErr := runCtx(ctx, "tmux", "rename-window", "-t", windowID, windowName)
 	if renameErr != nil {
-		if reconciled, ok := reconcileRenamedWindowContext(ctx, session, windowID, windowName, repoPath, before); ok {
+		if reconciled, ok, reconcileErr := reconcileRenamedWindowContext(ctx, session, windowID, windowName, repoPath, before); ok {
 			return reconciled, nil
+		} else if reconcileErr != nil && errors.Is(reconcileErr, errProjectWindowNameUnresolved) {
+			return WindowInfo{}, reconcileErr
 		}
 		cleanupCreatedWindow(windowID)
 		return WindowInfo{}, renameErr
 	}
 	verified, verifyErr := verifyRenamedWindowContext(ctx, session, windowID, windowName, repoPath, before)
 	if verifyErr != nil {
-		cleanupCreatedWindow(windowID)
+		if !errors.Is(verifyErr, errProjectWindowNameUnresolved) {
+			cleanupCreatedWindow(windowID)
+		}
 		return WindowInfo{}, verifyErr
 	}
 	if verified.Name == pendingName {
@@ -404,12 +409,12 @@ func renameProjectWindowContext(ctx context.Context, session, windowID, pendingN
 	return verified, nil
 }
 
-func reconcileRenamedWindowContext(ctx context.Context, session, windowID, windowName, repoPath string, before []WindowInfo) (WindowInfo, bool) {
+func reconcileRenamedWindowContext(ctx context.Context, session, windowID, windowName, repoPath string, before []WindowInfo) (WindowInfo, bool, error) {
 	verified, err := verifyRenamedWindowContext(ctx, session, windowID, windowName, repoPath, before)
 	if err != nil {
-		return WindowInfo{}, false
+		return WindowInfo{}, false, err
 	}
-	return verified, true
+	return verified, true, nil
 }
 
 func verifyRenamedWindowContext(ctx context.Context, session, windowID, windowName, repoPath string, before []WindowInfo) (WindowInfo, error) {
@@ -460,6 +465,9 @@ func waitForSoleRenamedWindow(ctx context.Context, session, windowID, windowName
 	for {
 		windows, err := ListWindowsContext(reconcileCtx, session)
 		if err != nil {
+			if reconcileCtx.Err() != nil {
+				return WindowInfo{}, fmt.Errorf("%w: created tmux window %q did not converge to a unique name: %w", errProjectWindowNameUnresolved, windowName, reconcileCtx.Err())
+			}
 			return WindowInfo{}, err
 		}
 		requested := make([]WindowInfo, 0, 1)
@@ -473,7 +481,7 @@ func waitForSoleRenamedWindow(ctx context.Context, session, windowID, windowName
 		}
 		select {
 		case <-reconcileCtx.Done():
-			return WindowInfo{}, fmt.Errorf("created tmux window %q did not converge to a unique name: %w", windowName, reconcileCtx.Err())
+			return WindowInfo{}, fmt.Errorf("%w: created tmux window %q did not converge to a unique name: %w", errProjectWindowNameUnresolved, windowName, reconcileCtx.Err())
 		case <-ticker.C:
 		}
 	}
@@ -558,8 +566,9 @@ var projectShellCreationLocks = struct {
 }{locks: make(map[string]chan struct{})}
 
 const maxProjectShellCreationAttempts = 1024
-const projectWindowReconcileTimeout = 5 * time.Second
 const pendingProjectWindowPrefix = "ccx-shell-pending-"
+
+var projectWindowReconcileTimeout = 5 * time.Second
 
 func acquireProjectShellCreation(ctx context.Context, session, projectSlug string) (func(), error) {
 	key := session + "\x00" + projectSlug
