@@ -718,6 +718,10 @@ func TestCreateProjectWindowContextRollsBackWinnerWhenDuplicateDoesNotConverge(t
 				return tmuxOutput(pendingProjectWindowPrefix + "0123456789abcdef01234567\n")
 			}
 			return tmuxOutput(pendingName + "\n")
+		case args[0] == "display-message" && args[len(args)-1] == projectWindowSessionFormat:
+			return tmuxOutput("ccx-t2\n")
+		case args[0] == "display-message" && args[len(args)-1] == projectWindowRepoPathFormat:
+			return tmuxOutput("/repo\n")
 		default:
 			return exec.Command("sh", "-c", "true")
 		}
@@ -784,6 +788,145 @@ func TestRollbackProjectWindowsSkipsChangedAttemptMarker(t *testing.T) {
 	}
 }
 
+func TestRollbackProjectWindowsDoesNotKillAfterOwnershipReadInterleaving(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		mutated func(*string, *string)
+	}{
+		{name: "marker changed", mutated: func(marker, path *string) { *marker = "foreign-marker" }},
+		{name: "pane path changed", mutated: func(marker, path *string) { *path = "/other-repo" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			oldExecCommandContext := execCommandContext
+			oldTimeout := projectWindowReconcileTimeout
+			projectWindowReconcileTimeout = 100 * time.Millisecond
+			pendingName := pendingProjectWindowPrefix + "0123456789abcdef01234567"
+			marker := pendingName
+			path := "/repo"
+			mutated := false
+			killed := false
+			var ifShellArgs []string
+			tmuxOutput := func(output string) *exec.Cmd {
+				return exec.Command("sh", "-c", "printf '%s' \"$1\"", "sh", output)
+			}
+			execCommandContext = func(_ context.Context, _ string, args ...string) *exec.Cmd {
+				switch {
+				case args[0] == "list-windows" && args[len(args)-1] == windowListFormat:
+					return tmuxOutput("2\t@1\n")
+				case args[0] == "list-windows" && args[len(args)-1] == "#{window_id}":
+					if !mutated {
+						mutated = true
+						tc.mutated(&marker, &path)
+					}
+					return tmuxOutput("@1\n")
+				case args[0] == "display-message" && args[len(args)-1] == "#{window_name}":
+					return tmuxOutput("alpha-shell-1\n")
+				case args[0] == "display-message" && args[len(args)-1] == "#{pane_current_path}":
+					return tmuxOutput(path + "\n")
+				case args[0] == "display-message" && args[len(args)-1] == "#{pane_current_command}":
+					return tmuxOutput("bash\n")
+				case args[0] == "display-message" && args[len(args)-1] == projectWindowMarkerFormat:
+					return tmuxOutput(marker + "\n")
+				case args[0] == "display-message" && args[len(args)-1] == projectWindowSessionFormat:
+					return tmuxOutput("ccx-t2\n")
+				case args[0] == "display-message" && args[len(args)-1] == projectWindowRepoPathFormat:
+					return tmuxOutput("/repo\n")
+				case args[0] == "if-shell":
+					ifShellArgs = append([]string(nil), args...)
+					return exec.Command("sh", "-c", "true")
+				case args[0] == "kill-window":
+					killed = true
+					return exec.Command("sh", "-c", "true")
+				default:
+					return exec.Command("sh", "-c", "true")
+				}
+			}
+			t.Cleanup(func() {
+				execCommandContext = oldExecCommandContext
+				projectWindowReconcileTimeout = oldTimeout
+			})
+
+			err := rollbackProjectWindows(context.Background(), "ccx-t2", "@1", pendingName, "/repo", []WindowInfo{{ID: "@1", CreationMarker: pendingName}})
+			if err == nil {
+				t.Fatal("rollbackProjectWindows error = nil, want interleaving ownership failure")
+			}
+			if killed {
+				t.Fatal("rollbackProjectWindows issued an unconditional kill")
+			}
+			if len(ifShellArgs) == 0 {
+				t.Fatal("rollbackProjectWindows did not reach conditional side effect")
+			}
+			condition := strings.Join(ifShellArgs, " ")
+			for _, required := range []string{"session_name", "pane_current_path"} {
+				if !strings.Contains(condition, required) {
+					t.Fatalf("if-shell condition = %q, missing %q", condition, required)
+				}
+			}
+		})
+	}
+}
+
+func TestRestorePendingWindowSkipsRenameAfterOwnershipReadInterleaving(t *testing.T) {
+	oldExecCommandContext := execCommandContext
+	oldTimeout := projectWindowReconcileTimeout
+	projectWindowReconcileTimeout = 100 * time.Millisecond
+	pendingName := pendingProjectWindowPrefix + "0123456789abcdef01234567"
+	path := "/repo"
+	mutated := false
+	renamed := false
+	var ifShellArgs []string
+	tmuxOutput := func(output string) *exec.Cmd {
+		return exec.Command("sh", "-c", "printf '%s' \"$1\"", "sh", output)
+	}
+	execCommandContext = func(_ context.Context, _ string, args ...string) *exec.Cmd {
+		switch {
+		case args[0] == "list-windows" && args[len(args)-1] == windowListFormat:
+			return tmuxOutput("2\t@1\n")
+		case args[0] == "list-windows" && args[len(args)-1] == "#{window_id}":
+			if !mutated {
+				mutated = true
+				path = "/external-repo"
+			}
+			return tmuxOutput("@1\n")
+		case args[0] == "display-message" && args[len(args)-1] == "#{window_name}":
+			return tmuxOutput("alpha-shell-1\n")
+		case args[0] == "display-message" && args[len(args)-1] == "#{pane_current_path}":
+			return tmuxOutput(path + "\n")
+		case args[0] == "display-message" && args[len(args)-1] == "#{pane_current_command}":
+			return tmuxOutput("bash\n")
+		case args[0] == "display-message" && args[len(args)-1] == projectWindowMarkerFormat:
+			return tmuxOutput(pendingName + "\n")
+		case args[0] == "display-message" && args[len(args)-1] == projectWindowSessionFormat:
+			return tmuxOutput("ccx-t2\n")
+		case args[0] == "display-message" && args[len(args)-1] == projectWindowRepoPathFormat:
+			return tmuxOutput("/repo\n")
+		case args[0] == "if-shell":
+			ifShellArgs = append([]string(nil), args...)
+			return exec.Command("sh", "-c", "true")
+		case args[0] == "rename-window":
+			renamed = true
+			return exec.Command("sh", "-c", "true")
+		default:
+			return exec.Command("sh", "-c", "true")
+		}
+	}
+	t.Cleanup(func() {
+		execCommandContext = oldExecCommandContext
+		projectWindowReconcileTimeout = oldTimeout
+	})
+
+	err := restorePendingWindowContext(context.Background(), "ccx-t2", "@1", pendingName, "/repo")
+	if err == nil {
+		t.Fatal("restorePendingWindowContext error = nil, want interleaving ownership failure")
+	}
+	if renamed {
+		t.Fatal("restorePendingWindowContext issued an unguarded rename")
+	}
+	if len(ifShellArgs) == 0 || !strings.Contains(strings.Join(ifShellArgs, " "), "pane_current_path") {
+		t.Fatalf("if-shell args = %#v, want path-guarded conditional rename", ifShellArgs)
+	}
+}
+
 func TestCreateProjectWindowContextCleansOwnedWindowWhenRenameFails(t *testing.T) {
 	oldExecCommandContext := execCommandContext
 	created := false
@@ -828,6 +971,10 @@ func TestCreateProjectWindowContextCleansOwnedWindowWhenRenameFails(t *testing.T
 			return tmuxOutput("bash\n")
 		case args[0] == "display-message" && args[len(args)-1] == projectWindowMarkerFormat:
 			return tmuxOutput(pendingName + "\n")
+		case args[0] == "display-message" && args[len(args)-1] == projectWindowSessionFormat:
+			return tmuxOutput("ccx-t2\n")
+		case args[0] == "display-message" && args[len(args)-1] == projectWindowRepoPathFormat:
+			return tmuxOutput("/repo\n")
 		default:
 			return exec.Command("sh", "-c", "true")
 		}

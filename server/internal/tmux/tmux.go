@@ -42,12 +42,14 @@ const (
 // Name is the stable project-facing identifier; Index and ID are tmux runtime
 // metadata and may change when windows are reordered or recreated.
 type WindowInfo struct {
-	Index          int    `json:"index"`
-	ID             string `json:"id"`
-	Name           string `json:"name"`
-	CurrentPath    string `json:"current_path"`
-	CurrentCommand string `json:"current_command"`
-	CreationMarker string `json:"creation_marker,omitempty"`
+	Index            int    `json:"index"`
+	ID               string `json:"id"`
+	Name             string `json:"name"`
+	CurrentPath      string `json:"current_path"`
+	CurrentCommand   string `json:"current_command"`
+	CreationMarker   string `json:"creation_marker,omitempty"`
+	CreationSession  string `json:"creation_session,omitempty"`
+	CreationRepoPath string `json:"creation_repo_path,omitempty"`
 }
 
 // Window is kept as a concise alias for callers that use tmux window terminology.
@@ -150,6 +152,8 @@ func ListWindowsContext(ctx context.Context, session string) ([]WindowInfo, erro
 			{name: "current path", dest: &window.CurrentPath, format: "#{pane_current_path}"},
 			{name: "current command", dest: &window.CurrentCommand, format: "#{pane_current_command}"},
 			{name: "creation marker", dest: &window.CreationMarker, format: projectWindowMarkerFormat},
+			{name: "creation session", dest: &window.CreationSession, format: projectWindowSessionFormat},
+			{name: "creation repository path", dest: &window.CreationRepoPath, format: projectWindowRepoPathFormat},
 		}
 		skipWindow := false
 		for _, field := range fields {
@@ -334,15 +338,24 @@ func createProjectWindowContext(ctx context.Context, session, windowName, repoPa
 		}
 		windowID = verified.ID
 	}
-	if err := markProjectWindowContext(ctx, windowID, pendingName); err != nil {
+	if err := markProjectWindowContext(ctx, session, windowID, pendingName, repoPath); err != nil {
 		_ = cleanupCreatedWindow(windowID)
 		return WindowInfo{}, err
 	}
 	return renameProjectWindowContext(ctx, session, windowID, pendingName, windowName, repoPath, before)
 }
 
-func markProjectWindowContext(ctx context.Context, windowID, marker string) error {
-	return runCtx(ctx, "tmux", "set-option", "-w", "-t", windowID, projectWindowMarkerOption, marker)
+func markProjectWindowContext(ctx context.Context, session, windowID, marker, repoPath string) error {
+	for _, option := range [][2]string{
+		{projectWindowMarkerOption, marker},
+		{projectWindowSessionOption, session},
+		{projectWindowRepoPathOption, canonicalPath(repoPath)},
+	} {
+		if err := runCtx(ctx, "tmux", "set-option", "-w", "-t", windowID, option[0], option[1]); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func newPendingWindowName() (string, error) {
@@ -547,7 +560,7 @@ func restorePendingWindowContext(ctx context.Context, session, windowID, pending
 	if !owned {
 		return nil
 	}
-	if err := runCtx(recoveryCtx, "tmux", "rename-window", "-t", windowID, pendingName); err != nil {
+	if err := renameWindowIfOwnedContext(recoveryCtx, windowID, pendingName, pendingName); err != nil {
 		present, presentErr := windowInSessionContext(recoveryCtx, session, windowID)
 		if presentErr == nil && !present {
 			return nil
@@ -559,7 +572,7 @@ func restorePendingWindowContext(ctx context.Context, session, windowID, pending
 		return err
 	}
 	for _, window := range windows {
-		if window.ID == windowID && window.Name == pendingName && window.CreationMarker == pendingName && pathsMatch(window.CurrentPath, repoPath) {
+		if window.ID == windowID && window.Name == pendingName && window.CreationMarker == pendingName && window.CreationSession == session && pathsMatch(window.CurrentPath, repoPath) && pathsMatch(window.CreationRepoPath, repoPath) {
 			return nil
 		}
 	}
@@ -621,8 +634,20 @@ func killWindowIfOwnedContext(ctx context.Context, windowID, marker string) erro
 	if !isProjectCreationMarker(marker) {
 		return fmt.Errorf("unsafe tmux project marker %q", marker)
 	}
-	condition := fmt.Sprintf("#{==:%s,%s}", projectWindowMarkerFormat, marker)
+	condition := ownershipCondition(marker)
 	command := "kill-window -t " + windowID
+	return runCtx(ctx, "tmux", "if-shell", "-t", windowID, "-F", condition, command, "")
+}
+
+func renameWindowIfOwnedContext(ctx context.Context, windowID, pendingName, marker string) error {
+	if !isSafeWindowID(windowID) {
+		return fmt.Errorf("unsafe tmux window ID %q", windowID)
+	}
+	if !isProjectCreationMarker(marker) {
+		return fmt.Errorf("unsafe tmux project marker %q", marker)
+	}
+	condition := ownershipCondition(marker)
+	command := "rename-window -t " + windowID + " " + pendingName
 	return runCtx(ctx, "tmux", "if-shell", "-t", windowID, "-F", condition, command, "")
 }
 
@@ -641,8 +666,14 @@ func rollbackWindowOwnershipContext(ctx context.Context, session, windowID, mark
 		if window.CreationMarker != marker {
 			return false, fmt.Errorf("rollback ownership marker changed for window %q", windowID)
 		}
+		if window.CreationSession != session {
+			return false, fmt.Errorf("rollback session ownership changed for window %q", windowID)
+		}
 		if !pathsMatch(window.CurrentPath, repoPath) {
 			return false, fmt.Errorf("rollback repository path changed for window %q", windowID)
+		}
+		if !pathsMatch(window.CreationRepoPath, repoPath) {
+			return false, fmt.Errorf("rollback repository ownership changed for window %q", windowID)
 		}
 		return true, nil
 	}
@@ -752,6 +783,10 @@ const maxProjectShellCreationAttempts = 1024
 const pendingProjectWindowPrefix = "ccx-shell-pending-"
 const projectWindowMarkerOption = "@ccx-project-window-attempt"
 const projectWindowMarkerFormat = "#{@ccx-project-window-attempt}"
+const projectWindowSessionOption = "@ccx-project-window-session"
+const projectWindowSessionFormat = "#{@ccx-project-window-session}"
+const projectWindowRepoPathOption = "@ccx-project-window-repo-path"
+const projectWindowRepoPathFormat = "#{@ccx-project-window-repo-path}"
 
 var projectWindowReconcileTimeout = 5 * time.Second
 
@@ -766,6 +801,13 @@ func isProjectCreationMarker(marker string) bool {
 		}
 	}
 	return true
+}
+
+func ownershipCondition(marker string) string {
+	markerCondition := fmt.Sprintf("#{==:%s,%s}", projectWindowMarkerFormat, marker)
+	sessionCondition := fmt.Sprintf("#{==:#{session_name},%s}", projectWindowSessionFormat)
+	pathCondition := fmt.Sprintf("#{==:#{pane_current_path},%s}", projectWindowRepoPathFormat)
+	return fmt.Sprintf("#{&&:%s,#{&&:%s,%s}}", markerCondition, sessionCondition, pathCondition)
 }
 
 func acquireProjectShellCreation(ctx context.Context, session, projectSlug string) (func(), error) {
