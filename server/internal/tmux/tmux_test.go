@@ -546,6 +546,70 @@ func TestCreateProjectWindowContextCleansOnlyOwnedWindowOnRenameDuplicate(t *tes
 	}
 }
 
+func TestCreateProjectWindowContextPreservesWinnerAfterPostRenameDuplicate(t *testing.T) {
+	oldExecCommandContext := execCommandContext
+	created := false
+	external := false
+	renamed := false
+	pendingName := ""
+	killed := false
+	tmuxOutput := func(output string) *exec.Cmd {
+		return exec.Command("sh", "-c", "printf '%s' \"$1\"", "sh", output)
+	}
+	execCommandContext = func(_ context.Context, _ string, args ...string) *exec.Cmd {
+		switch {
+		case args[0] == "new-window":
+			created = true
+			for i := 0; i+1 < len(args); i++ {
+				if args[i] == "-n" {
+					pendingName = args[i+1]
+				}
+			}
+			return tmuxOutput("@1\n")
+		case args[0] == "rename-window":
+			renamed = true
+			external = true
+			return exec.Command("sh", "-c", "true")
+		case args[0] == "kill-window":
+			killed = true
+			return exec.Command("sh", "-c", "true")
+		case args[0] == "list-windows" && args[len(args)-1] == windowListFormat:
+			switch {
+			case !created:
+				return tmuxOutput("")
+			case external:
+				return tmuxOutput("2\t@1\n3\t@2\n")
+			default:
+				return tmuxOutput("2\t@1\n")
+			}
+		case args[0] == "list-windows" && args[len(args)-1] == "#{window_id}":
+			if external {
+				return tmuxOutput("@1\n@2\n")
+			}
+			return tmuxOutput("@1\n")
+		case args[0] == "display-message" && args[len(args)-1] == "#{window_name}":
+			if strings.HasSuffix(args[2], "@1") && !renamed {
+				return tmuxOutput(pendingName + "\n")
+			}
+			return tmuxOutput("alpha-shell-1\n")
+		case args[0] == "display-message" && args[len(args)-1] == "#{pane_current_path}":
+			return tmuxOutput("/repo\n")
+		case args[0] == "display-message" && args[len(args)-1] == "#{pane_current_command}":
+			return tmuxOutput("bash\n")
+		default:
+			return exec.Command("sh", "-c", "true")
+		}
+	}
+	t.Cleanup(func() { execCommandContext = oldExecCommandContext })
+
+	if err := CreateProjectWindowContext(context.Background(), "ccx-t2", "alpha", "alpha-shell-1", "/repo"); err != nil {
+		t.Fatalf("CreateProjectWindowContext: %v", err)
+	}
+	if killed {
+		t.Fatal("winner-preserving duplicate handling killed the winning owned window")
+	}
+}
+
 func TestCreateProjectWindowContextCleansOwnedWindowWhenRenameFails(t *testing.T) {
 	oldExecCommandContext := execCommandContext
 	created := false

@@ -324,7 +324,7 @@ func createProjectWindowContext(ctx context.Context, session, windowName, repoPa
 		}
 		windowID = verified.ID
 	}
-	return renameProjectWindowContext(ctx, session, windowID, pendingName, windowName, repoPath)
+	return renameProjectWindowContext(ctx, session, windowID, pendingName, windowName, repoPath, before)
 }
 
 func newPendingWindowName() (string, error) {
@@ -368,7 +368,7 @@ func findPendingWindowContext(ctx context.Context, session, pendingName, repoPat
 	return matches[0], true, nil
 }
 
-func renameProjectWindowContext(ctx context.Context, session, windowID, pendingName, windowName, repoPath string) (WindowInfo, error) {
+func renameProjectWindowContext(ctx context.Context, session, windowID, pendingName, windowName, repoPath string, before []WindowInfo) (WindowInfo, error) {
 	windows, err := listWindowsForRecovery(ctx, session)
 	if err != nil {
 		cleanupCreatedWindow(windowID)
@@ -386,13 +386,13 @@ func renameProjectWindowContext(ctx context.Context, session, windowID, pendingN
 	}
 	renameErr := runCtx(ctx, "tmux", "rename-window", "-t", windowID, windowName)
 	if renameErr != nil {
-		if reconciled, ok := reconcileRenamedWindowContext(ctx, session, windowID, windowName, repoPath); ok {
+		if reconciled, ok := reconcileRenamedWindowContext(ctx, session, windowID, windowName, repoPath, before); ok {
 			return reconciled, nil
 		}
 		cleanupCreatedWindow(windowID)
 		return WindowInfo{}, renameErr
 	}
-	verified, verifyErr := verifyRenamedWindowContext(ctx, session, windowID, windowName, repoPath)
+	verified, verifyErr := verifyRenamedWindowContext(ctx, session, windowID, windowName, repoPath, before)
 	if verifyErr != nil {
 		cleanupCreatedWindow(windowID)
 		return WindowInfo{}, verifyErr
@@ -404,15 +404,15 @@ func renameProjectWindowContext(ctx context.Context, session, windowID, pendingN
 	return verified, nil
 }
 
-func reconcileRenamedWindowContext(ctx context.Context, session, windowID, windowName, repoPath string) (WindowInfo, bool) {
-	verified, err := verifyRenamedWindowContext(ctx, session, windowID, windowName, repoPath)
+func reconcileRenamedWindowContext(ctx context.Context, session, windowID, windowName, repoPath string, before []WindowInfo) (WindowInfo, bool) {
+	verified, err := verifyRenamedWindowContext(ctx, session, windowID, windowName, repoPath, before)
 	if err != nil {
 		return WindowInfo{}, false
 	}
 	return verified, true
 }
 
-func verifyRenamedWindowContext(ctx context.Context, session, windowID, windowName, repoPath string) (WindowInfo, error) {
+func verifyRenamedWindowContext(ctx context.Context, session, windowID, windowName, repoPath string, before []WindowInfo) (WindowInfo, error) {
 	windows, err := listWindowsForRecovery(ctx, session)
 	if err != nil {
 		return WindowInfo{}, err
@@ -428,7 +428,18 @@ func verifyRenamedWindowContext(ctx context.Context, session, windowID, windowNa
 		}
 	}
 	if len(requested) > 1 {
-		return WindowInfo{}, fmt.Errorf("%w: %s", ErrWindowNameTaken, windowName)
+		knownIDs := windowNameSetByID(before)
+		for _, window := range requested {
+			if _, known := knownIDs[window.ID]; known {
+				cleanupCreatedWindow(windowID)
+				return WindowInfo{}, fmt.Errorf("%w: %s", ErrWindowNameTaken, windowName)
+			}
+		}
+		sort.Slice(requested, func(i, j int) bool { return requested[i].ID < requested[j].ID })
+		if requested[0].ID != windowID {
+			cleanupCreatedWindow(windowID)
+			return WindowInfo{}, fmt.Errorf("%w: %s", ErrWindowNameTaken, windowName)
+		}
 	}
 	if own.ID != windowID || own.Name != windowName || !pathsMatch(own.CurrentPath, repoPath) {
 		return WindowInfo{}, fmt.Errorf("created tmux window %q could not be verified after rename", windowName)
