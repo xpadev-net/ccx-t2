@@ -8,10 +8,382 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
+
+var (
+	// ErrSessionNotFound indicates that a tmux operation targeted a session
+	// which does not exist. It is distinct from other tmux command failures.
+	ErrSessionNotFound = errors.New("tmux session not found")
+	// ErrInvalidWindowName indicates that a window name cannot safely be used
+	// as a project-scoped tmux identifier.
+	ErrInvalidWindowName = errors.New("invalid tmux window name")
+	// ErrInvalidWindowPrefix indicates that a project window prefix is invalid.
+	ErrInvalidWindowPrefix = errors.New("invalid tmux window prefix")
+	// ErrWindowNameTaken indicates that a requested project window already
+	// exists in the target session.
+	ErrWindowNameTaken = errors.New("tmux window name is already taken")
+)
+
+const (
+	maxWindowNameLength = 128
+	windowListFormat    = "#{window_index}\t#{window_id}"
+)
+
+// WindowInfo contains stable and display-relevant metadata for a tmux window.
+// Name is the stable project-facing identifier; Index and ID are tmux runtime
+// metadata and may change when windows are reordered or recreated.
+type WindowInfo struct {
+	Index          int    `json:"index"`
+	ID             string `json:"id"`
+	Name           string `json:"name"`
+	CurrentPath    string `json:"current_path"`
+	CurrentCommand string `json:"current_command"`
+}
+
+// Window is kept as a concise alias for callers that use tmux window terminology.
+type Window = WindowInfo
+
+// ValidateWindowName verifies the strict identifier format used for new
+// project-scoped tmux windows. Existing legacy APIs intentionally do not call
+// this helper so their behavior remains compatible.
+func ValidateWindowName(name string) error {
+	if name == "" || len(name) > maxWindowNameLength {
+		return fmt.Errorf("%w: must be 1-%d ASCII characters", ErrInvalidWindowName, maxWindowNameLength)
+	}
+	for i, r := range name {
+		valid := r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '-'
+		if !valid || i == 0 && (r < '0' || r > '9') && (r < 'A' || r > 'Z') && (r < 'a' || r > 'z') {
+			return fmt.Errorf("%w: %q contains unsupported characters", ErrInvalidWindowName, name)
+		}
+	}
+	return nil
+}
+
+// ValidateWindowPrefix verifies a project window prefix, which must be a
+// valid window identifier followed by exactly the namespace separator '-'.
+func ValidateWindowPrefix(prefix string) error {
+	if prefix == "" || !strings.HasSuffix(prefix, "-") {
+		return fmt.Errorf("%w: %q must end with '-'", ErrInvalidWindowPrefix, prefix)
+	}
+	if err := ValidateWindowName(strings.TrimSuffix(prefix, "-")); err != nil {
+		return fmt.Errorf("%w: %q: %v", ErrInvalidWindowPrefix, prefix, err)
+	}
+	return nil
+}
+
+// ProjectWindowPrefix returns the namespace prefix used by all windows owned
+// by a project. Callers should validate the project slug before using it.
+func ProjectWindowPrefix(projectSlug string) string {
+	return projectSlug + "-"
+}
+
+// ProjectShellWindowPrefix returns the prefix reserved for user-created shell
+// windows in a project.
+func ProjectShellWindowPrefix(projectSlug string) string {
+	return ProjectWindowPrefix(projectSlug) + "shell-"
+}
+
+// ValidateProjectWindowName rejects malformed or foreign project window names.
+func ValidateProjectWindowName(projectSlug, windowName string) error {
+	if err := ValidateWindowName(projectSlug); err != nil {
+		return fmt.Errorf("invalid project slug: %w", err)
+	}
+	if err := ValidateWindowName(windowName); err != nil {
+		return err
+	}
+	if !strings.HasPrefix(windowName, ProjectWindowPrefix(projectSlug)) {
+		return fmt.Errorf("%w: %q is outside project %q", ErrInvalidWindowPrefix, windowName, projectSlug)
+	}
+	return nil
+}
+
+// IsProjectWindowName reports whether windowName belongs to projectSlug.
+func IsProjectWindowName(projectSlug, windowName string) bool {
+	return ValidateProjectWindowName(projectSlug, windowName) == nil
+}
+
+// ListWindows returns the windows in a tmux session using a background context.
+func ListWindows(session string) ([]WindowInfo, error) {
+	return ListWindowsContext(context.Background(), session)
+}
+
+// ListWindowsContext enumerates tmux windows without shell parsing. Missing
+// sessions return ErrSessionNotFound; other tmux failures are returned as-is.
+func ListWindowsContext(ctx context.Context, session string) ([]WindowInfo, error) {
+	out, err := outputCtx(ctx, "tmux", "list-windows", "-t", session, "-F", windowListFormat)
+	if err != nil {
+		if isMissingSessionError(err) {
+			return nil, fmt.Errorf("%w: %s", ErrSessionNotFound, session)
+		}
+		return nil, err
+	}
+
+	lines := strings.Split(strings.TrimSuffix(out, "\n"), "\n")
+	if len(lines) == 1 && lines[0] == "" {
+		return []WindowInfo{}, nil
+	}
+	windows := make([]WindowInfo, 0, len(lines))
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		window, err := parseWindowIdentity(line)
+		if err != nil {
+			return nil, fmt.Errorf("parse tmux window metadata: %w", err)
+		}
+		target := session + ":" + strconv.Itoa(window.Index)
+		identity, identityErr := readWindowField(ctx, target, "#{window_id}")
+		if identityErr != nil {
+			if isMissingSessionError(identityErr) {
+				return nil, fmt.Errorf("%w: %s", ErrSessionNotFound, session)
+			}
+			return nil, fmt.Errorf("verify tmux window %q: %w", window.ID, identityErr)
+		}
+		if identity != window.ID {
+			return nil, fmt.Errorf("tmux window identity changed at %s: got %q, want %q", target, identity, window.ID)
+		}
+		fields := []struct {
+			name   string
+			dest   *string
+			format string
+		}{
+			{name: "name", dest: &window.Name, format: "#{window_name}"},
+			{name: "current path", dest: &window.CurrentPath, format: "#{pane_current_path}"},
+			{name: "current command", dest: &window.CurrentCommand, format: "#{pane_current_command}"},
+		}
+		for _, field := range fields {
+			value, fieldErr := readWindowField(ctx, target, field.format)
+			if fieldErr != nil {
+				if isMissingSessionError(fieldErr) {
+					return nil, fmt.Errorf("%w: %s", ErrSessionNotFound, session)
+				}
+				return nil, fmt.Errorf("read tmux window %q %s: %w", window.ID, field.name, fieldErr)
+			}
+			*field.dest = value
+		}
+		identity, identityErr = readWindowField(ctx, target, "#{window_id}")
+		if identityErr != nil {
+			if isMissingSessionError(identityErr) {
+				return nil, fmt.Errorf("%w: %s", ErrSessionNotFound, session)
+			}
+			return nil, fmt.Errorf("verify hydrated tmux window %q: %w", window.ID, identityErr)
+		}
+		if identity != window.ID {
+			return nil, fmt.Errorf("tmux window identity changed at %s: got %q, want %q", target, identity, window.ID)
+		}
+		windows = append(windows, window)
+	}
+	sort.SliceStable(windows, func(i, j int) bool {
+		if windows[i].Index != windows[j].Index {
+			return windows[i].Index < windows[j].Index
+		}
+		return windows[i].Name < windows[j].Name
+	})
+	return windows, nil
+}
+
+// ListProjectWindowsContext enumerates only windows in a project's namespace.
+func ListProjectWindowsContext(ctx context.Context, session, projectSlug string) ([]WindowInfo, error) {
+	if err := ValidateWindowName(projectSlug); err != nil {
+		return nil, fmt.Errorf("invalid project slug: %w", err)
+	}
+	windows, err := ListWindowsContext(ctx, session)
+	if err != nil {
+		if errors.Is(err, ErrSessionNotFound) {
+			return []WindowInfo{}, nil
+		}
+		return nil, err
+	}
+	prefix := ProjectWindowPrefix(projectSlug)
+	projectWindows := windows[:0]
+	for _, window := range windows {
+		if strings.HasPrefix(window.Name, prefix) {
+			projectWindows = append(projectWindows, window)
+		}
+	}
+	return projectWindows, nil
+}
+
+// ListProjectWindows returns project-scoped windows using a background context.
+func ListProjectWindows(session, projectSlug string) ([]WindowInfo, error) {
+	return ListProjectWindowsContext(context.Background(), session, projectSlug)
+}
+
+// CreateProjectShellWindow creates a uniquely named interactive shell window
+// in the project's repository using a background context.
+func CreateProjectShellWindow(session, projectSlug, repoPath string) (WindowInfo, error) {
+	return CreateProjectShellWindowContext(context.Background(), session, projectSlug, repoPath)
+}
+
+// CreateProjectShellContext is the concise compatibility spelling for
+// CreateProjectShellWindowContext.
+func CreateProjectShellContext(ctx context.Context, session, projectSlug, repoPath string) (WindowInfo, error) {
+	return CreateProjectShellWindowContext(ctx, session, projectSlug, repoPath)
+}
+
+// CreateProjectShellWindowContext creates a uniquely named interactive shell
+// window in repoPath. Names use the deterministic project-shell-N sequence and
+// the package-level gate prevents concurrent creators in this process from
+// selecting the same free name.
+func CreateProjectShellWindowContext(ctx context.Context, session, projectSlug, repoPath string) (WindowInfo, error) {
+	if err := validateProjectShellInputs(projectSlug, repoPath); err != nil {
+		return WindowInfo{}, err
+	}
+	release, err := acquireProjectShellCreation(ctx, session, projectSlug)
+	if err != nil {
+		return WindowInfo{}, err
+	}
+	defer release()
+
+	windows, err := ListWindowsContext(ctx, session)
+	if err != nil {
+		return WindowInfo{}, err
+	}
+	used := windowNameSet(windows)
+	for number := 1; ; number++ {
+		name := fmt.Sprintf("%sshell-%d", ProjectWindowPrefix(projectSlug), number)
+		if _, exists := used[name]; exists {
+			continue
+		}
+		if err := CreateWindowContext(ctx, session, name, repoPath); err != nil {
+			if isMissingSessionError(err) {
+				return WindowInfo{}, fmt.Errorf("%w: %s", ErrSessionNotFound, session)
+			}
+			return WindowInfo{}, err
+		}
+		return WindowInfo{Name: name, CurrentPath: repoPath}, nil
+	}
+}
+
+// CreateProjectWindowContext creates a specifically named interactive shell
+// window after validating that the name belongs to the project and is unused.
+func CreateProjectWindowContext(ctx context.Context, session, projectSlug, windowName, repoPath string) error {
+	if err := validateProjectShellInputs(projectSlug, repoPath); err != nil {
+		return err
+	}
+	if err := ValidateProjectShellWindowName(projectSlug, windowName); err != nil {
+		return err
+	}
+	release, err := acquireProjectShellCreation(ctx, session, projectSlug)
+	if err != nil {
+		return err
+	}
+	defer release()
+	windows, err := ListWindowsContext(ctx, session)
+	if err != nil {
+		return err
+	}
+	if _, exists := windowNameSet(windows)[windowName]; exists {
+		return fmt.Errorf("%w: %s", ErrWindowNameTaken, windowName)
+	}
+	if err := CreateWindowContext(ctx, session, windowName, repoPath); err != nil {
+		if isMissingSessionError(err) {
+			return fmt.Errorf("%w: %s", ErrSessionNotFound, session)
+		}
+		return err
+	}
+	return nil
+}
+
+// ValidateProjectShellWindowName rejects malformed, foreign, or non-shell
+// project window names for user-created shell operations.
+func ValidateProjectShellWindowName(projectSlug, windowName string) error {
+	if err := ValidateProjectWindowName(projectSlug, windowName); err != nil {
+		return err
+	}
+	if !strings.HasPrefix(windowName, ProjectShellWindowPrefix(projectSlug)) {
+		return fmt.Errorf("%w: %q is not a project shell window", ErrInvalidWindowPrefix, windowName)
+	}
+	suffix := strings.TrimPrefix(windowName, ProjectShellWindowPrefix(projectSlug))
+	if suffix == "" || suffix[0] == '0' {
+		return fmt.Errorf("%w: %q must end in a positive decimal suffix", ErrInvalidWindowName, windowName)
+	}
+	for _, r := range suffix {
+		if r < '0' || r > '9' {
+			return fmt.Errorf("%w: %q must end in a positive decimal suffix", ErrInvalidWindowName, windowName)
+		}
+	}
+	return nil
+}
+
+func validateProjectShellInputs(projectSlug, repoPath string) error {
+	if err := ValidateWindowName(projectSlug); err != nil {
+		return fmt.Errorf("invalid project slug: %w", err)
+	}
+	if strings.TrimSpace(repoPath) == "" {
+		return fmt.Errorf("repository path must not be empty")
+	}
+	if err := ValidateWindowPrefix(ProjectWindowPrefix(projectSlug)); err != nil {
+		return fmt.Errorf("invalid project prefix: %w", err)
+	}
+	return nil
+}
+
+var projectShellCreationLocks = struct {
+	sync.Mutex
+	locks map[string]chan struct{}
+}{locks: make(map[string]chan struct{})}
+
+func acquireProjectShellCreation(ctx context.Context, session, projectSlug string) (func(), error) {
+	key := session + "\x00" + projectSlug
+	projectShellCreationLocks.Lock()
+	gate := projectShellCreationLocks.locks[key]
+	if gate == nil {
+		gate = make(chan struct{}, 1)
+		projectShellCreationLocks.locks[key] = gate
+	}
+	projectShellCreationLocks.Unlock()
+	select {
+	case gate <- struct{}{}:
+		return func() { <-gate }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func windowNameSet(windows []WindowInfo) map[string]struct{} {
+	used := make(map[string]struct{}, len(windows))
+	for _, window := range windows {
+		used[window.Name] = struct{}{}
+	}
+	return used
+}
+
+func isMissingSessionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "no such session") || strings.Contains(msg, "can't find session") || strings.Contains(msg, "no server running")
+}
+
+func parseWindowIdentity(line string) (WindowInfo, error) {
+	fields := strings.Split(line, "\t")
+	if len(fields) != 2 {
+		return WindowInfo{}, fmt.Errorf("expected 2 fields, got %d", len(fields))
+	}
+	index, err := strconv.Atoi(fields[0])
+	if err != nil {
+		return WindowInfo{}, fmt.Errorf("window index %q: %w", fields[0], err)
+	}
+	return WindowInfo{
+		Index: index,
+		ID:    fields[1],
+	}, nil
+}
+
+func readWindowField(ctx context.Context, target, format string) (string, error) {
+	out, err := outputCtx(ctx, "tmux", "display-message", "-t", target, "-p", format)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSuffix(out, "\n"), nil
+}
 
 // EnsureSession creates a tmux session with the given name if it does not exist.
 func EnsureSession(slug string) error {

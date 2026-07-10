@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os/exec"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -11,6 +12,283 @@ import (
 )
 
 type tmuxTestContextKey struct{}
+
+func TestListWindowsContextParsesMetadataWithTabs(t *testing.T) {
+	ctx := context.WithValue(context.Background(), tmuxTestContextKey{}, "marker")
+	var gotCtx context.Context
+	var gotArgs [][]string
+	oldExecCommandContext := execCommandContext
+	execCommandContext = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		gotCtx = ctx
+		gotArgs = append(gotArgs, append([]string(nil), args...))
+		var output string
+		switch len(gotArgs) {
+		case 1:
+			output = "0\t@0\n"
+		case 2:
+			output = "@0\n"
+		case 3:
+			output = "alpha shell\t1\n"
+		case 4:
+			output = "/Users/me/My Repo\t(a|b)\n"
+		case 5:
+			output = "zsh\n"
+		case 6:
+			output = "@0\n"
+		}
+		return exec.Command("sh", "-c", "printf '%s' \"$1\"", "sh", output)
+	}
+	t.Cleanup(func() { execCommandContext = oldExecCommandContext })
+
+	windows, err := ListWindowsContext(ctx, "ccx-t2")
+	if err != nil {
+		t.Fatalf("ListWindowsContext: %v", err)
+	}
+	if gotCtx != ctx {
+		t.Fatal("ListWindowsContext did not pass caller context")
+	}
+	wantArgs := []string{"list-windows", "-t", "ccx-t2", "-F", windowListFormat}
+	if !reflect.DeepEqual(gotArgs[0], wantArgs) {
+		t.Fatalf("tmux list args = %#v, want %#v", gotArgs[0], wantArgs)
+	}
+	want := []WindowInfo{{
+		Index:          0,
+		ID:             "@0",
+		Name:           "alpha shell\t1",
+		CurrentPath:    "/Users/me/My Repo\t(a|b)",
+		CurrentCommand: "zsh",
+	}}
+	if !reflect.DeepEqual(windows, want) {
+		t.Fatalf("windows = %#v, want %#v", windows, want)
+	}
+}
+
+func TestListWindowsContextDistinguishesMissingSessionFromCommandFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		stderr    string
+		wantError bool
+	}{
+		{name: "missing", stderr: "can't find session: ccx-t2"},
+		{name: "failure", stderr: "permission denied", wantError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			oldExecCommandContext := execCommandContext
+			execCommandContext = func(context.Context, string, ...string) *exec.Cmd {
+				return exec.Command("sh", "-c", "printf '%s' \"$1\" >&2; exit 1", "sh", tc.stderr)
+			}
+			t.Cleanup(func() { execCommandContext = oldExecCommandContext })
+
+			windows, err := ListWindowsContext(context.Background(), "ccx-t2")
+			if tc.wantError {
+				if err == nil || errors.Is(err, ErrSessionNotFound) {
+					t.Fatalf("ListWindowsContext error = %v, want command failure", err)
+				}
+				return
+			}
+			if !errors.Is(err, ErrSessionNotFound) {
+				t.Fatalf("ListWindowsContext error = %v, want ErrSessionNotFound", err)
+			}
+			if windows != nil {
+				t.Fatalf("windows = %#v, want nil for missing session", windows)
+			}
+		})
+	}
+}
+
+func TestListProjectWindowsContextTreatsMissingSessionAsEmpty(t *testing.T) {
+	oldExecCommandContext := execCommandContext
+	execCommandContext = func(context.Context, string, ...string) *exec.Cmd {
+		return exec.Command("sh", "-c", "printf '%s' 'no such session' >&2; exit 1")
+	}
+	t.Cleanup(func() { execCommandContext = oldExecCommandContext })
+
+	windows, err := ListProjectWindowsContext(context.Background(), "ccx-t2", "alpha")
+	if err != nil {
+		t.Fatalf("ListProjectWindowsContext: %v", err)
+	}
+	if windows == nil || len(windows) != 0 {
+		t.Fatalf("windows = %#v, want empty non-nil slice", windows)
+	}
+}
+
+func TestListWindowsContextClassifiesSessionLossDuringMetadataRead(t *testing.T) {
+	oldExecCommandContext := execCommandContext
+	call := 0
+	execCommandContext = func(context.Context, string, ...string) *exec.Cmd {
+		call++
+		if call == 1 {
+			return exec.Command("sh", "-c", "printf '%s' '0\t@0\n'")
+		}
+		return exec.Command("sh", "-c", "printf '%s' 'no such session' >&2; exit 1")
+	}
+	t.Cleanup(func() { execCommandContext = oldExecCommandContext })
+
+	_, err := ListWindowsContext(context.Background(), "ccx-t2")
+	if !errors.Is(err, ErrSessionNotFound) {
+		t.Fatalf("ListWindowsContext error = %v, want ErrSessionNotFound", err)
+	}
+}
+
+func TestValidateProjectShellWindowNames(t *testing.T) {
+	valid := []string{"alpha-shell-1", "alpha-shell-99"}
+	for _, name := range valid {
+		if err := ValidateProjectShellWindowName("alpha", name); err != nil {
+			t.Errorf("ValidateProjectShellWindowName(%q): %v", name, err)
+		}
+	}
+	invalid := []string{"", "alpha shell-1", "beta-shell-1", "alpha-worker-1", "-alpha-shell-1", "alpha-shell-", "alpha-shell-foo", "alpha-shell-1-extra", "alpha-shell-01", "alpha-shell-0"}
+	for _, name := range invalid {
+		if err := ValidateProjectShellWindowName("alpha", name); err == nil {
+			t.Errorf("ValidateProjectShellWindowName(%q) = nil, want error", name)
+		}
+	}
+	if err := ValidateWindowPrefix("alpha"); err == nil {
+		t.Fatal("ValidateWindowPrefix without separator = nil, want error")
+	}
+}
+
+func TestCreateProjectShellWindowContextChoosesDeterministicFreeName(t *testing.T) {
+	ctx := context.WithValue(context.Background(), tmuxTestContextKey{}, "marker")
+	var gotContexts []context.Context
+	var gotArgs [][]string
+	oldExecCommandContext := execCommandContext
+	execCommandContext = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		gotContexts = append(gotContexts, ctx)
+		gotArgs = append(gotArgs, append([]string(nil), args...))
+		var output string
+		switch len(gotArgs) {
+		case 1:
+			output = "0\t@0\n1\t@1\n"
+		case 2:
+			output = "@0\n"
+		case 3:
+			output = "alpha-shell-1\n"
+		case 4:
+			output = "/repo with spaces\n"
+		case 5:
+			output = "bash\n"
+		case 6:
+			output = "@0\n"
+		case 7:
+			output = "@1\n"
+		case 8:
+			output = "alpha-shell-3\n"
+		case 9:
+			output = "/repo with spaces\n"
+		case 10:
+			output = "zsh\n"
+		case 11:
+			output = "@1\n"
+		default:
+			return exec.Command("sh", "-c", "true")
+		}
+		return exec.Command("sh", "-c", "printf '%s' \"$1\"", "sh", output)
+	}
+	t.Cleanup(func() { execCommandContext = oldExecCommandContext })
+
+	window, err := CreateProjectShellWindowContext(ctx, "ccx-t2", "alpha", "/repo with spaces/$HOME")
+	if err != nil {
+		t.Fatalf("CreateProjectShellWindowContext: %v", err)
+	}
+	if window.Name != "alpha-shell-2" || window.CurrentPath != "/repo with spaces/$HOME" {
+		t.Fatalf("window = %#v, want alpha-shell-2 with exact repository path", window)
+	}
+	wantCreateArgs := []string{"new-window", "-t", "ccx-t2:", "-n", "alpha-shell-2", "-c", "/repo with spaces/$HOME"}
+	if !reflect.DeepEqual(gotArgs[11], wantCreateArgs) {
+		t.Fatalf("create args = %#v, want %#v", gotArgs[11], wantCreateArgs)
+	}
+	for i, gotCtx := range gotContexts {
+		if gotCtx != ctx {
+			t.Fatalf("command %d context was not propagated", i)
+		}
+	}
+}
+
+func TestCreateProjectShellWindowContextStartsInteractiveShellInRepository(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skipf("tmux not installed: %v", err)
+	}
+	session := "ccx-tmux-project-shell-" + strings.ReplaceAll(time.Now().Format("150405.000000000"), ".", "")
+	repoPath := t.TempDir()
+	if err := exec.Command("tmux", "new-session", "-d", "-s", session, "-n", "alpha-orchestrator", "-c", repoPath).Run(); err != nil {
+		t.Fatalf("create test session: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = exec.Command("tmux", "kill-session", "-t", session).Run()
+	})
+
+	created, err := CreateProjectShellWindowContext(context.Background(), session, "alpha", repoPath)
+	if err != nil {
+		t.Fatalf("CreateProjectShellWindowContext: %v", err)
+	}
+	windows, err := ListWindowsContext(context.Background(), session)
+	if err != nil {
+		t.Fatalf("ListWindowsContext: %v", err)
+	}
+	var found WindowInfo
+	for _, window := range windows {
+		if window.Name == created.Name {
+			found = window
+			break
+		}
+	}
+	if found.Name == "" {
+		t.Fatalf("created window %q not found in %#v", created.Name, windows)
+	}
+	wantPath, err := filepath.EvalSymlinks(repoPath)
+	if err != nil {
+		t.Fatalf("resolve repository path: %v", err)
+	}
+	gotPath, err := filepath.EvalSymlinks(found.CurrentPath)
+	if err != nil {
+		t.Fatalf("resolve tmux pane path %q: %v", found.CurrentPath, err)
+	}
+	if gotPath != wantPath {
+		t.Fatalf("pane cwd = %q, want %q", gotPath, wantPath)
+	}
+	if found.CurrentCommand == "" {
+		t.Fatal("created window has no current interactive command")
+	}
+}
+
+func TestCreateProjectShellWindowContextRejectsCanceledContextBeforeTmux(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	oldExecCommandContext := execCommandContext
+	called := false
+	execCommandContext = func(context.Context, string, ...string) *exec.Cmd {
+		called = true
+		return exec.Command("sh", "-c", "true")
+	}
+	t.Cleanup(func() { execCommandContext = oldExecCommandContext })
+
+	_, err := CreateProjectShellWindowContext(ctx, "ccx-t2", "alpha", "/repo")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("CreateProjectShellWindowContext error = %v, want context.Canceled", err)
+	}
+	if called {
+		t.Fatal("tmux command was started after context cancellation")
+	}
+}
+
+func TestCreateProjectWindowContextRejectsForeignNameBeforeTmux(t *testing.T) {
+	oldExecCommandContext := execCommandContext
+	called := false
+	execCommandContext = func(context.Context, string, ...string) *exec.Cmd {
+		called = true
+		return exec.Command("sh", "-c", "true")
+	}
+	t.Cleanup(func() { execCommandContext = oldExecCommandContext })
+
+	err := CreateProjectWindowContext(context.Background(), "ccx-t2", "alpha", "beta-shell-1", "/repo")
+	if !errors.Is(err, ErrInvalidWindowPrefix) {
+		t.Fatalf("CreateProjectWindowContext error = %v, want ErrInvalidWindowPrefix", err)
+	}
+	if called {
+		t.Fatal("tmux command was started for a foreign project window")
+	}
+}
 
 func TestCreateWindowContextUsesCommandContext(t *testing.T) {
 	ctx := context.WithValue(context.Background(), tmuxTestContextKey{}, "marker")
