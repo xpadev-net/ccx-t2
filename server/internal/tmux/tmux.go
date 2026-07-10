@@ -318,17 +318,17 @@ func createProjectWindowContext(ctx context.Context, session, windowName, repoPa
 			verified, ok, verifyErr = findPendingWindowContextWithRecovery(ctx, session, pendingName, repoPath, before, windowID)
 		}
 		if verifyErr != nil {
-			cleanupCreatedWindow(windowID)
+			_ = cleanupCreatedWindow(windowID)
 			return WindowInfo{}, verifyErr
 		}
 		if !ok {
-			cleanupCreatedWindow(windowID)
+			_ = cleanupCreatedWindow(windowID)
 			return WindowInfo{}, fmt.Errorf("created pending tmux window %q could not be verified", pendingName)
 		}
 		windowID = verified.ID
 	}
 	if err := markProjectWindowContext(ctx, windowID, pendingName); err != nil {
-		cleanupCreatedWindow(windowID)
+		_ = cleanupCreatedWindow(windowID)
 		return WindowInfo{}, err
 	}
 	return renameProjectWindowContext(ctx, session, windowID, pendingName, windowName, repoPath, before)
@@ -399,24 +399,39 @@ func renameProjectWindowContext(ctx context.Context, session, windowID, pendingN
 	if renameErr != nil {
 		if reconciled, ok, reconcileErr := reconcileRenamedWindowContext(ctx, session, windowID, windowName, pendingName, repoPath, before); ok {
 			return reconciled, nil
-		} else if reconcileErr != nil && errors.Is(reconcileErr, errProjectWindowNameUnresolved) {
+		} else if reconcileErr != nil && (errors.Is(reconcileErr, errProjectWindowNameUnresolved) || errors.Is(reconcileErr, ErrWindowNameTaken)) {
 			return WindowInfo{}, reconcileErr
 		}
-		cleanupCreatedWindow(windowID)
-		return WindowInfo{}, renameErr
+		return WindowInfo{}, cleanupAfterRenameFailure(ctx, session, windowID, pendingName, windowName, repoPath, renameErr)
 	}
 	verified, verifyErr := verifyRenamedWindowContext(ctx, session, windowID, windowName, pendingName, repoPath, before)
 	if verifyErr != nil {
-		if !errors.Is(verifyErr, errProjectWindowNameUnresolved) {
-			cleanupCreatedWindow(windowID)
+		if errors.Is(verifyErr, errProjectWindowNameUnresolved) || errors.Is(verifyErr, ErrWindowNameTaken) {
+			return WindowInfo{}, verifyErr
 		}
-		return WindowInfo{}, verifyErr
+		return WindowInfo{}, cleanupAfterRenameFailure(ctx, session, windowID, pendingName, windowName, repoPath, verifyErr)
 	}
 	if verified.Name == pendingName {
-		cleanupCreatedWindow(windowID)
-		return WindowInfo{}, fmt.Errorf("tmux window %q was not renamed", windowName)
+		return WindowInfo{}, cleanupAfterRenameFailure(ctx, session, windowID, pendingName, windowName, repoPath, fmt.Errorf("tmux window %q was not renamed", windowName))
 	}
 	return verified, nil
+}
+
+func cleanupAfterRenameFailure(ctx context.Context, session, windowID, pendingName, windowName, repoPath string, cause error) error {
+	windows, listErr := listWindowsForRecovery(ctx, session)
+	if listErr != nil {
+		cause = fmt.Errorf("%w; current window state unavailable: %v", cause, listErr)
+		windows = nil
+	} else {
+		requested := windows[:0]
+		for _, window := range windows {
+			if window.Name == windowName {
+				requested = append(requested, window)
+			}
+		}
+		windows = requested
+	}
+	return resolutionRollbackError(ctx, session, windowID, pendingName, repoPath, windows, windowName, cause)
 }
 
 func reconcileRenamedWindowContext(ctx context.Context, session, windowID, windowName, attemptMarker, repoPath string, before []WindowInfo) (WindowInfo, bool, error) {
@@ -446,24 +461,20 @@ func verifyRenamedWindowContext(ctx context.Context, session, windowID, windowNa
 		knownIDs := windowNameSetByID(before)
 		for _, window := range requested {
 			if _, known := knownIDs[window.ID]; known {
-				cleanupCreatedWindow(windowID)
-				return WindowInfo{}, fmt.Errorf("%w: %s", ErrWindowNameTaken, windowName)
+				return WindowInfo{}, resolutionRollbackError(ctx, session, windowID, attemptMarker, repoPath, requested, windowName, fmt.Errorf("%w: %s", ErrWindowNameTaken, windowName))
 			}
 		}
-		sort.Slice(requested, func(i, j int) bool { return requested[i].ID < requested[j].ID })
+		sort.Slice(requested, func(i, j int) bool { return windowIDLess(requested[i].ID, requested[j].ID) })
 		if requested[0].ID != windowID {
-			cleanupCreatedWindow(windowID)
-			return WindowInfo{}, fmt.Errorf("%w: %s", ErrWindowNameTaken, windowName)
+			return WindowInfo{}, resolutionRollbackError(ctx, session, windowID, attemptMarker, repoPath, requested, windowName, fmt.Errorf("%w: %s", ErrWindowNameTaken, windowName))
 		}
 		for _, duplicate := range requested[1:] {
 			if !isProjectCreationMarker(duplicate.CreationMarker) {
-				cleanupCreatedWindow(windowID)
-				return WindowInfo{}, fmt.Errorf("%w: %s", ErrWindowNameTaken, windowName)
+				return WindowInfo{}, resolutionRollbackError(ctx, session, windowID, attemptMarker, repoPath, requested, windowName, fmt.Errorf("%w: %s", ErrWindowNameTaken, windowName))
 			}
 		}
 		if own.CreationMarker != attemptMarker {
-			cleanupCreatedWindow(windowID)
-			return WindowInfo{}, fmt.Errorf("created tmux window %q lost its ownership marker", windowName)
+			return WindowInfo{}, resolutionRollbackError(ctx, session, windowID, attemptMarker, repoPath, requested, windowName, fmt.Errorf("created tmux window %q lost its ownership marker", windowName))
 		}
 		return waitForSoleRenamedWindow(ctx, session, windowID, windowName, attemptMarker, repoPath)
 	}
@@ -513,9 +524,9 @@ func resolutionRollbackError(ctx context.Context, session, windowID, pendingName
 	if rollbackErr := rollbackProjectWindows(ctx, session, windowID, requested); rollbackErr == nil {
 		return fmt.Errorf("%w: created tmux window %q did not converge: %w", errProjectWindowNameUnresolved, windowName, cause)
 	} else if restoreErr := restorePendingWindowContext(ctx, session, windowID, pendingName, repoPath); restoreErr == nil {
-		return fmt.Errorf("%w: created tmux window %q did not converge; owned window was restored to its unique pending identity: %v", errProjectWindowNameUnresolved, windowName, rollbackErr)
+		return fmt.Errorf("%w: created tmux window %q did not converge; owned window was restored to its unique pending identity: %v: %w", errProjectWindowNameUnresolved, windowName, rollbackErr, cause)
 	} else {
-		return fmt.Errorf("%w: created tmux window %q did not converge and cleanup failed: %v; pending restore failed: %v", errProjectWindowNameUnresolved, windowName, rollbackErr, restoreErr)
+		return fmt.Errorf("%w: created tmux window %q did not converge and cleanup failed: %v; pending restore failed: %v: %w", errProjectWindowNameUnresolved, windowName, rollbackErr, restoreErr, cause)
 	}
 }
 
@@ -593,6 +604,15 @@ func windowNameSetByID(windows []WindowInfo) map[string]struct{} {
 		known[window.ID] = struct{}{}
 	}
 	return known
+}
+
+func windowIDLess(left, right string) bool {
+	leftNumber, leftErr := strconv.Atoi(strings.TrimPrefix(left, "@"))
+	rightNumber, rightErr := strconv.Atoi(strings.TrimPrefix(right, "@"))
+	if leftErr == nil && rightErr == nil {
+		return leftNumber < rightNumber
+	}
+	return left < right
 }
 
 func pathsMatch(left, right string) bool {

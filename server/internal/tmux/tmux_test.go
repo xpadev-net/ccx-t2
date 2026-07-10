@@ -168,6 +168,15 @@ func TestValidateProjectShellWindowNames(t *testing.T) {
 	}
 }
 
+func TestWindowIDOrderingUsesNumericSuffix(t *testing.T) {
+	if !windowIDLess("@2", "@10") {
+		t.Fatal("windowIDLess(@2, @10) = false, want numeric ordering")
+	}
+	if windowIDLess("@10", "@2") {
+		t.Fatal("windowIDLess(@10, @2) = true, want numeric ordering")
+	}
+}
+
 func TestCreateProjectShellWindowContextChoosesDeterministicFreeName(t *testing.T) {
 	ctx := context.WithValue(context.Background(), tmuxTestContextKey{}, "marker")
 	var gotContexts []context.Context
@@ -628,7 +637,7 @@ func TestCreateProjectWindowContextRollsBackWinnerWhenDuplicateDoesNotConverge(t
 	renamed := false
 	rolledBack := false
 	pendingName := ""
-	killedTarget := ""
+	killedOwn := false
 	tmuxOutput := func(output string) *exec.Cmd {
 		return exec.Command("sh", "-c", "printf '%s' \"$1\"", "sh", output)
 	}
@@ -650,9 +659,9 @@ func TestCreateProjectWindowContextRollsBackWinnerWhenDuplicateDoesNotConverge(t
 			renamed = true
 			return exec.Command("sh", "-c", "true")
 		case args[0] == "kill-window":
-			killedTarget = args[2]
-			if killedTarget == "@1" {
+			if args[2] == "@1" {
 				rolledBack = true
+				killedOwn = true
 			}
 			return exec.Command("sh", "-c", "true")
 		case args[0] == "list-windows" && args[len(args)-1] == windowListFormat:
@@ -707,8 +716,8 @@ func TestCreateProjectWindowContextRollsBackWinnerWhenDuplicateDoesNotConverge(t
 	if !errors.Is(err, errProjectWindowNameUnresolved) {
 		t.Fatalf("CreateProjectWindowContext error = %v, want non-convergence error", err)
 	}
-	if killedTarget != "@1" {
-		t.Fatalf("non-converging duplicate cleanup killed %q, want winner @1", killedTarget)
+	if !killedOwn {
+		t.Fatal("non-converging duplicate cleanup did not kill the committed winner")
 	}
 	if err := CreateProjectWindowContext(context.Background(), "ccx-t2", "alpha", "alpha-shell-1", "/repo"); err != nil {
 		t.Fatalf("retry after rollback: %v", err)
