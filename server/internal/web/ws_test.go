@@ -14,15 +14,17 @@ import (
 	"github.com/xpadev/ccx-t2/internal/worker"
 )
 
-func TestWorkerLogWebSocketSnapshotPrecedesQueuedLiveOutput(t *testing.T) {
-	stream := make(chan []byte, 4)
+func TestWorkerLogWebSocketSnapshotBoundaryDiscardsQueuedOverlap(t *testing.T) {
+	stream := make(chan []byte)
 	registry := worker.NewRegistry()
 	registry.Register(worker.Info{WorkerID: "worker-task-001", TaskID: "task-001"})
 	subscribed := make(chan struct{})
 	captureStarted := make(chan struct{})
+	overlapQueued := make(chan struct{})
 	releaseCapture := make(chan struct{})
 
-	server := httptest.NewServer(New(Deps{
+	var handler *Server
+	handler = New(Deps{
 		Config:   testConfig(),
 		Registry: registry,
 		PipeBytes: func(session, window string) (<-chan []byte, func(), error) {
@@ -36,14 +38,88 @@ func TestWorkerLogWebSocketSnapshotPrecedesQueuedLiveOutput(t *testing.T) {
 				return nil, ctx.Err()
 			}
 			close(captureStarted)
-			stream <- []byte("live")
+			stream <- []byte("already in snapshot")
+			if !waitForQueuedSubscriberChunk(handler.tmuxStreams) {
+				return nil, context.DeadlineExceeded
+			}
+			close(overlapQueued)
 			select {
 			case <-releaseCapture:
 			case <-ctx.Done():
 				return nil, ctx.Err()
 			}
-			close(stream)
-			return []byte("snapshot"), nil
+			return []byte("snapshot already in snapshot"), nil
+		},
+		AuthDisabled: true,
+	})
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(server.URL, "/ws/worker/worker-task-001"), nil)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer conn.Close()
+
+	select {
+	case <-captureStarted:
+	case <-time.After(time.Second):
+		t.Fatal("capture did not start after stream subscription")
+	}
+	select {
+	case <-overlapQueued:
+	case <-time.After(time.Second):
+		t.Fatal("overlapping stream output was not queued before snapshot completion")
+	}
+	close(releaseCapture)
+
+	var snapshot wsMessage
+	if err := conn.ReadJSON(&snapshot); err != nil {
+		t.Fatalf("ReadJSON snapshot: %v", err)
+	}
+	if snapshot.Type != "chunk" || snapshot.Data != "snapshot already in snapshot" {
+		t.Fatalf("snapshot = %#v, want snapshot without queued overlap replay", snapshot)
+	}
+	stream <- []byte("after snapshot")
+	var live wsMessage
+	if err := conn.ReadJSON(&live); err != nil {
+		t.Fatalf("ReadJSON post-boundary live: %v", err)
+	}
+	if live.Type != "chunk" || live.Data != "after snapshot" {
+		t.Fatalf("live = %#v, want only post-boundary live output", live)
+	}
+	close(stream)
+	var closed wsMessage
+	if err := conn.ReadJSON(&closed); err != nil {
+		t.Fatalf("ReadJSON closed: %v", err)
+	}
+	if closed.Type != "closed" {
+		t.Fatalf("closed = %#v, want closed", closed)
+	}
+}
+
+func TestWorkerLogWebSocketSlowEvictionSendsReconnectError(t *testing.T) {
+	stream := make(chan []byte)
+	registry := worker.NewRegistry()
+	registry.Register(worker.Info{WorkerID: "worker-task-001", TaskID: "task-001"})
+	captureStarted := make(chan struct{})
+	releaseCapture := make(chan struct{})
+	evictionObserved := make(chan struct{})
+
+	server := httptest.NewServer(New(Deps{
+		Config:   testConfig(),
+		Registry: registry,
+		PipeBytes: func(session, window string) (<-chan []byte, func(), error) {
+			return stream, func() { close(evictionObserved) }, nil
+		},
+		CapturePane: func(ctx context.Context, session, window string) ([]byte, error) {
+			close(captureStarted)
+			select {
+			case <-releaseCapture:
+				return []byte("snapshot"), nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
 		},
 		AuthDisabled: true,
 	}))
@@ -58,30 +134,27 @@ func TestWorkerLogWebSocketSnapshotPrecedesQueuedLiveOutput(t *testing.T) {
 	select {
 	case <-captureStarted:
 	case <-time.After(time.Second):
-		t.Fatal("capture did not start after stream subscription")
+		t.Fatal("capture did not start")
+	}
+	go func() {
+		for i := 0; i < 129; i++ {
+			stream <- []byte("burst")
+		}
+		close(stream)
+	}()
+	select {
+	case <-evictionObserved:
+	case <-time.After(time.Second):
+		t.Fatal("slow-client eviction was not observed")
 	}
 	close(releaseCapture)
 
-	var snapshot wsMessage
-	if err := conn.ReadJSON(&snapshot); err != nil {
-		t.Fatalf("ReadJSON snapshot: %v", err)
+	var msg wsMessage
+	if err := conn.ReadJSON(&msg); err != nil {
+		t.Fatalf("ReadJSON slow eviction: %v", err)
 	}
-	if snapshot.Type != "chunk" || snapshot.Data != "snapshot" {
-		t.Fatalf("snapshot = %#v, want snapshot chunk before live output", snapshot)
-	}
-	var live wsMessage
-	if err := conn.ReadJSON(&live); err != nil {
-		t.Fatalf("ReadJSON live: %v", err)
-	}
-	if live.Type != "chunk" || live.Data != "live" {
-		t.Fatalf("live = %#v, want queued live chunk after snapshot", live)
-	}
-	var closed wsMessage
-	if err := conn.ReadJSON(&closed); err != nil {
-		t.Fatalf("ReadJSON closed: %v", err)
-	}
-	if closed.Type != "closed" {
-		t.Fatalf("closed = %#v, want closed", closed)
+	if msg.Type != "error" || msg.Data != "log stream fell behind; reconnecting" {
+		t.Fatalf("slow eviction message = %#v, want deterministic reconnect error", msg)
 	}
 }
 
@@ -149,6 +222,27 @@ func TestTmuxSharedStreamSignalsSlowSubscriberWithoutStarvingHealthySubscriber(t
 	case <-time.After(time.Second):
 		t.Fatal("shared pipe cleanup was not called")
 	}
+}
+
+func waitForQueuedSubscriberChunk(registry *tmuxStreamRegistry) bool {
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		registry.mu.Lock()
+		for _, stream := range registry.streams {
+			for subscriber := range stream.subscribers {
+				subscriber.mu.Lock()
+				queued := len(subscriber.chunks)
+				subscriber.mu.Unlock()
+				if queued > 0 {
+					registry.mu.Unlock()
+					return true
+				}
+			}
+		}
+		registry.mu.Unlock()
+		time.Sleep(time.Millisecond)
+	}
+	return false
 }
 
 func TestWSWriterSerializesConcurrentMessagesAndPing(t *testing.T) {

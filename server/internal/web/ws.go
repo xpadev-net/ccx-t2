@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -175,13 +176,98 @@ type tmuxSharedStream struct {
 }
 
 type tmuxSubscriber struct {
-	chunks chan []byte
-	slow   chan struct{}
+	mu              sync.Mutex
+	chunks          chan []byte
+	slow            chan struct{}
+	closed          bool
+	slowEvicted     bool
+	snapshotPending atomic.Bool
 }
 
 type tmuxStreamSubscription struct {
-	chunks <-chan []byte
-	slow   <-chan struct{}
+	chunks         <-chan []byte
+	slow           <-chan struct{}
+	beginSnapshot  func()
+	finishSnapshot func() bool
+}
+
+func (s *tmuxSubscriber) beginSnapshot() {
+	s.snapshotPending.Store(true)
+}
+
+func (s *tmuxSubscriber) deliver(chunk []byte) bool {
+	pending := s.snapshotPending.Load()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return false
+	}
+	if pending && !s.snapshotPending.Load() {
+		return false
+	}
+	select {
+	case s.chunks <- chunk:
+		return false
+	default:
+		s.closed = true
+		s.slowEvicted = true
+		close(s.slow)
+		close(s.chunks)
+		return true
+	}
+}
+
+func (s *tmuxSubscriber) closeNormally() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return
+	}
+	s.closed = true
+	close(s.chunks)
+}
+
+func (s *tmuxSubscriber) finishSnapshot() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.slowEvicted {
+		s.snapshotPending.Store(false)
+		return false
+	}
+	for {
+		select {
+		case _, ok := <-s.chunks:
+			if !ok {
+				s.snapshotPending.Store(false)
+				return true
+			}
+		default:
+			s.snapshotPending.Store(false)
+			return true
+		}
+	}
+}
+
+func (s *tmuxStreamSubscription) establishSnapshotBoundary() bool {
+	if s.finishSnapshot == nil {
+		return true
+	}
+	return s.finishSnapshot()
+}
+
+func (s *tmuxStreamSubscription) startSnapshot() {
+	if s.beginSnapshot != nil {
+		s.beginSnapshot()
+	}
+}
+
+func (s *tmuxStreamSubscription) wasSlowEvicted() bool {
+	select {
+	case <-s.slow:
+		return true
+	default:
+		return false
+	}
 }
 
 type orchestratorStartLocks struct {
@@ -473,11 +559,16 @@ func (s *Server) handleTmuxLogWS(w http.ResponseWriter, r *http.Request, window,
 	go handleTmuxClientMessages(ctx, conn, session, window, s.sendRawKeys, s.resizePane, cancel)
 
 	if s.capturePane != nil {
+		subscription.startSnapshot()
 		captureCtx, captureCancel := context.WithTimeout(ctx, followupTmuxOperationTimeout)
 		snapshot, err := s.capturePane(captureCtx, session, window)
 		captureCancel()
 		if err != nil {
 			_ = writer.send(ctx, wsMessage{Type: "error", Data: "capture " + label + " pane"})
+			return
+		}
+		if !subscription.establishSnapshotBoundary() {
+			_ = writer.send(ctx, wsMessage{Type: "error", Data: "log stream fell behind; reconnecting"})
 			return
 		}
 		if len(snapshot) > 0 {
@@ -498,7 +589,11 @@ func (s *Server) handleTmuxLogWS(w http.ResponseWriter, r *http.Request, window,
 			return
 		case chunk, ok := <-subscription.chunks:
 			if !ok {
-				_ = writer.send(ctx, wsMessage{Type: "closed"})
+				if subscription.wasSlowEvicted() {
+					_ = writer.send(ctx, wsMessage{Type: "error", Data: "log stream fell behind; reconnecting"})
+				} else {
+					_ = writer.send(ctx, wsMessage{Type: "closed"})
+				}
 				return
 			}
 			if err := writer.send(ctx, wsMessage{Type: "chunk", Data: string(chunk)}); err != nil {
@@ -735,7 +830,21 @@ func (s *Server) subscribeTmuxStreamWithStatus(session, window string) (*tmuxStr
 		if err != nil {
 			return nil, nil, err
 		}
-		return &tmuxStreamSubscription{chunks: chunks}, cleanup, nil
+		return &tmuxStreamSubscription{
+			chunks: chunks,
+			finishSnapshot: func() bool {
+				for {
+					select {
+					case _, ok := <-chunks:
+						if !ok {
+							return true
+						}
+					default:
+						return true
+					}
+				}
+			},
+		}, cleanup, nil
 	}
 	return s.tmuxStreams.subscribeWithStatus(session+"\x00"+window, session, window, s.pipeBytes)
 }
@@ -749,6 +858,8 @@ func (r *tmuxStreamRegistry) subscribeWithStatus(key, session, window string, pi
 		r.streams = make(map[string]*tmuxSharedStream)
 	}
 	stream := r.streams[key]
+	var streamChunks <-chan []byte
+	startStream := false
 	if stream == nil || stream.closed {
 		chunks, cleanup, err := pipe(session, window)
 		if err != nil {
@@ -761,7 +872,8 @@ func (r *tmuxStreamRegistry) subscribeWithStatus(key, session, window string, pi
 			subscribers: make(map[*tmuxSubscriber]struct{}),
 		}
 		r.streams[key] = stream
-		go r.runStream(stream, chunks)
+		streamChunks = chunks
+		startStream = true
 	}
 	sub := &tmuxSubscriber{
 		chunks: make(chan []byte, 128),
@@ -769,6 +881,9 @@ func (r *tmuxStreamRegistry) subscribeWithStatus(key, session, window string, pi
 	}
 	stream.subscribers[sub] = struct{}{}
 	r.mu.Unlock()
+	if startStream {
+		go r.runStream(stream, streamChunks)
+	}
 
 	var once sync.Once
 	cleanup := func() {
@@ -779,7 +894,7 @@ func (r *tmuxStreamRegistry) subscribeWithStatus(key, session, window string, pi
 			if current == stream && !stream.closed {
 				if _, ok := stream.subscribers[sub]; ok {
 					delete(stream.subscribers, sub)
-					close(sub.chunks)
+					sub.closeNormally()
 				}
 				if len(stream.subscribers) == 0 {
 					stream.closed = true
@@ -793,7 +908,12 @@ func (r *tmuxStreamRegistry) subscribeWithStatus(key, session, window string, pi
 			stream.closePipe()
 		}
 	}
-	return &tmuxStreamSubscription{chunks: sub.chunks, slow: sub.slow}, cleanup, nil
+	return &tmuxStreamSubscription{
+		chunks:         sub.chunks,
+		slow:           sub.slow,
+		beginSnapshot:  sub.beginSnapshot,
+		finishSnapshot: sub.finishSnapshot,
+	}, cleanup, nil
 }
 
 func (r *tmuxStreamRegistry) runStream(stream *tmuxSharedStream, chunks <-chan []byte) {
@@ -806,15 +926,11 @@ func (r *tmuxStreamRegistry) runStream(stream *tmuxSharedStream, chunks <-chan [
 			return
 		}
 		for sub := range stream.subscribers {
-			select {
-			case sub.chunks <- chunk:
-			default:
+			if sub.deliver(chunk) {
 				// Do not drop a terminal chunk and continue a corrupted stream.
 				// Remove only this subscriber so healthy clients keep receiving
 				// the shared pipe and the handler can request a fresh snapshot.
 				delete(stream.subscribers, sub)
-				close(sub.slow)
-				close(sub.chunks)
 				if len(stream.subscribers) == 0 {
 					stream.closed = true
 					delete(r.streams, stream.key)
@@ -837,7 +953,7 @@ func (r *tmuxStreamRegistry) runStream(stream *tmuxSharedStream, chunks <-chan [
 		delete(r.streams, stream.key)
 		stream.closed = true
 		for sub := range stream.subscribers {
-			close(sub.chunks)
+			sub.closeNormally()
 		}
 		stream.subscribers = nil
 	}
