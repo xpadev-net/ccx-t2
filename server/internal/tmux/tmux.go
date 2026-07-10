@@ -252,6 +252,13 @@ func CreateProjectShellWindowContext(ctx context.Context, session, projectSlug, 
 		}
 		created, err := createProjectWindowContext(ctx, session, name, repoPath, windows)
 		if errors.Is(err, ErrWindowNameTaken) {
+			current, listErr := ListWindowsContext(ctx, session)
+			if listErr != nil {
+				return WindowInfo{}, listErr
+			}
+			if recovered, ok := findMarkedProjectShellWindow(current, name, repoPath); ok {
+				return recovered, nil
+			}
 			used[name] = struct{}{}
 			continue
 		}
@@ -486,9 +493,9 @@ func waitForSoleRenamedWindow(ctx context.Context, session, windowID, windowName
 		windows, err := ListWindowsContext(reconcileCtx, session)
 		if err != nil {
 			if reconcileCtx.Err() != nil {
-				return WindowInfo{}, resolutionRollbackError(reconcileCtx, session, windowID, attemptMarker, repoPath, requested, windowName, reconcileCtx.Err())
+				return WindowInfo{}, resolutionRollbackError(reconcileCtx, session, windowID, attemptMarker, repoPath, ownWindowRollback(windowID, attemptMarker), windowName, duplicateResolutionCause(requested, windowID, reconcileCtx.Err()))
 			}
-			return WindowInfo{}, resolutionRollbackError(reconcileCtx, session, windowID, attemptMarker, repoPath, requested, windowName, err)
+			return WindowInfo{}, resolutionRollbackError(reconcileCtx, session, windowID, attemptMarker, repoPath, ownWindowRollback(windowID, attemptMarker), windowName, duplicateResolutionCause(requested, windowID, err))
 		}
 		requested = requested[:0]
 		for _, window := range windows {
@@ -499,17 +506,25 @@ func waitForSoleRenamedWindow(ctx context.Context, session, windowID, windowName
 		if len(requested) == 1 && requested[0].ID == windowID && requested[0].CreationMarker == attemptMarker && pathsMatch(requested[0].CurrentPath, repoPath) {
 			return requested[0], nil
 		}
-		for _, duplicate := range requested {
-			if duplicate.ID != windowID && isProjectCreationMarker(duplicate.CreationMarker) {
-				_ = cleanupCreatedWindowContext(reconcileCtx, duplicate.ID)
-			}
-		}
 		select {
 		case <-reconcileCtx.Done():
-			return WindowInfo{}, resolutionRollbackError(reconcileCtx, session, windowID, attemptMarker, repoPath, requested, windowName, reconcileCtx.Err())
+			return WindowInfo{}, resolutionRollbackError(reconcileCtx, session, windowID, attemptMarker, repoPath, ownWindowRollback(windowID, attemptMarker), windowName, duplicateResolutionCause(requested, windowID, reconcileCtx.Err()))
 		case <-ticker.C:
 		}
 	}
+}
+
+func ownWindowRollback(windowID, marker string) []WindowInfo {
+	return []WindowInfo{{ID: windowID, CreationMarker: marker}}
+}
+
+func duplicateResolutionCause(windows []WindowInfo, ownID string, cause error) error {
+	for _, window := range windows {
+		if window.ID != ownID && isProjectCreationMarker(window.CreationMarker) {
+			return fmt.Errorf("%w: %v", ErrWindowNameTaken, cause)
+		}
+	}
+	return cause
 }
 
 func resolutionRollbackError(ctx context.Context, session, windowID, pendingName, repoPath string, requested []WindowInfo, windowName string, cause error) error {
@@ -708,6 +723,19 @@ func windowNameSet(windows []WindowInfo) map[string]struct{} {
 		used[window.Name] = struct{}{}
 	}
 	return used
+}
+
+func findMarkedProjectShellWindow(windows []WindowInfo, name, repoPath string) (WindowInfo, bool) {
+	exactName := make([]WindowInfo, 0, 1)
+	for _, window := range windows {
+		if window.Name == name {
+			exactName = append(exactName, window)
+		}
+	}
+	if len(exactName) != 1 || !isProjectCreationMarker(exactName[0].CreationMarker) || !pathsMatch(exactName[0].CurrentPath, repoPath) {
+		return WindowInfo{}, false
+	}
+	return exactName[0], true
 }
 
 func isMissingSessionError(err error) bool {

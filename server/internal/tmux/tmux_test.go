@@ -638,6 +638,7 @@ func TestCreateProjectWindowContextRollsBackWinnerWhenDuplicateDoesNotConverge(t
 	rolledBack := false
 	pendingName := ""
 	killedOwn := false
+	killedLoser := false
 	tmuxOutput := func(output string) *exec.Cmd {
 		return exec.Command("sh", "-c", "printf '%s' \"$1\"", "sh", output)
 	}
@@ -662,6 +663,8 @@ func TestCreateProjectWindowContextRollsBackWinnerWhenDuplicateDoesNotConverge(t
 			if args[2] == "@1" {
 				rolledBack = true
 				killedOwn = true
+			} else if args[2] == "@2" {
+				killedLoser = true
 			}
 			return exec.Command("sh", "-c", "true")
 		case args[0] == "list-windows" && args[len(args)-1] == windowListFormat:
@@ -718,6 +721,9 @@ func TestCreateProjectWindowContextRollsBackWinnerWhenDuplicateDoesNotConverge(t
 	}
 	if !killedOwn {
 		t.Fatal("non-converging duplicate cleanup did not kill the committed winner")
+	}
+	if killedLoser {
+		t.Fatal("winner rollback killed another creator's marked window")
 	}
 	if err := CreateProjectWindowContext(context.Background(), "ccx-t2", "alpha", "alpha-shell-1", "/repo"); err != nil {
 		t.Fatalf("retry after rollback: %v", err)
