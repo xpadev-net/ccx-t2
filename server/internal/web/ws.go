@@ -9,7 +9,6 @@ import (
 	"net/url"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -176,33 +175,22 @@ type tmuxSharedStream struct {
 }
 
 type tmuxSubscriber struct {
-	mu              sync.Mutex
-	chunks          chan []byte
-	slow            chan struct{}
-	closed          bool
-	slowEvicted     bool
-	snapshotPending atomic.Bool
+	mu          sync.Mutex
+	chunks      chan []byte
+	slow        chan struct{}
+	closed      bool
+	slowEvicted bool
 }
 
 type tmuxStreamSubscription struct {
-	chunks         <-chan []byte
-	slow           <-chan struct{}
-	beginSnapshot  func()
-	finishSnapshot func() bool
-}
-
-func (s *tmuxSubscriber) beginSnapshot() {
-	s.snapshotPending.Store(true)
+	chunks <-chan []byte
+	slow   <-chan struct{}
 }
 
 func (s *tmuxSubscriber) deliver(chunk []byte) bool {
-	pending := s.snapshotPending.Load()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
-		return false
-	}
-	if pending && !s.snapshotPending.Load() {
 		return false
 	}
 	select {
@@ -225,40 +213,6 @@ func (s *tmuxSubscriber) closeNormally() {
 	}
 	s.closed = true
 	close(s.chunks)
-}
-
-func (s *tmuxSubscriber) finishSnapshot() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.slowEvicted {
-		s.snapshotPending.Store(false)
-		return false
-	}
-	for {
-		select {
-		case _, ok := <-s.chunks:
-			if !ok {
-				s.snapshotPending.Store(false)
-				return true
-			}
-		default:
-			s.snapshotPending.Store(false)
-			return true
-		}
-	}
-}
-
-func (s *tmuxStreamSubscription) establishSnapshotBoundary() bool {
-	if s.finishSnapshot == nil {
-		return true
-	}
-	return s.finishSnapshot()
-}
-
-func (s *tmuxStreamSubscription) startSnapshot() {
-	if s.beginSnapshot != nil {
-		s.beginSnapshot()
-	}
 }
 
 func (s *tmuxStreamSubscription) wasSlowEvicted() bool {
@@ -550,6 +504,17 @@ func (s *Server) handleTmuxLogWS(w http.ResponseWriter, r *http.Request, window,
 	writer := newWSWriter(ctx, conn, cancel)
 	defer writer.close()
 
+	var snapshot []byte
+	if s.capturePane != nil {
+		captureCtx, captureCancel := context.WithTimeout(ctx, followupTmuxOperationTimeout)
+		var err error
+		snapshot, err = s.capturePane(captureCtx, session, window)
+		captureCancel()
+		if err != nil {
+			_ = writer.send(ctx, wsMessage{Type: "error", Data: "capture " + label + " pane"})
+			return
+		}
+	}
 	subscription, cleanup, err := s.subscribeTmuxStreamWithStatus(session, window)
 	if err != nil {
 		_ = writer.send(ctx, wsMessage{Type: "error", Data: "open " + label + " log stream"})
@@ -558,23 +523,9 @@ func (s *Server) handleTmuxLogWS(w http.ResponseWriter, r *http.Request, window,
 	defer cleanup()
 	go handleTmuxClientMessages(ctx, conn, session, window, s.sendRawKeys, s.resizePane, cancel)
 
-	if s.capturePane != nil {
-		subscription.startSnapshot()
-		captureCtx, captureCancel := context.WithTimeout(ctx, followupTmuxOperationTimeout)
-		snapshot, err := s.capturePane(captureCtx, session, window)
-		captureCancel()
-		if err != nil {
-			_ = writer.send(ctx, wsMessage{Type: "error", Data: "capture " + label + " pane"})
+	if len(snapshot) > 0 {
+		if err := writer.send(ctx, wsMessage{Type: "chunk", Data: string(snapshot)}); err != nil {
 			return
-		}
-		if !subscription.establishSnapshotBoundary() {
-			_ = writer.send(ctx, wsMessage{Type: "error", Data: "log stream fell behind; reconnecting"})
-			return
-		}
-		if len(snapshot) > 0 {
-			if err := writer.send(ctx, wsMessage{Type: "chunk", Data: string(snapshot)}); err != nil {
-				return
-			}
 		}
 	}
 	for {
@@ -830,21 +781,7 @@ func (s *Server) subscribeTmuxStreamWithStatus(session, window string) (*tmuxStr
 		if err != nil {
 			return nil, nil, err
 		}
-		return &tmuxStreamSubscription{
-			chunks: chunks,
-			finishSnapshot: func() bool {
-				for {
-					select {
-					case _, ok := <-chunks:
-						if !ok {
-							return true
-						}
-					default:
-						return true
-					}
-				}
-			},
-		}, cleanup, nil
+		return &tmuxStreamSubscription{chunks: chunks}, cleanup, nil
 	}
 	return s.tmuxStreams.subscribeWithStatus(session+"\x00"+window, session, window, s.pipeBytes)
 }
@@ -908,12 +845,7 @@ func (r *tmuxStreamRegistry) subscribeWithStatus(key, session, window string, pi
 			stream.closePipe()
 		}
 	}
-	return &tmuxStreamSubscription{
-		chunks:         sub.chunks,
-		slow:           sub.slow,
-		beginSnapshot:  sub.beginSnapshot,
-		finishSnapshot: sub.finishSnapshot,
-	}, cleanup, nil
+	return &tmuxStreamSubscription{chunks: sub.chunks, slow: sub.slow}, cleanup, nil
 }
 
 func (r *tmuxStreamRegistry) runStream(stream *tmuxSharedStream, chunks <-chan []byte) {
@@ -929,7 +861,7 @@ func (r *tmuxStreamRegistry) runStream(stream *tmuxSharedStream, chunks <-chan [
 			if sub.deliver(chunk) {
 				// Do not drop a terminal chunk and continue a corrupted stream.
 				// Remove only this subscriber so healthy clients keep receiving
-				// the shared pipe and the handler can request a fresh snapshot.
+				// the shared pipe and the handler can request a fresh stream.
 				delete(stream.subscribers, sub)
 				if len(stream.subscribers) == 0 {
 					stream.closed = true
