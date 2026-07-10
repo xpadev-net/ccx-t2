@@ -77,7 +77,7 @@
     detail: `$deep-review`, independent subagent review, and `gh-review-hook` exit 0 before merge-ready report.
 
 ### Task_2: reliable terminal WebSocket transport
-- status: in_progress
+- status: split_in_progress
 - type: impl
 - branch: `codex/webshell-ws-stability`
 - thread: `019f4d7d-a6b5-71f1-acda-e0e404f28bfb`
@@ -115,6 +115,88 @@
     owner: worker
     detail: `$deep-review`, independent subagent review, and `gh-review-hook` exit 0 before merge-ready report.
 
+#### Split decision
+- Keep the accepted writer serialization, ping/pong deadlines, cleanup, shared-stream fanout, bounded backpressure, healthy-subscriber isolation, and deterministic slow-client reconnect behavior in Task_8 / PR #66.
+- Move the unprovable snapshot/live handoff into Task_9 because the existing independent `PipeBytesFunc` and `CapturePaneFunc` expose no watermark or atomic boundary.
+- Task_2 is complete only when both Task_8 and Task_9 are merged and validated.
+
+### Task_8: mergeable WebSocket transport stability subset
+- status: in_progress
+- type: impl
+- branch: `codex/webshell-ws-stability`
+- thread: `019f4d7d-a6b5-71f1-acda-e0e404f28bfb`
+- pr: `https://github.com/xpadev-net/ccx-t2/pull/66`
+- owns:
+  - `server/internal/web/ws.go`
+  - `server/internal/web/ws_test.go`
+- forbidden:
+  - `server/internal/web/server.go`
+  - `server/internal/web/server_test.go`
+  - `server/internal/tmux/**`
+  - `web/**`
+- depends_on: []
+- implementation detail:
+  - Retain serialized websocket JSON/ping writes, pong/read deadlines, idempotent cleanup, shared single-pipe fanout, bounded per-subscriber backpressure, healthy-subscriber isolation, and explicit slow-client reconnect/error behavior.
+  - Remove `snapshotPending` / begin-finish snapshot / queue-drain heuristics and their invalid overlap test.
+  - Restore the pre-existing capture-before-subscribe sequence so this PR does not introduce duplicates or additional loss; document the existing handoff gap as Task_9 rather than claiming it fixed here.
+- acceptance:
+  - Concurrent writers and pings obey Gorilla's single-writer contract.
+  - Dead peers are reclaimed and idle healthy peers remain connected.
+  - Slow subscribers are explicitly disconnected for resync without corrupting healthy subscribers.
+  - No heuristic snapshot queue drain remains and the PR description does not claim no-gap/no-duplicate attachment.
+- validation:
+  - kind: command
+    required: true
+    owner: worker
+    detail: `cd server && go test ./internal/web && go test -race ./internal/web && go vet ./internal/web`
+  - kind: command
+    required: true
+    owner: worker
+    detail: focused race-count stress for writer, eviction, healthy-subscriber isolation, and dead-peer cleanup
+  - kind: review
+    required: true
+    owner: reviewer
+    detail: `$deep-review` confirms the reduced PR preserves prior snapshot semantics while improving independent transport lifecycle concerns.
+
+### Task_9: atomic tmux pane attachment and web integration
+- status: waiting
+- type: impl
+- branch: `codex/webshell-atomic-pane-attach`
+- thread: pending
+- owns:
+  - `server/internal/tmux/tmux.go`
+  - `server/internal/tmux/tmux_test.go`
+  - `server/internal/web/server.go`
+  - `server/internal/web/server_test.go`
+  - `server/internal/web/ws.go`
+  - `server/internal/web/ws_test.go`
+- forbidden:
+  - `web/**`
+  - scheduler, MCP, ledger, worker/orchestrator semantics, docs, embedded assets
+- depends_on: [Task_1, Task_8]
+- implementation detail:
+  - Define one tmux-owned pane attachment contract that returns initial terminal state plus an ordered live stream with a formal boundary/watermark.
+  - Implement the boundary using one tmux-side serialized/control-mode transaction or another mechanism that proves every byte is represented exactly once; sequential independent `pipe-pane` and `capture-pane` calls are insufficient.
+  - Wire the atomic attachment through web dependencies and consume it in the terminal websocket without byte comparison or queue-drain guesses.
+- acceptance:
+  - Output before the boundary is represented by the snapshot exactly once.
+  - Output after snapshot sampling but before the attach call returns is delivered live exactly once.
+  - Repeated bytes, arbitrary chunking, ANSI/control sequences, cancellation, slow consumers, and cleanup preserve the boundary contract.
+  - Web handler tests prove no gaps and no duplicates under forced boundary schedules and race stress.
+- validation:
+  - kind: command
+    required: true
+    owner: worker
+    detail: `cd server && go test ./internal/tmux ./internal/web`
+  - kind: command
+    required: true
+    owner: worker
+    detail: `cd server && go test -race ./internal/tmux ./internal/web`
+  - kind: review
+    required: true
+    owner: reviewer
+    detail: Independent review of tmux ordering proof, cancellation, cleanup, realtime semantics, and deterministic boundary tests.
+
 ### Task_3: project terminal REST and generic WS API
 - status: waiting
 - type: impl
@@ -127,7 +209,7 @@
   - `server/internal/web/ws.go`
   - `server/internal/tmux/**`
   - `web/**`
-- depends_on: [Task_1, Task_2]
+- depends_on: [Task_1, Task_8, Task_9]
 - implementation detail:
   - Add project routes for terminal list/create/delete and `/ws/projects/{slug}/terminal/{window}`.
   - Return stable DTO fields: id/window, display title, kind (`shell|orchestrator|worker`), active/available state, and `closable`.
@@ -279,7 +361,8 @@
     detail: Execute the E2E spec using `playwright-cli` and retain screenshots/network/console evidence.
 
 ## Task Waves
-- Wave 1 (parallel): [Task_1, Task_2]
+- Wave 1a (parallel): [Task_1, Task_8]
+- Wave 1b (atomic attachment after both merge): [Task_9]
 - Wave 2 (sequential integration): [Task_3]
 - Wave 3 (sequential): [Task_4]
 - Wave 4 (sequential): [Task_5]
@@ -312,8 +395,10 @@
 - 2026-07-11: User approved execution and requested finer decomposition plus task-pr-orchestrator, separate threads, `luna high`.
 - 2026-07-11: Expanded to seven tasks with file ownership, dependencies, acceptance, validation, PR gates, and E2E spec. Wave 1 pending delegation.
 - 2026-07-11: Wave 1 delegated in separate worktrees using `gpt-5.6-luna` / `high`. Task_1 startup system error received one required resume; Task_2 passed startup stability check.
+- 2026-07-11: Task_2 split after repeated parent deep-review proved the independent snapshot/pipe interfaces cannot establish an atomic no-gap/no-duplicate boundary. PR #66 continues as Task_8 reduced transport stability; Task_9 owns the new tmux attachment contract after Task_1 and Task_8 merge.
 
 ## Decision Log
 - 2026-07-11: WebShell is the product UI; harness/task concepts remain backend-compatible but are removed from primary navigation.
 - 2026-07-11: Split stream reliability from REST routing and tmux primitives to isolate concurrency/security review.
 - 2026-07-11: Serialize frontend client then UI because both establish contracts consumed by `main.tsx`; avoiding parallel integration churn outweighs speed.
+- 2026-07-11: Approved Task_2 decomposition. Rejected further websocket-only queue-drain heuristics because capture sampling and pipe delivery are observationally ambiguous without a tmux-owned watermark.
