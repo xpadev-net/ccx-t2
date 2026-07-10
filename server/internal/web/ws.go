@@ -50,20 +50,116 @@ func pipeLinesAsBytes(pipe PipeOutputFunc) PipeBytesFunc {
 			return nil, nil, err
 		}
 		chunks := make(chan []byte, 128)
+		stop := make(chan struct{})
+		var cleanupOnce sync.Once
 		go func() {
 			defer close(chunks)
 			for line := range lines {
-				chunks <- []byte(line)
+				select {
+				case chunks <- []byte(line):
+				case <-stop:
+					return
+				}
 			}
 		}()
-		return chunks, cleanup, nil
+		return chunks, func() {
+			cleanupOnce.Do(func() {
+				close(stop)
+				if cleanup != nil {
+					cleanup()
+				}
+			})
+		}, nil
 	}
+}
+
+func newWSWriter(ctx context.Context, conn *websocket.Conn, cancel context.CancelFunc) *wsWriter {
+	return newWSWriterWithPingPeriod(ctx, conn, cancel, wsPingPeriod)
+}
+
+func newWSWriterWithPingPeriod(ctx context.Context, conn *websocket.Conn, cancel context.CancelFunc, pingPeriod time.Duration) *wsWriter {
+	writer := &wsWriter{
+		conn:       conn,
+		ctx:        ctx,
+		cancel:     cancel,
+		messages:   make(chan wsMessage, wsWriterBuffer),
+		pingPeriod: pingPeriod,
+		done:       make(chan struct{}),
+	}
+	go writer.run()
+	return writer
+}
+
+func (w *wsWriter) run() {
+	defer close(w.done)
+
+	var ping <-chan time.Time
+	var ticker *time.Ticker
+	if w.pingPeriod > 0 {
+		ticker = time.NewTicker(w.pingPeriod)
+		defer ticker.Stop()
+		ping = ticker.C
+	}
+
+	for {
+		select {
+		case <-w.ctx.Done():
+			return
+		case msg, ok := <-w.messages:
+			if !ok {
+				return
+			}
+			if err := writeWSJSON(w.conn, msg); err != nil {
+				if w.cancel != nil {
+					w.cancel()
+				}
+				return
+			}
+		case <-ping:
+			if err := writeWSPing(w.conn); err != nil {
+				if w.cancel != nil {
+					w.cancel()
+				}
+				return
+			}
+		}
+	}
+}
+
+func (w *wsWriter) send(ctx context.Context, msg wsMessage) error {
+	select {
+	case <-w.done:
+		return errWSWriterClosed
+	case <-ctx.Done():
+		return ctx.Err()
+	case w.messages <- msg:
+		return nil
+	}
+}
+
+func (w *wsWriter) close() {
+	w.closeOnce.Do(func() {
+		close(w.messages)
+	})
+	<-w.done
 }
 
 type ledgerWSClient struct {
 	conn *websocket.Conn
 	send chan wsMessage
 }
+
+type wsWriter struct {
+	conn       *websocket.Conn
+	ctx        context.Context
+	cancel     context.CancelFunc
+	messages   chan wsMessage
+	pingPeriod time.Duration
+	done       chan struct{}
+	closeOnce  sync.Once
+}
+
+var errWSWriterClosed = errors.New("websocket writer is closed")
 
 type tmuxStreamRegistry struct {
 	mu      sync.Mutex
@@ -74,8 +170,18 @@ type tmuxSharedStream struct {
 	key         string
 	cleanup     func()
 	cleanupOnce sync.Once
-	subscribers map[chan []byte]struct{}
+	subscribers map[*tmuxSubscriber]struct{}
 	closed      bool
+}
+
+type tmuxSubscriber struct {
+	chunks chan []byte
+	slow   chan struct{}
+}
+
+type tmuxStreamSubscription struct {
+	chunks <-chan []byte
+	slow   <-chan struct{}
 }
 
 type orchestratorStartLocks struct {
@@ -83,7 +189,12 @@ type orchestratorStartLocks struct {
 	locks map[string]*sync.Mutex
 }
 
-const wsWriteTimeout = 5 * time.Second
+const (
+	wsWriteTimeout = 5 * time.Second
+	wsPongWait     = 60 * time.Second
+	wsPingPeriod   = (wsPongWait * 9) / 10
+	wsWriterBuffer = 128
+)
 
 func (s *Server) handleWorkerLogWS(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -348,40 +459,49 @@ func (s *Server) handleTmuxLogWS(w http.ResponseWriter, r *http.Request, window,
 		return
 	}
 	defer conn.Close()
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+	writer := newWSWriter(ctx, conn, cancel)
+	defer writer.close()
+
+	subscription, cleanup, err := s.subscribeTmuxStreamWithStatus(session, window)
+	if err != nil {
+		_ = writer.send(ctx, wsMessage{Type: "error", Data: "open " + label + " log stream"})
+		return
+	}
+	defer cleanup()
+	go handleTmuxClientMessages(ctx, conn, session, window, s.sendRawKeys, s.resizePane, cancel)
+
 	if s.capturePane != nil {
-		captureCtx, captureCancel := context.WithTimeout(r.Context(), followupTmuxOperationTimeout)
+		captureCtx, captureCancel := context.WithTimeout(ctx, followupTmuxOperationTimeout)
 		snapshot, err := s.capturePane(captureCtx, session, window)
 		captureCancel()
 		if err != nil {
-			_ = writeWSJSON(conn, wsMessage{Type: "error", Data: "capture " + label + " pane"})
+			_ = writer.send(ctx, wsMessage{Type: "error", Data: "capture " + label + " pane"})
 			return
 		}
 		if len(snapshot) > 0 {
-			if err := writeWSJSON(conn, wsMessage{Type: "chunk", Data: string(snapshot)}); err != nil {
+			if err := writer.send(ctx, wsMessage{Type: "chunk", Data: string(snapshot)}); err != nil {
 				return
 			}
 		}
 	}
-	chunks, cleanup, err := s.subscribeTmuxStream(session, window)
-	if err != nil {
-		_ = writeWSJSON(conn, wsMessage{Type: "error", Data: "open " + label + " log stream"})
-		return
-	}
-	defer cleanup()
-
-	ctx, cancel := context.WithCancel(r.Context())
-	defer cancel()
-	go handleTmuxClientMessages(ctx, conn, session, window, s.sendRawKeys, s.resizePane, cancel)
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case chunk, ok := <-chunks:
+		case <-subscription.slow:
+			// The shared pipe has advanced beyond this subscriber's bounded
+			// buffer. Send an explicit resync signal when possible, then close
+			// instead of continuing with a corrupted byte stream.
+			_ = writer.send(ctx, wsMessage{Type: "error", Data: "log stream fell behind; reconnecting"})
+			return
+		case chunk, ok := <-subscription.chunks:
 			if !ok {
-				_ = writeWSJSON(conn, wsMessage{Type: "closed"})
+				_ = writer.send(ctx, wsMessage{Type: "closed"})
 				return
 			}
-			if err := writeWSJSON(conn, wsMessage{Type: "chunk", Data: string(chunk)}); err != nil {
+			if err := writer.send(ctx, wsMessage{Type: "chunk", Data: string(chunk)}); err != nil {
 				return
 			}
 		}
@@ -394,7 +514,9 @@ func handleTmuxClientMessages(ctx context.Context, conn *websocket.Conn, session
 		discardWSReads(ctx, conn, cancel)
 		return
 	}
-	conn.SetReadLimit(maxFollowupMessageBytes)
+	if err := configureWSReader(conn, maxFollowupMessageBytes); err != nil {
+		return
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -403,9 +525,6 @@ func handleTmuxClientMessages(ctx context.Context, conn *websocket.Conn, session
 		}
 		var msg wsMessage
 		if err := conn.ReadJSON(&msg); err != nil {
-			if !errors.Is(err, websocket.ErrCloseSent) {
-				_ = conn.Close()
-			}
 			return
 		}
 		switch msg.Type {
@@ -417,7 +536,6 @@ func handleTmuxClientMessages(ctx context.Context, conn *websocket.Conn, session
 			err := sendRawKeys(sendCtx, session, window, msg.Data)
 			sendCancel()
 			if err != nil {
-				_ = conn.Close()
 				return
 			}
 		case "resize":
@@ -428,7 +546,6 @@ func handleTmuxClientMessages(ctx context.Context, conn *websocket.Conn, session
 			err := resizePane(resizeCtx, session, window, msg.Cols, msg.Rows)
 			resizeCancel()
 			if err != nil {
-				_ = conn.Close()
 				return
 			}
 		default:
@@ -497,9 +614,11 @@ func (s *Server) handleLedgerWSForScope(w http.ResponseWriter, r *http.Request, 
 
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
+	writer := newWSWriter(ctx, conn, cancel)
+	defer writer.close()
 	go discardWSReads(ctx, conn, cancel)
 
-	if err := writeWSJSON(conn, wsMessage{Type: "ready"}); err != nil {
+	if err := writer.send(ctx, wsMessage{Type: "ready"}); err != nil {
 		return
 	}
 	for {
@@ -510,7 +629,7 @@ func (s *Server) handleLedgerWSForScope(w http.ResponseWriter, r *http.Request, 
 			if !ok {
 				return
 			}
-			if err := writeWSJSON(conn, msg); err != nil {
+			if err := writer.send(ctx, msg); err != nil {
 				return
 			}
 		}
@@ -571,8 +690,33 @@ func writeWSJSON(conn *websocket.Conn, msg wsMessage) error {
 	return conn.WriteJSON(msg)
 }
 
+func writeWSPing(conn *websocket.Conn) error {
+	if err := conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout)); err != nil {
+		return err
+	}
+	return conn.WriteMessage(websocket.PingMessage, nil)
+}
+
+func configureWSReader(conn *websocket.Conn, readLimit int64) error {
+	conn.SetReadLimit(readLimit)
+	return configureWSReaderWithWait(conn, wsPongWait)
+}
+
+func configureWSReaderWithWait(conn *websocket.Conn, pongWait time.Duration) error {
+	if err := conn.SetReadDeadline(time.Now().Add(pongWait)); err != nil {
+		return err
+	}
+	conn.SetPongHandler(func(string) error {
+		return conn.SetReadDeadline(time.Now().Add(pongWait))
+	})
+	return nil
+}
+
 func discardWSReads(ctx context.Context, conn *websocket.Conn, cancel context.CancelFunc) {
 	defer cancel()
+	if err := configureWSReader(conn, maxFollowupMessageBytes); err != nil {
+		return
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -580,22 +724,39 @@ func discardWSReads(ctx context.Context, conn *websocket.Conn, cancel context.Ca
 		default:
 		}
 		if _, _, err := conn.NextReader(); err != nil {
-			if !errors.Is(err, websocket.ErrCloseSent) {
-				_ = conn.Close()
-			}
 			return
 		}
 	}
 }
 
 func (s *Server) subscribeTmuxStream(session, window string) (<-chan []byte, func(), error) {
-	if s.tmuxStreams == nil {
-		return s.pipeBytes(session, window)
+	subscription, cleanup, err := s.subscribeTmuxStreamWithStatus(session, window)
+	if err != nil {
+		return nil, nil, err
 	}
-	return s.tmuxStreams.subscribe(session+"\x00"+window, session, window, s.pipeBytes)
+	return subscription.chunks, cleanup, nil
+}
+
+func (s *Server) subscribeTmuxStreamWithStatus(session, window string) (*tmuxStreamSubscription, func(), error) {
+	if s.tmuxStreams == nil {
+		chunks, cleanup, err := s.pipeBytes(session, window)
+		if err != nil {
+			return nil, nil, err
+		}
+		return &tmuxStreamSubscription{chunks: chunks}, cleanup, nil
+	}
+	return s.tmuxStreams.subscribeWithStatus(session+"\x00"+window, session, window, s.pipeBytes)
 }
 
 func (r *tmuxStreamRegistry) subscribe(key, session, window string, pipe PipeBytesFunc) (<-chan []byte, func(), error) {
+	subscription, cleanup, err := r.subscribeWithStatus(key, session, window, pipe)
+	if err != nil {
+		return nil, nil, err
+	}
+	return subscription.chunks, cleanup, nil
+}
+
+func (r *tmuxStreamRegistry) subscribeWithStatus(key, session, window string, pipe PipeBytesFunc) (*tmuxStreamSubscription, func(), error) {
 	if pipe == nil {
 		return nil, nil, errors.New("tmux pipe is not configured")
 	}
@@ -613,63 +774,90 @@ func (r *tmuxStreamRegistry) subscribe(key, session, window string, pipe PipeByt
 		stream = &tmuxSharedStream{
 			key:         key,
 			cleanup:     cleanup,
-			subscribers: make(map[chan []byte]struct{}),
+			subscribers: make(map[*tmuxSubscriber]struct{}),
 		}
 		r.streams[key] = stream
 		go r.runStream(stream, chunks)
 	}
-	sub := make(chan []byte, 128)
+	sub := &tmuxSubscriber{
+		chunks: make(chan []byte, 128),
+		slow:   make(chan struct{}),
+	}
 	stream.subscribers[sub] = struct{}{}
 	r.mu.Unlock()
 
 	var once sync.Once
 	cleanup := func() {
+		var closePipe bool
 		once.Do(func() {
 			r.mu.Lock()
-			defer r.mu.Unlock()
 			current := r.streams[key]
-			if current != stream || stream.closed {
-				return
+			if current == stream && !stream.closed {
+				if _, ok := stream.subscribers[sub]; ok {
+					delete(stream.subscribers, sub)
+					close(sub.chunks)
+				}
+				if len(stream.subscribers) == 0 {
+					stream.closed = true
+					delete(r.streams, key)
+					closePipe = true
+				}
 			}
-			delete(stream.subscribers, sub)
-			if len(stream.subscribers) == 0 {
-				stream.closed = true
-				delete(r.streams, key)
-				stream.closePipe()
-			}
+			r.mu.Unlock()
 		})
+		if closePipe {
+			stream.closePipe()
+		}
 	}
-	return sub, cleanup, nil
+	return &tmuxStreamSubscription{chunks: sub.chunks, slow: sub.slow}, cleanup, nil
 }
 
 func (r *tmuxStreamRegistry) runStream(stream *tmuxSharedStream, chunks <-chan []byte) {
 	defer stream.closePipe()
 	for chunk := range chunks {
+		closePipe := false
 		r.mu.Lock()
-		subs := make([]chan []byte, 0, len(stream.subscribers))
+		if stream.closed {
+			r.mu.Unlock()
+			return
+		}
 		for sub := range stream.subscribers {
-			subs = append(subs, sub)
+			select {
+			case sub.chunks <- chunk:
+			default:
+				// Do not drop a terminal chunk and continue a corrupted stream.
+				// Remove only this subscriber so healthy clients keep receiving
+				// the shared pipe and the handler can request a fresh snapshot.
+				delete(stream.subscribers, sub)
+				close(sub.slow)
+				close(sub.chunks)
+				if len(stream.subscribers) == 0 {
+					stream.closed = true
+					delete(r.streams, stream.key)
+					closePipe = true
+				}
+			}
+			if closePipe {
+				break
+			}
 		}
 		r.mu.Unlock()
-		for _, sub := range subs {
-			select {
-			case sub <- chunk:
-			default:
-				// Keep the shared tmux pipe live even if one browser falls behind.
-			}
+		if closePipe {
+			stream.closePipe()
+			return
 		}
 	}
 
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if current := r.streams[stream.key]; current == stream {
 		delete(r.streams, stream.key)
+		stream.closed = true
+		for sub := range stream.subscribers {
+			close(sub.chunks)
+		}
+		stream.subscribers = nil
 	}
-	stream.closed = true
-	for sub := range stream.subscribers {
-		close(sub)
-	}
-	stream.subscribers = nil
+	r.mu.Unlock()
 }
 
 func (s *tmuxSharedStream) closePipe() {
