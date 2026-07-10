@@ -382,17 +382,17 @@ func findPendingWindowContext(ctx context.Context, session, pendingName, repoPat
 func renameProjectWindowContext(ctx context.Context, session, windowID, pendingName, windowName, repoPath string, before []WindowInfo) (WindowInfo, error) {
 	windows, err := listWindowsForRecovery(ctx, session)
 	if err != nil {
-		cleanupCreatedWindow(windowID)
+		_ = cleanupCreatedWindow(windowID)
 		return WindowInfo{}, err
 	}
 	for _, window := range windows {
 		if window.Name == windowName && window.ID != windowID {
-			cleanupCreatedWindow(windowID)
+			_ = cleanupCreatedWindow(windowID)
 			return WindowInfo{}, fmt.Errorf("%w: %s", ErrWindowNameTaken, windowName)
 		}
 	}
 	if err := ctx.Err(); err != nil {
-		cleanupCreatedWindow(windowID)
+		_ = cleanupCreatedWindow(windowID)
 		return WindowInfo{}, err
 	}
 	renameErr := runCtx(ctx, "tmux", "rename-window", "-t", windowID, windowName)
@@ -418,20 +418,11 @@ func renameProjectWindowContext(ctx context.Context, session, windowID, pendingN
 }
 
 func cleanupAfterRenameFailure(ctx context.Context, session, windowID, pendingName, windowName, repoPath string, cause error) error {
-	windows, listErr := listWindowsForRecovery(ctx, session)
-	if listErr != nil {
-		cause = fmt.Errorf("%w; current window state unavailable: %v", cause, listErr)
-		windows = nil
-	} else {
-		requested := windows[:0]
-		for _, window := range windows {
-			if window.Name == windowName {
-				requested = append(requested, window)
-			}
-		}
-		windows = requested
-	}
-	return resolutionRollbackError(ctx, session, windowID, pendingName, repoPath, windows, windowName, cause)
+	// This path has not established that this attempt won the duplicate race;
+	// only its stable ID may be rolled back. The deterministic winner path is
+	// the sole caller allowed to clean other marker-bearing windows.
+	ownOnly := []WindowInfo{{ID: windowID, CreationMarker: pendingName}}
+	return resolutionRollbackError(ctx, session, windowID, pendingName, repoPath, ownOnly, windowName, cause)
 }
 
 func reconcileRenamedWindowContext(ctx context.Context, session, windowID, windowName, attemptMarker, repoPath string, before []WindowInfo) (WindowInfo, bool, error) {
@@ -458,23 +449,24 @@ func verifyRenamedWindowContext(ctx context.Context, session, windowID, windowNa
 		}
 	}
 	if len(requested) > 1 {
+		ownOnly := []WindowInfo{{ID: windowID, CreationMarker: attemptMarker}}
 		knownIDs := windowNameSetByID(before)
 		for _, window := range requested {
 			if _, known := knownIDs[window.ID]; known {
-				return WindowInfo{}, resolutionRollbackError(ctx, session, windowID, attemptMarker, repoPath, requested, windowName, fmt.Errorf("%w: %s", ErrWindowNameTaken, windowName))
+				return WindowInfo{}, resolutionRollbackError(ctx, session, windowID, attemptMarker, repoPath, ownOnly, windowName, fmt.Errorf("%w: %s", ErrWindowNameTaken, windowName))
 			}
 		}
 		sort.Slice(requested, func(i, j int) bool { return windowIDLess(requested[i].ID, requested[j].ID) })
 		if requested[0].ID != windowID {
-			return WindowInfo{}, resolutionRollbackError(ctx, session, windowID, attemptMarker, repoPath, requested, windowName, fmt.Errorf("%w: %s", ErrWindowNameTaken, windowName))
+			return WindowInfo{}, resolutionRollbackError(ctx, session, windowID, attemptMarker, repoPath, ownOnly, windowName, fmt.Errorf("%w: %s", ErrWindowNameTaken, windowName))
 		}
 		for _, duplicate := range requested[1:] {
 			if !isProjectCreationMarker(duplicate.CreationMarker) {
-				return WindowInfo{}, resolutionRollbackError(ctx, session, windowID, attemptMarker, repoPath, requested, windowName, fmt.Errorf("%w: %s", ErrWindowNameTaken, windowName))
+				return WindowInfo{}, resolutionRollbackError(ctx, session, windowID, attemptMarker, repoPath, ownOnly, windowName, fmt.Errorf("%w: %s", ErrWindowNameTaken, windowName))
 			}
 		}
 		if own.CreationMarker != attemptMarker {
-			return WindowInfo{}, resolutionRollbackError(ctx, session, windowID, attemptMarker, repoPath, requested, windowName, fmt.Errorf("created tmux window %q lost its ownership marker", windowName))
+			return WindowInfo{}, resolutionRollbackError(ctx, session, windowID, attemptMarker, repoPath, ownOnly, windowName, fmt.Errorf("created tmux window %q lost its ownership marker", windowName))
 		}
 		return waitForSoleRenamedWindow(ctx, session, windowID, windowName, attemptMarker, repoPath)
 	}
