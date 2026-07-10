@@ -31,6 +31,7 @@ var (
 	// exists in the target session.
 	ErrWindowNameTaken             = errors.New("tmux window name is already taken")
 	errProjectWindowNameUnresolved = errors.New("project window name did not converge")
+	errProjectWindowRetrySafe      = errors.New("project window rollback was verified")
 )
 
 const (
@@ -256,12 +257,8 @@ func CreateProjectShellWindowContext(ctx context.Context, session, projectSlug, 
 		}
 		created, err := createProjectWindowContext(ctx, session, name, repoPath, windows)
 		if errors.Is(err, ErrWindowNameTaken) {
-			current, listErr := ListWindowsContext(ctx, session)
-			if listErr != nil {
-				return WindowInfo{}, listErr
-			}
-			if recovered, ok := findMarkedProjectShellWindow(current, name, repoPath); ok {
-				return recovered, nil
+			if errors.Is(err, errProjectWindowNameUnresolved) && !errors.Is(err, errProjectWindowRetrySafe) {
+				return WindowInfo{}, err
 			}
 			used[name] = struct{}{}
 			continue
@@ -542,9 +539,9 @@ func duplicateResolutionCause(windows []WindowInfo, ownID string, cause error) e
 
 func resolutionRollbackError(ctx context.Context, session, windowID, pendingName, repoPath string, requested []WindowInfo, windowName string, cause error) error {
 	if rollbackErr := rollbackProjectWindows(ctx, session, windowID, pendingName, repoPath, requested); rollbackErr == nil {
-		return fmt.Errorf("%w: created tmux window %q did not converge: %w", errProjectWindowNameUnresolved, windowName, cause)
+		return fmt.Errorf("%w: %w: created tmux window %q did not converge: %w", errProjectWindowRetrySafe, errProjectWindowNameUnresolved, windowName, cause)
 	} else if restoreErr := restorePendingWindowContext(ctx, session, windowID, pendingName, repoPath); restoreErr == nil {
-		return fmt.Errorf("%w: created tmux window %q did not converge; owned window was restored to its unique pending identity: %v: %w", errProjectWindowNameUnresolved, windowName, rollbackErr, cause)
+		return fmt.Errorf("%w: %w: created tmux window %q did not converge; owned window was restored to its unique pending identity: %v: %w", errProjectWindowRetrySafe, errProjectWindowNameUnresolved, windowName, rollbackErr, cause)
 	} else {
 		return fmt.Errorf("%w: created tmux window %q did not converge and cleanup failed: %v; pending restore failed: %v: %w", errProjectWindowNameUnresolved, windowName, rollbackErr, restoreErr, cause)
 	}
@@ -835,19 +832,6 @@ func windowNameSet(windows []WindowInfo) map[string]struct{} {
 		used[window.Name] = struct{}{}
 	}
 	return used
-}
-
-func findMarkedProjectShellWindow(windows []WindowInfo, name, repoPath string) (WindowInfo, bool) {
-	exactName := make([]WindowInfo, 0, 1)
-	for _, window := range windows {
-		if window.Name == name {
-			exactName = append(exactName, window)
-		}
-	}
-	if len(exactName) != 1 || !isProjectCreationMarker(exactName[0].CreationMarker) || !pathsMatch(exactName[0].CurrentPath, repoPath) {
-		return WindowInfo{}, false
-	}
-	return exactName[0], true
 }
 
 func isMissingSessionError(err error) bool {
