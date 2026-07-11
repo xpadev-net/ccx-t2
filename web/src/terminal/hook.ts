@@ -48,8 +48,8 @@ export function useTerminalController(options: UseTerminalControllerOptions): Us
   }, [controller, options.onData, options.onError, options.onStateChange]);
 
   useEffect(() => {
-    controller.configure(options.projectSlug, options.windowName, options.token ?? "");
-  }, [controller, options.projectSlug, options.token, options.windowName]);
+    controller.updateOptions(options);
+  }, [controller, options]);
 
   useEffect(() => {
     if (!options.autoStart && options.autoStart !== undefined) {

@@ -147,7 +147,8 @@ export function websocketUrl(path: string, token = "", locationLike?: Pick<Locat
   if (baseUrl) {
     const parsed = new URL(baseUrl, location ? `${location.protocol}//${location.host}` : undefined);
     const protocol = parsed.protocol === "https:" ? "wss:" : "ws:";
-    return `${protocol}//${parsed.host}${withToken}`;
+    const basePath = parsed.pathname.replace(/\/$/, "");
+    return `${protocol}//${parsed.host}${basePath}${withToken}`;
   }
   if (!location) {
     return withToken;
@@ -201,7 +202,13 @@ function normalizeOptions(options: ApiOptions): ApiRequestOptions {
 }
 
 function resolveUrl(path: string, baseUrl = ""): string {
-  return baseUrl ? new URL(path, baseUrl).toString() : path;
+  if (!baseUrl) {
+    return path;
+  }
+  const parsed = new URL(baseUrl);
+  const basePath = parsed.pathname.replace(/\/$/, "");
+  const requestPath = path.startsWith("/") ? path : `/${path}`;
+  return new URL(`${basePath}${requestPath}`, parsed.origin).toString();
 }
 
 function currentLocation(): Pick<Location, "protocol" | "host"> | undefined {

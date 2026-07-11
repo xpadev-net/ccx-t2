@@ -108,22 +108,61 @@ function browserWebSocketFactory(url: string): TerminalSocket {
   return new WebSocket(url);
 }
 
+type ResolvedRuntimeOptions = {
+  baseUrl: string;
+  fetcher?: FetchLike;
+  websocketFactory: TerminalSocketFactory;
+  location?: Pick<Location, "protocol" | "host">;
+  timers: TimerApi;
+  random: () => number;
+  retryPolicy: RetryPolicy;
+  stableOpenMs: number;
+  probeTimeoutMs: number;
+  wakeTarget: WakeTarget | null;
+  visibilityTarget: WakeTarget | null;
+  isVisible: () => boolean;
+};
+
+function resolveRuntimeOptions(options: TerminalControllerOptions): ResolvedRuntimeOptions {
+  return {
+    baseUrl: options.baseUrl ?? "",
+    fetcher: options.fetch,
+    websocketFactory: options.websocketFactory ?? browserWebSocketFactory,
+    location: options.location,
+    timers: options.timers ?? browserTimers,
+    random: options.random ?? Math.random,
+    retryPolicy: { ...defaultRetryPolicy, ...options.retry },
+    stableOpenMs: Math.max(0, options.stableOpenMs ?? 10_000),
+    probeTimeoutMs: Math.max(1, options.probeTimeoutMs ?? 5_000),
+    wakeTarget: options.wakeTarget === undefined ? browserWakeTarget() : options.wakeTarget,
+    visibilityTarget: options.visibilityTarget === undefined ? browserVisibilityTarget() : options.visibilityTarget,
+    isVisible: options.isVisible ?? browserVisibility
+  };
+}
+
+function sameLocation(
+  left?: Pick<Location, "protocol" | "host">,
+  right?: Pick<Location, "protocol" | "host">
+): boolean {
+  return left?.protocol === right?.protocol && left?.host === right?.host;
+}
+
 export class TerminalController {
   private projectSlug: string;
   private windowName: string;
   private token: string;
-  private readonly baseUrl: string;
-  private readonly fetcher?: FetchLike;
-  private readonly websocketFactory: TerminalSocketFactory;
-  private readonly location?: Pick<Location, "protocol" | "host">;
-  private readonly timers: TimerApi;
-  private readonly random: () => number;
-  private readonly retryPolicy: RetryPolicy;
-  private readonly stableOpenMs: number;
-  private readonly probeTimeoutMs: number;
-  private readonly wakeTarget: WakeTarget | null;
-  private readonly visibilityTarget: WakeTarget | null;
-  private readonly isVisible: () => boolean;
+  private baseUrl: string;
+  private fetcher?: FetchLike;
+  private websocketFactory: TerminalSocketFactory;
+  private location?: Pick<Location, "protocol" | "host">;
+  private timers: TimerApi;
+  private random: () => number;
+  private retryPolicy: RetryPolicy;
+  private stableOpenMs: number;
+  private probeTimeoutMs: number;
+  private wakeTarget: WakeTarget | null;
+  private visibilityTarget: WakeTarget | null;
+  private isVisible: () => boolean;
   private callbacks: TerminalControllerCallbacks;
   private state: TerminalState = { phase: "idle", detail: "Terminal is idle." };
   private readonly listeners = new Set<() => void>();
@@ -143,18 +182,19 @@ export class TerminalController {
     this.projectSlug = options.projectSlug;
     this.windowName = options.windowName;
     this.token = options.token ?? "";
-    this.baseUrl = options.baseUrl ?? "";
-    this.fetcher = options.fetch;
-    this.websocketFactory = options.websocketFactory ?? browserWebSocketFactory;
-    this.location = options.location;
-    this.timers = options.timers ?? browserTimers;
-    this.random = options.random ?? Math.random;
-    this.retryPolicy = { ...defaultRetryPolicy, ...options.retry };
-    this.stableOpenMs = Math.max(0, options.stableOpenMs ?? 10_000);
-    this.probeTimeoutMs = Math.max(1, options.probeTimeoutMs ?? 5_000);
-    this.wakeTarget = options.wakeTarget === undefined ? browserWakeTarget() : options.wakeTarget;
-    this.visibilityTarget = options.visibilityTarget === undefined ? browserVisibilityTarget() : options.visibilityTarget;
-    this.isVisible = options.isVisible ?? browserVisibility;
+    const runtime = resolveRuntimeOptions(options);
+    this.baseUrl = runtime.baseUrl;
+    this.fetcher = runtime.fetcher;
+    this.websocketFactory = runtime.websocketFactory;
+    this.location = runtime.location;
+    this.timers = runtime.timers;
+    this.random = runtime.random;
+    this.retryPolicy = runtime.retryPolicy;
+    this.stableOpenMs = runtime.stableOpenMs;
+    this.probeTimeoutMs = runtime.probeTimeoutMs;
+    this.wakeTarget = runtime.wakeTarget;
+    this.visibilityTarget = runtime.visibilityTarget;
+    this.isVisible = runtime.isVisible;
     this.callbacks = options.callbacks ?? {};
   }
 
@@ -175,6 +215,41 @@ export class TerminalController {
 
   setCallbacks(callbacks: TerminalControllerCallbacks): void {
     this.callbacks = callbacks;
+  }
+
+  updateOptions(options: TerminalControllerOptions): void {
+    const nextRuntime = resolveRuntimeOptions(options);
+    const targetChanged = this.projectSlug !== options.projectSlug ||
+      this.windowName !== options.windowName || this.token !== (options.token ?? "");
+    const runtimeChanged = !this.runtimeMatches(nextRuntime);
+    if (!targetChanged && !runtimeChanged) {
+      return;
+    }
+    if (this.started) {
+      this.removeWakeListeners();
+    }
+    this.invalidateGeneration();
+    this.projectSlug = options.projectSlug;
+    this.windowName = options.windowName;
+    this.token = options.token ?? "";
+    this.baseUrl = nextRuntime.baseUrl;
+    this.fetcher = nextRuntime.fetcher;
+    this.websocketFactory = nextRuntime.websocketFactory;
+    this.location = nextRuntime.location;
+    this.timers = nextRuntime.timers;
+    this.random = nextRuntime.random;
+    this.retryPolicy = nextRuntime.retryPolicy;
+    this.stableOpenMs = nextRuntime.stableOpenMs;
+    this.probeTimeoutMs = nextRuntime.probeTimeoutMs;
+    this.wakeTarget = nextRuntime.wakeTarget;
+    this.visibilityTarget = nextRuntime.visibilityTarget;
+    this.isVisible = nextRuntime.isVisible;
+    if (!this.started || !this.hasTarget()) {
+      this.setState({ phase: "idle", detail: this.hasTarget() ? "Terminal is idle." : "Select a terminal." });
+      return;
+    }
+    this.installWakeListeners();
+    this.connect(this.generation);
   }
 
   configure(projectSlug: string, windowName: string, token = ""): void {
@@ -251,6 +326,16 @@ export class TerminalController {
 
   private hasTarget(): boolean {
     return this.projectSlug.trim() !== "" && this.windowName.trim() !== "";
+  }
+
+  private runtimeMatches(next: ResolvedRuntimeOptions): boolean {
+    return this.baseUrl === next.baseUrl && this.fetcher === next.fetcher &&
+      this.websocketFactory === next.websocketFactory && sameLocation(this.location, next.location) &&
+      this.timers === next.timers && this.random === next.random &&
+      this.retryPolicy.baseMs === next.retryPolicy.baseMs && this.retryPolicy.maxMs === next.retryPolicy.maxMs &&
+      this.retryPolicy.jitterRatio === next.retryPolicy.jitterRatio && this.stableOpenMs === next.stableOpenMs &&
+      this.probeTimeoutMs === next.probeTimeoutMs && this.wakeTarget === next.wakeTarget &&
+      this.visibilityTarget === next.visibilityTarget && this.isVisible === next.isVisible;
   }
 
   private invalidateGeneration(): void {
