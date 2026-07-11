@@ -283,10 +283,10 @@
     detail: `$deep-review`, independent subagent review, and `gh-review-hook` exit 0.
 
 ### Task_5: cmux-style terminal-first workspace
-- status: waiting
+- status: in_progress
 - type: impl
 - branch: `codex/webshell-cmux-ui`
-- thread: pending
+- thread: `019f5015-78ee-7e21-a1aa-626735d4c5b7`
 - owns:
   - `web/src/main.tsx`
   - `web/src/styles.css`
@@ -420,6 +420,7 @@
 - 2026-07-11: Task_3 merged via PR #68 at `daf1d379d5f55f71c5ca38eb89abd0b12bb6f584` after stable tmux window-ID resolution closed prefix-collision findings; exact-head parent and two independent deep-reviews were CLEAN, hook exit 0, 149 normal/race tests, vet, 280 focused race-stress cases, diff-check, and all GitHub checks passed. Task_4 dependency gate opened.
 - 2026-07-11: Task_4 started in separate worktree thread `019f4fc6-9813-7012-a7fd-441fdc78fef5` on `codex/webshell-terminal-client` using `gpt-5.6-luna` / `high`.
 - 2026-07-11: Task_4 merged via PR #69 at `1dad20bc56a5a48209a606ac4eed0dcb838de40a` after target identity plus generation closed the React pre-passive-effect stale-action race; exact-head parent and two independent deep-reviews were CLEAN, build and diff-check passed, fresh hook exited 0, and all GitHub checks were green. Task_5 dependency gate opened.
+- 2026-07-11: Task_5 started in separate worktree thread `019f5015-78ee-7e21-a1aa-626735d4c5b7` on `codex/webshell-cmux-ui` using `gpt-5.6-luna` / `high`, with required desktop/narrow browser probes and the user-provided cmux reference image.
 
 ## Decision Log
 - 2026-07-11: WebShell is the product UI; harness/task concepts remain backend-compatible but are removed from primary navigation.
