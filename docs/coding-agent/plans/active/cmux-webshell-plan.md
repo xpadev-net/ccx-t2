@@ -326,7 +326,8 @@
 - status: in_progress
 - type: docs
 - branch: `codex/webshell-docs-assets`
-- thread: `client-new-thread:96f1ac2b-32f3-4f4a-928c-bb0ec8adf81d` (replacement worktree setup queued)
+- thread: `/root/task6_docs_assets` (collaboration worker fallback)
+- worktree: `/Users/xpadev/.codex/worktrees/task6-docs/ccx-t2`
 - owns:
   - `README.md`
   - `docs/requirements.md`
@@ -427,6 +428,7 @@
 - 2026-07-11: Task_5 merged via PR #70 at `ba48493fa61314ba824a2c0881d3e616532bd904` after parent and independent deep-review were CLEAN, current-head build/embedded check/hook and all GitHub checks passed, and Reviewer E2E at `1440x900`/`900x700` approved project/tab lifecycle, credential isolation, stale-scrollback prevention, protected terminals, focus, errors, and responsive overflow. Task_6 dependency gate opened; Task_5 archival was requested.
 - 2026-07-11: Task_5 worker thread archived. Task_6 separate `gpt-5.6-luna` / `high` worktree setup queued as `client-new-thread:6fe51544-4be8-4da7-85c6-26cbf26bd227` on delegated branch `codex/webshell-docs-assets`; startup stability check pending thread materialization.
 - 2026-07-11: Original Task_6 queued setup did not materialize and no matching thread/worktree was discoverable after repeated checks. Replacement `gpt-5.6-luna` / `high` worktree setup queued as `client-new-thread:96f1ac2b-32f3-4f4a-928c-bb0ec8adf81d`; startup stability check remains pending.
+- 2026-07-11: Replacement user-owned thread also failed to materialize. Orchestrator created dedicated worktree `/Users/xpadev/.codex/worktrees/task6-docs/ccx-t2` on `codex/webshell-docs-assets` and started bounded collaboration Worker `/root/task6_docs_assets`; runtime does not expose per-worker model selection, so the requested luna-high setting could not be enforced on this fallback.
 
 ## Decision Log
 - 2026-07-11: WebShell is the product UI; harness/task concepts remain backend-compatible but are removed from primary navigation.
