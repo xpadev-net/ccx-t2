@@ -219,11 +219,14 @@ export class TerminalController {
 
   updateOptions(options: TerminalControllerOptions): void {
     const nextRuntime = resolveRuntimeOptions(options);
-    const targetChanged = this.projectSlug !== options.projectSlug ||
-      this.windowName !== options.windowName || this.token !== (options.token ?? "");
+    const terminalChanged = this.projectSlug !== options.projectSlug || this.windowName !== options.windowName;
+    const connectionChanged = terminalChanged || this.token !== (options.token ?? "");
     const runtimeChanged = !this.runtimeMatches(nextRuntime);
-    if (!targetChanged && !runtimeChanged) {
+    if (!connectionChanged && !runtimeChanged) {
       return;
+    }
+    if (terminalChanged) {
+      this.lastSize = undefined;
     }
     if (this.started) {
       this.removeWakeListeners();
@@ -255,6 +258,9 @@ export class TerminalController {
   configure(projectSlug: string, windowName: string, token = ""): void {
     if (this.projectSlug === projectSlug && this.windowName === windowName && this.token === token) {
       return;
+    }
+    if (this.projectSlug !== projectSlug || this.windowName !== windowName) {
+      this.lastSize = undefined;
     }
     this.projectSlug = projectSlug;
     this.windowName = windowName;

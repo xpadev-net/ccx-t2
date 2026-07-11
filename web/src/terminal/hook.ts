@@ -80,7 +80,27 @@ export function useTerminalController(options: UseTerminalControllerOptions): Us
 
   useEffect(() => {
     controller.updateOptions(options);
-  }, [controller, options]);
+  }, [
+    controller,
+    options.projectSlug,
+    options.windowName,
+    options.token,
+    options.baseUrl,
+    options.fetch,
+    options.websocketFactory,
+    options.location?.protocol,
+    options.location?.host,
+    options.timers,
+    options.random,
+    options.retry?.baseMs,
+    options.retry?.maxMs,
+    options.retry?.jitterRatio,
+    options.stableOpenMs,
+    options.probeTimeoutMs,
+    options.wakeTarget,
+    options.visibilityTarget,
+    options.isVisible
+  ]);
 
   useEffect(() => {
     if (!options.autoStart && options.autoStart !== undefined) {
