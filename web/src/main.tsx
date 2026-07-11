@@ -273,6 +273,10 @@ function App() {
 
   const applyToken = () => {
     const nextToken = tokenDraft.trim();
+    if (nextToken === token) {
+      setNotice("Access token is already applied.");
+      return;
+    }
     storeToken(nextToken);
     loadGenerationRef.current += 1;
     setLoading(true);
