@@ -659,14 +659,11 @@ func (s *Server) handleTmuxLogWS(w http.ResponseWriter, r *http.Request, window,
 			return
 		}
 	}
-	for initial := subscription.initial; initial != nil; {
-		chunk, ok := <-initial
-		if !ok {
-			initial = nil
-			break
-		}
-		if err := writer.send(ctx, wsMessage{Type: "chunk", Data: string(chunk)}); err != nil {
-			return
+	if subscription.initial != nil {
+		for chunk := range subscription.initial {
+			if err := writer.send(ctx, wsMessage{Type: "chunk", Data: string(chunk)}); err != nil {
+				return
+			}
 		}
 	}
 	for {
