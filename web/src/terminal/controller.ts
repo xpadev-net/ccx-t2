@@ -340,6 +340,7 @@ export class TerminalController {
 
   private invalidateGeneration(): void {
     this.generation += 1;
+    this.retryAttempt = 0;
     this.clearTimers();
     this.closeSocket();
   }

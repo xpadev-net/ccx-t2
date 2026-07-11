@@ -145,7 +145,7 @@ export function websocketUrl(path: string, token = "", locationLike?: Pick<Locat
   const withToken = addTokenQuery(path, token);
   const location = locationLike ?? currentLocation();
   if (baseUrl) {
-    const parsed = new URL(baseUrl, location ? `${location.protocol}//${location.host}` : undefined);
+    const parsed = new URL(baseUrl, location ? `${location.protocol}//${location.host}` : "http://localhost");
     const protocol = parsed.protocol === "https:" ? "wss:" : "ws:";
     const basePath = parsed.pathname.replace(/\/$/, "");
     return `${protocol}//${parsed.host}${basePath}${withToken}`;
@@ -181,14 +181,17 @@ export async function requestJson<T>(path: string, options: ApiRequestOptions & 
     throw new Error("fetch is not available");
   }
   const { init, ...requestOptions } = options;
+  const headers = new Headers(init?.headers);
+  if (requestOptions.token) {
+    headers.set("Authorization", `Bearer ${requestOptions.token}`);
+  }
+  if (init?.body !== undefined && !headers.has("Content-Type")) {
+    headers.set("Content-Type", "application/json");
+  }
   const response = await fetcher(resolveUrl(path, requestOptions.baseUrl), {
     ...init,
     signal: requestOptions.signal,
-    headers: {
-      "Content-Type": "application/json",
-      ...(requestOptions.token ? { Authorization: `Bearer ${requestOptions.token}` } : {}),
-      ...(init?.headers ?? {})
-    }
+    headers
   });
   const payload = await readJson(response);
   if (!response.ok) {
@@ -205,7 +208,8 @@ function resolveUrl(path: string, baseUrl = ""): string {
   if (!baseUrl) {
     return path;
   }
-  const parsed = new URL(baseUrl);
+  const location = currentLocation();
+  const parsed = new URL(baseUrl, location ? `${location.protocol}//${location.host}` : "http://localhost");
   const basePath = parsed.pathname.replace(/\/$/, "");
   const requestPath = path.startsWith("/") ? path : `/${path}`;
   return new URL(`${basePath}${requestPath}`, parsed.origin).toString();
@@ -286,5 +290,5 @@ function stringValue(value: unknown): string | undefined {
 }
 
 function invalidPayload(label: string, payload: unknown): ApiError {
-  return new ApiError(`Invalid ${label} response`, 200, "OK", payload, payload);
+  return new ApiError(`Invalid ${label} response`, 0, "Invalid response", payload, payload);
 }

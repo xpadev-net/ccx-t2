@@ -31,8 +31,39 @@ export type UseTerminalControllerResult = {
 export function useTerminalController(options: UseTerminalControllerOptions): UseTerminalControllerResult {
   const controllerRef = useRef<TerminalController | null>(null);
   if (controllerRef.current === null) {
+    const {
+      projectSlug,
+      windowName,
+      token,
+      baseUrl,
+      fetch,
+      websocketFactory,
+      location,
+      timers,
+      random,
+      retry,
+      stableOpenMs,
+      probeTimeoutMs,
+      wakeTarget,
+      visibilityTarget,
+      isVisible
+    } = options;
     controllerRef.current = new TerminalController({
-      ...options,
+      projectSlug,
+      windowName,
+      token,
+      baseUrl,
+      fetch,
+      websocketFactory,
+      location,
+      timers,
+      random,
+      retry,
+      stableOpenMs,
+      probeTimeoutMs,
+      wakeTarget,
+      visibilityTarget,
+      isVisible,
       callbacks: { onStateChange: options.onStateChange, onData: options.onData, onError: options.onError }
     });
   }
@@ -60,9 +91,9 @@ export function useTerminalController(options: UseTerminalControllerOptions): Us
   }, [controller, options.autoStart]);
 
   const state = useSyncExternalStore(
-    (listener) => controller.subscribe(listener),
-    () => controller.getSnapshot(),
-    () => controller.getSnapshot()
+    controller.subscribe,
+    controller.getSnapshot,
+    controller.getSnapshot
   );
   const generation = controller.getGeneration();
 
