@@ -191,7 +191,7 @@ function App() {
   }, [busyAction, client, loading, refreshing, selectedProjectSlug]);
 
   const handleCloseTerminal = useCallback(async () => {
-    if (!selectedTerminal?.closable || busyAction || refreshing || !selectedProjectSlug) {
+    if (!selectedTerminal?.closable || busyAction || loading || refreshing || !selectedProjectSlug) {
       return;
     }
     if (typeof window !== "undefined" && !window.confirm(`Close ${selectedTerminal.title}?`)) {
@@ -211,6 +211,22 @@ function App() {
         ...current,
         [projectSlug]: (current[projectSlug] ?? []).filter((terminal) => terminal.window !== windowName)
       }));
+      setBuffers((current) => {
+        const next = { ...current };
+        delete next[key];
+        return next;
+      });
+      setConnections((current) => {
+        const next = { ...current };
+        delete next[key];
+        return next;
+      });
+      setRetrySignals((current) => {
+        const next = { ...current };
+        delete next[key];
+        return next;
+      });
+      tabRefs.current[key] = null;
       setSelectedTerminalKey((current) => current === key ? successorKey : current);
       if (successorKey && selectedProjectSlugRef.current === projectSlug) {
         window.requestAnimationFrame(() => {
@@ -223,7 +239,7 @@ function App() {
     } finally {
       setBusyAction("");
     }
-  }, [busyAction, client, refreshing, selectedProjectSlug, selectedTerminal]);
+  }, [busyAction, client, loading, refreshing, selectedProjectSlug, selectedTerminal]);
 
   const handleTerminalState = useCallback((key: string, state: TerminalState) => {
     setConnections((current) => ({ ...current, [key]: state }));
@@ -244,6 +260,7 @@ function App() {
   const applyToken = () => {
     const nextToken = tokenDraft.trim();
     storeToken(nextToken);
+    setLoading(true);
     setToken(nextToken);
     setNotice("Access token applied. Refreshing workspace…");
   };
@@ -395,7 +412,7 @@ function App() {
           <div className="status-context"><span className={`state-dot ${selectedConnection.phase}`} aria-hidden="true" /> <span>{selectedTerminal?.title ?? "No terminal"}</span><span className="status-separator">/</span><span>{selectedProjectSlug || "No project"}</span></div>
           <div className="status-actions">
             <span className={`connection-text ${selectedConnection.phase}`}>{terminalStateLabel(selectedConnection)}</span>
-            {selectedTerminal?.closable && <button className="status-button danger-text" type="button" onClick={() => void handleCloseTerminal()} disabled={Boolean(busyAction) || refreshing} aria-label={`Close ${selectedTerminal.title}`}>Close</button>}
+            {selectedTerminal?.closable && <button className="status-button danger-text" type="button" onClick={() => void handleCloseTerminal()} disabled={Boolean(busyAction) || loading || refreshing} aria-label={`Close ${selectedTerminal.title}`}>Close</button>}
             <button className="status-button" type="button" onClick={() => {
               if (selectedTerminal) {
                 setRetrySignals((current) => ({ ...current, [selectedTerminalKey]: (current[selectedTerminalKey] ?? 0) + 1 }));
