@@ -39,6 +39,7 @@ type Server struct {
 	pipeOutput      PipeOutputFunc
 	pipeBytes       PipeBytesFunc
 	capturePane     CapturePaneFunc
+	attachPane      AttachPaneFunc
 	sendKeys        SendKeysFunc
 	sendRawKeys     SendRawKeysFunc
 	resizePane      ResizePaneFunc
@@ -77,6 +78,7 @@ type Deps struct {
 	PipeOutput     PipeOutputFunc
 	PipeBytes      PipeBytesFunc
 	CapturePane    CapturePaneFunc
+	AttachPane     AttachPaneFunc
 	SendKeys       SendKeysFunc
 	SendRawKeys    SendRawKeysFunc
 	ResizePane     ResizePaneFunc
@@ -102,6 +104,7 @@ func New(deps Deps) *Server {
 		pipeOutput:     deps.PipeOutput,
 		pipeBytes:      deps.PipeBytes,
 		capturePane:    deps.CapturePane,
+		attachPane:     deps.AttachPane,
 		sendKeys:       deps.SendKeys,
 		sendRawKeys:    deps.SendRawKeys,
 		resizePane:     deps.ResizePane,
@@ -133,6 +136,15 @@ func New(deps Deps) *Server {
 	}
 	if s.capturePane == nil && deps.PipeOutput == nil && deps.PipeBytes == nil {
 		s.capturePane = tmux.CapturePaneContext
+	}
+	if s.attachPane == nil && deps.PipeOutput == nil && deps.PipeBytes == nil && deps.CapturePane == nil {
+		s.attachPane = func(ctx context.Context, session, window string) (*PaneAttachment, error) {
+			attachment, err := tmux.AttachPaneContext(ctx, session, window)
+			if err != nil {
+				return nil, err
+			}
+			return &PaneAttachment{Snapshot: attachment.Snapshot, Chunks: attachment.Chunks, Cleanup: attachment.Cleanup}, nil
+		}
 	}
 	if s.sendKeys == nil {
 		s.sendKeys = tmux.SendKeysContext
@@ -573,6 +585,7 @@ func (s *Server) projectServer(slug string) (*Server, error) {
 		pipeOutput:      s.pipeOutput,
 		pipeBytes:       s.pipeBytes,
 		capturePane:     s.capturePane,
+		attachPane:      s.attachPane,
 		sendKeys:        s.sendKeys,
 		sendRawKeys:     s.sendRawKeys,
 		resizePane:      s.resizePane,

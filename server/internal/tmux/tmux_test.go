@@ -1,8 +1,10 @@
 package tmux
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -59,6 +61,237 @@ func TestListWindowsContextParsesMetadataWithTabs(t *testing.T) {
 	}}
 	if !reflect.DeepEqual(windows, want) {
 		t.Fatalf("windows = %#v, want %#v", windows, want)
+	}
+}
+
+func TestAttachPaneContextUsesBodylessSnapshotResponseAsWatermark(t *testing.T) {
+	oldExecCommandContext := execCommandContext
+	deleteMarker := filepath.Join(t.TempDir(), "delete-complete")
+	execCommandContext = func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+		script := `
+printf '%s\n' '%begin 0 1 0' '%end 0 1 0'
+while IFS= read -r line; do
+  case "$line" in
+    display-message*) printf '%s\n' '%begin 0 2 0' '%0' '%end 0 2 0' ;;
+    refresh-client*) printf '%s\n' '%begin 0 3 0' '%end 0 3 0' '%output %0 pre-before-capture' ;;
+	    capture-pane*)
+	      case "$line" in
+	        *" -b "*) printf '%s\n' '%begin 0 4 0' '%end 0 4 0' '%output %0 queued\012' ;;
+	        *) exit 91 ;;
+	      esac ;;
+	    save-buffer*)
+	      case "$line" in
+	        *" -b "*)
+	          path=${line##* }
+	          path=${path#\'}
+	          path=${path%\'}
+	          printf '%s\n' '%end 0 5 0' '%error 0 5 0' > "$path"
+		          printf '%s\n' '%begin 0 5 0' '%end 0 5 0' '%output %0 live\012' '%output %0 after\134' ;;
+	        *) exit 92 ;;
+	      esac ;;
+	    delete-buffer*)
+	      printf '%s' deleted > "$TMUX_DELETE_MARKER"
+	      printf '%s\n' '%output %0 delete-queued\012' '%begin 0 6 0' '%end 0 6 0' ;;
+  esac
+done
+`
+		cmd := exec.CommandContext(ctx, "sh", "-c", script)
+		cmd.Env = append(os.Environ(), "TMUX_DELETE_MARKER="+deleteMarker)
+		return cmd
+	}
+	t.Cleanup(func() { execCommandContext = oldExecCommandContext })
+
+	attachment, err := AttachPaneContext(context.Background(), "session", "window")
+	if err != nil {
+		t.Fatalf("AttachPaneContext: %v", err)
+	}
+	if got, want := string(attachment.Snapshot), "%end 0 5 0\n%error 0 5 0\n"; got != want {
+		t.Fatalf("snapshot = %q, want %q", got, want)
+	}
+	for i, want := range []string{"queued\n", "live\n", "after\\", "delete-queued\n"} {
+		select {
+		case chunk := <-attachment.Chunks:
+			if got := string(chunk); got != want {
+				t.Fatalf("live chunk %d = %q, want %q", i, got, want)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("live chunk %d was not delivered", i)
+		}
+	}
+	if got, err := os.ReadFile(deleteMarker); err != nil || string(got) != "deleted" {
+		t.Fatalf("delete-buffer marker = %q, err = %v; want synchronized execution", got, err)
+	}
+	attachment.Cleanup()
+	select {
+	case _, ok := <-attachment.Chunks:
+		if ok {
+			t.Fatal("attachment stream remained open after cleanup")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("attachment stream did not close after cleanup")
+	}
+}
+
+func TestAttachPaneContextCancelsDuringSetup(t *testing.T) {
+	oldExecCommandContext := execCommandContext
+	execCommandContext = func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+		return exec.CommandContext(ctx, "sh", "-c", "exec sleep 10")
+	}
+	t.Cleanup(func() { execCommandContext = oldExecCommandContext })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := AttachPaneContext(ctx, "session", "window")
+		result <- err
+	}()
+	time.Sleep(25 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-result:
+		if err == nil {
+			t.Fatal("AttachPaneContext error = nil, want cancellation failure")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("AttachPaneContext did not stop after cancellation")
+	}
+}
+
+func TestAttachPaneContextFallsBackToIndependentBufferDelete(t *testing.T) {
+	oldExecCommandContext := execCommandContext
+	fallbackMarker := filepath.Join(t.TempDir(), "fallback-delete")
+	execCommandContext = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		if name == "tmux" && len(args) == 3 && args[0] == "delete-buffer" {
+			marker := "invalid"
+			if strings.HasPrefix(args[2], "ccx-attach-") && !strings.ContainsAny(args[2], "' \t\r\n") {
+				marker = "deleted"
+			}
+			_ = os.WriteFile(fallbackMarker, []byte(marker), 0o600)
+			return exec.CommandContext(ctx, "sh", "-c", "true")
+		}
+		script := `
+printf '%s\n' '%begin 0 1 0' '%end 0 1 0'
+while IFS= read -r line; do
+  case "$line" in
+    display-message*) printf '%s\n' '%begin 0 2 0' '%0' '%end 0 2 0' ;;
+    refresh-client*) printf '%s\n' '%begin 0 3 0' '%end 0 3 0' ;;
+    capture-pane*) printf '%s\n' '%begin 0 4 0' '%end 0 4 0' ;;
+    save-buffer*) exit 0 ;;
+  esac
+done
+`
+		return exec.CommandContext(ctx, "sh", "-c", script)
+	}
+	t.Cleanup(func() { execCommandContext = oldExecCommandContext })
+
+	if _, err := AttachPaneContext(context.Background(), "session", "window"); err == nil {
+		t.Fatal("AttachPaneContext error = nil, want broken save response")
+	}
+	if got, err := os.ReadFile(fallbackMarker); err != nil || string(got) != "deleted" {
+		t.Fatalf("fallback delete marker = %q, err = %v; want independent cleanup", got, err)
+	}
+}
+
+func TestAttachPaneContextBoundsBlockedFallbackBufferDelete(t *testing.T) {
+	oldExecCommandContext := execCommandContext
+	fallbackMarker := filepath.Join(t.TempDir(), "fallback-delete-started")
+	execCommandContext = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		if name == "tmux" && len(args) == 3 && args[0] == "delete-buffer" {
+			_ = os.WriteFile(fallbackMarker, []byte("started"), 0o600)
+			return exec.CommandContext(ctx, "sh", "-c", "exec sleep 10")
+		}
+		script := `
+printf '%s\n' '%begin 0 1 0' '%end 0 1 0'
+while IFS= read -r line; do
+  case "$line" in
+    display-message*) printf '%s\n' '%begin 0 2 0' '%0' '%end 0 2 0' ;;
+    refresh-client*) printf '%s\n' '%begin 0 3 0' '%end 0 3 0' ;;
+    capture-pane*) printf '%s\n' '%begin 0 4 0' '%end 0 4 0' ;;
+    save-buffer*) exit 0 ;;
+  esac
+done
+`
+		return exec.CommandContext(ctx, "sh", "-c", script)
+	}
+	t.Cleanup(func() { execCommandContext = oldExecCommandContext })
+
+	started := time.Now()
+	if _, err := AttachPaneContext(context.Background(), "session", "window"); err == nil {
+		t.Fatal("AttachPaneContext error = nil, want broken save response")
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("blocked fallback cleanup took %s, want bounded return", elapsed)
+	}
+	if got, err := os.ReadFile(fallbackMarker); err != nil || string(got) != "started" {
+		t.Fatalf("fallback marker = %q, err = %v; want fallback invocation", got, err)
+	}
+}
+
+func TestAttachPaneContextUsesRealTmuxControlMode(t *testing.T) {
+	socket := fmt.Sprintf("ccx-t9-attach-%d", os.Getpid())
+	session := "ccx-t9-attach"
+	run := func(args ...string) []byte {
+		cmd := exec.Command("tmux", append([]string{"-L", socket, "-f", "/dev/null"}, args...)...)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("tmux %v: %v: %s", args, err, out)
+		}
+		return out
+	}
+	_ = exec.Command("tmux", "-L", socket, "-f", "/dev/null", "kill-server").Run()
+	run("new-session", "-d", "-s", session)
+	t.Cleanup(func() {
+		cmd := exec.Command("tmux", "-L", socket, "-f", "/dev/null", "kill-server")
+		_ = cmd.Run()
+	})
+	run("send-keys", "-t", "="+session+":0", "printf pre", "C-m")
+	run("send-keys", "-t", "="+session+":0", "printf '%s\\n' '%end 1 2 3' '%error 1 2 3'", "C-m")
+	time.Sleep(200 * time.Millisecond)
+
+	oldExecCommandContext := execCommandContext
+	execCommandContext = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		return exec.CommandContext(ctx, name, append([]string{"-L", socket}, args...)...)
+	}
+	t.Cleanup(func() { execCommandContext = oldExecCommandContext })
+
+	attachment, err := AttachPaneContext(context.Background(), session, "0")
+	if err != nil {
+		t.Fatalf("AttachPaneContext: %v", err)
+	}
+	defer attachment.Cleanup()
+	if !bytes.Contains(attachment.Snapshot, []byte("pre")) {
+		t.Fatalf("snapshot = %q, want pre-boundary output", attachment.Snapshot)
+	}
+	for _, literal := range []string{"%end 1 2 3", "%error 1 2 3"} {
+		if !bytes.Contains(attachment.Snapshot, []byte(literal)) {
+			t.Fatalf("snapshot = %q, want literal pane line %q", attachment.Snapshot, literal)
+		}
+	}
+	run("send-keys", "-t", "="+session+":0", "printf live", "C-m")
+	deadline := time.NewTimer(2 * time.Second)
+	foundLive := false
+	for {
+		select {
+		case chunk, ok := <-attachment.Chunks:
+			if !ok {
+				t.Fatal("real tmux control-mode stream closed before live output")
+			}
+			if bytes.Contains(chunk, []byte("live")) {
+				foundLive = true
+			}
+			if foundLive {
+				deadline.Stop()
+				attachment.Cleanup()
+				for _, name := range strings.Split(strings.TrimSpace(string(run("list-buffers", "-F", "#{buffer_name}"))), "\n") {
+					if strings.HasPrefix(name, "ccx-attach-") {
+						t.Fatalf("attachment buffer %q remained after cleanup", name)
+					}
+				}
+				return
+			}
+		case <-deadline.C:
+			t.Fatal("real tmux control-mode output was not delivered")
+		}
 	}
 }
 
