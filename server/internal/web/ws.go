@@ -706,10 +706,11 @@ func (s *Server) handleTmuxLogWS(w http.ResponseWriter, r *http.Request, window,
 	defer cleanup()
 	go handleTmuxClientMessages(ctx, conn, session, window, s.sendRawKeys, s.resizePane, cancel)
 
-	if len(snapshot) > 0 {
-		if err := writer.send(ctx, wsMessage{Type: "chunk", Data: string(snapshot)}); err != nil {
-			return
-		}
+	// A snapshot is a replacement boundary, not another append-only chunk.
+	// Send it even when empty so reconnecting clients can clear stale output
+	// before consuming the replay and live stream that follow the watermark.
+	if err := writer.send(ctx, wsMessage{Type: "snapshot", Data: string(snapshot)}); err != nil {
+		return
 	}
 	if subscription.initial != nil {
 		for chunk := range subscription.initial {

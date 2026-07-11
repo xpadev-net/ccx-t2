@@ -19,6 +19,8 @@ export type TerminalSize = { cols: number; rows: number };
 
 export type TerminalTarget = { projectSlug: string; windowName: string };
 
+export type TerminalConnectionIdentity = TerminalTarget & { generation: number; token: string };
+
 export type RetryPolicy = {
   baseMs: number;
   maxMs: number;
@@ -53,7 +55,8 @@ export type TerminalSocketFactory = (url: string) => TerminalSocket;
 
 export type TerminalControllerCallbacks = {
   onStateChange?: (state: TerminalState) => void;
-  onData?: (data: string) => void;
+  onSnapshot?: (data: string, identity: TerminalConnectionIdentity) => void;
+  onData?: (data: string, identity: TerminalConnectionIdentity) => void;
   onError?: (error: Error) => void;
 };
 
@@ -375,6 +378,12 @@ export class TerminalController {
     }
     this.socket = socket;
     this.socketIdentity = { generation, attempt };
+    const connectionIdentity: TerminalConnectionIdentity = {
+      generation,
+      projectSlug: this.projectSlug,
+      windowName: this.windowName,
+      token: this.token
+    };
     const guard = () => this.isCurrentSocket(socket, generation, attempt);
     const onOpen = (_event: Event) => {
       if (!guard()) return;
@@ -390,7 +399,7 @@ export class TerminalController {
     };
     const onMessage = (event: Event) => {
       if (!guard()) return;
-      this.handleMessage(event, guard);
+      this.handleMessage(event, guard, connectionIdentity);
     };
     const onError = (_event: Event) => {
       if (!guard()) return;
@@ -422,7 +431,7 @@ export class TerminalController {
     this.socketCleanup = () => this.detachSocket(socket, onOpen, onMessage, onError, onClose);
   }
 
-  private handleMessage(event: Event, guard: () => boolean): void {
+  private handleMessage(event: Event, guard: () => boolean, identity: TerminalConnectionIdentity): void {
     const data = "data" in event ? (event.data as unknown) : undefined;
     if (typeof data !== "string") {
       this.callbacks.onError?.(new Error("Terminal websocket message was not text."));
@@ -438,8 +447,12 @@ export class TerminalController {
     if (!isRecord(message) || typeof message.type !== "string" || !guard()) {
       return;
     }
-    if ((message.type === "chunk" || message.type === "line") && typeof message.data === "string") {
-      this.callbacks.onData?.(message.data);
+    if (message.type === "snapshot" && (message.data === undefined || typeof message.data === "string")) {
+      // Empty snapshots omit data on the Go wire struct; the snapshot type is
+      // still an explicit replacement boundary and must clear stale output.
+      this.callbacks.onSnapshot?.(message.data ?? "", identity);
+    } else if ((message.type === "chunk" || message.type === "line") && typeof message.data === "string") {
+      this.callbacks.onData?.(message.data, identity);
     } else if (message.type === "error" && typeof message.data === "string") {
       this.callbacks.onError?.(new Error(message.data));
     }

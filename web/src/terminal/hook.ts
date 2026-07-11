@@ -1,6 +1,7 @@
 import { useEffect, useRef, useSyncExternalStore } from "react";
 import {
   TerminalController,
+  type TerminalConnectionIdentity,
   type TerminalControllerCallbacks,
   type TerminalControllerOptions,
   type TerminalSize,
@@ -15,6 +16,7 @@ export type UseTerminalControllerOptions = Omit<
   projectSlug: string;
   windowName: string;
   onStateChange?: TerminalControllerCallbacks["onStateChange"];
+  onSnapshot?: TerminalControllerCallbacks["onSnapshot"];
   onData?: TerminalControllerCallbacks["onData"];
   onError?: TerminalControllerCallbacks["onError"];
   autoStart?: boolean;
@@ -65,19 +67,26 @@ export function useTerminalController(options: UseTerminalControllerOptions): Us
       wakeTarget,
       visibilityTarget,
       isVisible,
-      callbacks: { onStateChange: options.onStateChange, onData: options.onData, onError: options.onError }
+      callbacks: { onStateChange: options.onStateChange, onError: options.onError }
     });
   }
   const controller = controllerRef.current;
+  const generation = controller.getGeneration();
+  const target: TerminalTarget = { projectSlug: options.projectSlug, windowName: options.windowName };
+  const token = options.token ?? "";
 
   useEffect(() => {
+    const accepts = (identity: TerminalConnectionIdentity) => identity.generation === generation &&
+      identity.projectSlug === target.projectSlug && identity.windowName === target.windowName && identity.token === token;
     controller.setCallbacks({
       onStateChange: options.onStateChange,
-      onData: options.onData,
+      onSnapshot: (data, identity) => { if (accepts(identity)) options.onSnapshot?.(data, identity); },
+      onData: (data, identity) => { if (accepts(identity)) options.onData?.(data, identity); },
       onError: options.onError
     });
     return () => controller.setCallbacks({});
-  }, [controller, options.onData, options.onError, options.onStateChange]);
+  }, [controller, generation, options.onData, options.onError, options.onSnapshot, options.onStateChange,
+    target.projectSlug, target.windowName, token]);
 
   useEffect(() => {
     controller.updateOptions(options);
@@ -116,8 +125,6 @@ export function useTerminalController(options: UseTerminalControllerOptions): Us
     controller.getSnapshot,
     controller.getSnapshot
   );
-  const generation = controller.getGeneration();
-  const target: TerminalTarget = { projectSlug: options.projectSlug, windowName: options.windowName };
   // Keep event handlers bound to the render's project/window target and generation so
   // queued callbacks fail closed both before and after a passive target-switch effect.
 
