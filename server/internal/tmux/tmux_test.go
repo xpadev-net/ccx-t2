@@ -64,7 +64,7 @@ func TestListWindowsContextParsesMetadataWithTabs(t *testing.T) {
 	}
 }
 
-func TestAttachPaneContextUsesCaptureResponseAsWatermark(t *testing.T) {
+func TestAttachPaneContextUsesBodylessSnapshotResponseAsWatermark(t *testing.T) {
 	oldExecCommandContext := execCommandContext
 	execCommandContext = func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
 		script := `
@@ -73,7 +73,22 @@ while IFS= read -r line; do
   case "$line" in
     display-message*) printf '%s\n' '%begin 0 2 0' '%0' '%end 0 2 0' ;;
     refresh-client*) printf '%s\n' '%begin 0 3 0' '%end 0 3 0' '%output %0 pre-before-capture' ;;
-	    capture-pane*) printf '%s\n' '%begin 0 4 0' 'snapshot' '%end 1 2 3' '%error 1 2 3' '%end 0 4 0' '%output %0 live\012' '%output %0 after\134' ;;
+	    capture-pane*)
+	      case "$line" in
+	        *" -b "*) printf '%s\n' '%begin 0 4 0' '%end 0 4 0' '%output %0 queued\012' ;;
+	        *) exit 91 ;;
+	      esac ;;
+	    save-buffer*)
+	      case "$line" in
+	        *" -b "*)
+	          path=${line##* }
+	          path=${path#\'}
+	          path=${path%\'}
+	          printf '%s\n' '%end 0 5 0' '%error 0 5 0' > "$path"
+		          printf '%s\n' '%begin 0 5 0' '%end 0 5 0' '%output %0 live\012' '%output %0 after\134' ;;
+	        *) exit 92 ;;
+	      esac ;;
+	    delete-buffer*) printf '%s\n' '%begin 0 6 0' '%end 0 6 0' ;;
   esac
 done
 `
@@ -85,10 +100,10 @@ done
 	if err != nil {
 		t.Fatalf("AttachPaneContext: %v", err)
 	}
-	if got, want := string(attachment.Snapshot), "snapshot\n%end 1 2 3\n%error 1 2 3\n"; got != want {
+	if got, want := string(attachment.Snapshot), "%end 0 5 0\n%error 0 5 0\n"; got != want {
 		t.Fatalf("snapshot = %q, want %q", got, want)
 	}
-	for i, want := range []string{"live\n", "after\\"} {
+	for i, want := range []string{"queued\n", "live\n", "after\\"} {
 		select {
 		case chunk := <-attachment.Chunks:
 			if got := string(chunk); got != want {

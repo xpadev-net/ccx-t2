@@ -186,6 +186,7 @@ type tmuxSharedStream struct {
 	// history is ordered output after snapshot's tmux watermark. A joiner
 	// receives a private replay of this prefix before it consumes future chunks.
 	history       [][]byte
+	historyBytes  int
 	recordHistory bool
 	closed        bool
 }
@@ -194,6 +195,7 @@ type tmuxSubscriber struct {
 	mu          sync.Mutex
 	chunks      chan []byte
 	slow        chan struct{}
+	resync      chan struct{}
 	closed      bool
 	slowEvicted bool
 }
@@ -202,6 +204,7 @@ type tmuxStreamSubscription struct {
 	initial <-chan []byte
 	chunks  <-chan []byte
 	slow    <-chan struct{}
+	resync  <-chan struct{}
 }
 
 func (s *tmuxSubscriber) deliver(chunk []byte) bool {
@@ -232,9 +235,29 @@ func (s *tmuxSubscriber) closeNormally() {
 	close(s.chunks)
 }
 
+func (s *tmuxSubscriber) closeResync() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return
+	}
+	s.closed = true
+	close(s.resync)
+	close(s.chunks)
+}
+
 func (s *tmuxStreamSubscription) wasSlowEvicted() bool {
 	select {
 	case <-s.slow:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *tmuxStreamSubscription) wasResynced() bool {
+	select {
+	case <-s.resync:
 		return true
 	default:
 		return false
@@ -256,15 +279,11 @@ func (r *tmuxStreamRegistry) lockAttachment(key string) func() {
 	return lock.Unlock
 }
 
-func (r *tmuxStreamRegistry) addSubscriberLocked(key string, stream *tmuxSharedStream) (*tmuxStreamSubscription, []byte, func()) {
-	sub := &tmuxSubscriber{chunks: make(chan []byte, 128), slow: make(chan struct{})}
+func (r *tmuxStreamRegistry) addSubscriberLocked(key string, stream *tmuxSharedStream) (*tmuxStreamSubscription, []byte, [][]byte, func()) {
+	sub := &tmuxSubscriber{chunks: make(chan []byte, 128), slow: make(chan struct{}), resync: make(chan struct{})}
 	stream.subscribers[sub] = struct{}{}
 	snapshot := append([]byte(nil), stream.snapshot...)
-	initial := make(chan []byte, len(stream.history))
-	for _, chunk := range stream.history {
-		initial <- append([]byte(nil), chunk...)
-	}
-	close(initial)
+	history := append([][]byte(nil), stream.history...)
 	var once sync.Once
 	cleanup := func() {
 		var closePipe bool
@@ -288,7 +307,16 @@ func (r *tmuxStreamRegistry) addSubscriberLocked(key string, stream *tmuxSharedS
 			stream.closePipe()
 		}
 	}
-	return &tmuxStreamSubscription{initial: initial, chunks: sub.chunks, slow: sub.slow}, snapshot, cleanup
+	return &tmuxStreamSubscription{chunks: sub.chunks, slow: sub.slow, resync: sub.resync}, snapshot, history, cleanup
+}
+
+func replayHistory(history [][]byte) <-chan []byte {
+	initial := make(chan []byte, len(history))
+	for _, chunk := range history {
+		initial <- append([]byte(nil), chunk...)
+	}
+	close(initial)
+	return initial
 }
 
 func (r *tmuxStreamRegistry) subscribeAttachedWithStatus(ctx context.Context, key, session, window string, attach AttachPaneFunc) ([]byte, *tmuxStreamSubscription, func(), error) {
@@ -304,8 +332,9 @@ func (r *tmuxStreamRegistry) subscribeAttachedWithStatus(ctx context.Context, ke
 	}
 	stream := r.streams[key]
 	if stream != nil && !stream.closed {
-		subscription, snapshot, cleanup := r.addSubscriberLocked(key, stream)
+		subscription, snapshot, history, cleanup := r.addSubscriberLocked(key, stream)
 		r.mu.Unlock()
+		subscription.initial = replayHistory(history)
 		return snapshot, subscription, cleanup, nil
 	}
 	r.mu.Unlock()
@@ -326,11 +355,12 @@ func (r *tmuxStreamRegistry) subscribeAttachedWithStatus(ctx context.Context, ke
 
 	r.mu.Lock()
 	if stream = r.streams[key]; stream != nil && !stream.closed {
-		subscription, snapshot, cleanup := r.addSubscriberLocked(key, stream)
+		subscription, snapshot, history, cleanup := r.addSubscriberLocked(key, stream)
 		r.mu.Unlock()
 		if attachment.Cleanup != nil {
 			attachment.Cleanup()
 		}
+		subscription.initial = replayHistory(history)
 		return snapshot, subscription, cleanup, nil
 	}
 	stream = &tmuxSharedStream{
@@ -341,8 +371,9 @@ func (r *tmuxStreamRegistry) subscribeAttachedWithStatus(ctx context.Context, ke
 		subscribers:   make(map[*tmuxSubscriber]struct{}),
 	}
 	r.streams[key] = stream
-	subscription, snapshot, cleanup := r.addSubscriberLocked(key, stream)
+	subscription, snapshot, history, cleanup := r.addSubscriberLocked(key, stream)
 	r.mu.Unlock()
+	subscription.initial = replayHistory(history)
 	go r.runStream(stream, attachment.Chunks)
 	return snapshot, subscription, cleanup, nil
 }
@@ -357,6 +388,13 @@ const (
 	wsPongWait     = 60 * time.Second
 	wsPingPeriod   = (wsPongWait * 9) / 10
 	wsWriterBuffer = 128
+
+	// Atomic attachment history is a bounded join handoff, not an archive. If
+	// either cap would be exceeded, the shared attachment is retired and
+	// subscribers are told to reconnect for a fresh tmux snapshot. Truncating
+	// this history would create an unprovable gap for a late joiner.
+	tmuxAttachmentHistoryMaxBytes  = 1 << 20
+	tmuxAttachmentHistoryMaxChunks = 4096
 )
 
 func (s *Server) handleWorkerLogWS(w http.ResponseWriter, r *http.Request) {
@@ -676,9 +714,14 @@ func (s *Server) handleTmuxLogWS(w http.ResponseWriter, r *http.Request, window,
 			// instead of continuing with a corrupted byte stream.
 			_ = writer.send(ctx, wsMessage{Type: "error", Data: "log stream fell behind; reconnecting"})
 			return
+		case <-subscription.resync:
+			_ = writer.send(ctx, wsMessage{Type: "error", Data: "log stream rotated; reconnecting"})
+			return
 		case chunk, ok := <-subscription.chunks:
 			if !ok {
-				if subscription.wasSlowEvicted() {
+				if subscription.wasResynced() {
+					_ = writer.send(ctx, wsMessage{Type: "error", Data: "log stream rotated; reconnecting"})
+				} else if subscription.wasSlowEvicted() {
 					_ = writer.send(ctx, wsMessage{Type: "error", Data: "log stream fell behind; reconnecting"})
 				} else {
 					_ = writer.send(ctx, wsMessage{Type: "closed"})
@@ -995,8 +1038,23 @@ func (r *tmuxStreamRegistry) runStream(stream *tmuxSharedStream, chunks <-chan [
 			r.mu.Unlock()
 			return
 		}
+		if stream.recordHistory && (len(stream.history) >= tmuxAttachmentHistoryMaxChunks || len(chunk) > tmuxAttachmentHistoryMaxBytes || stream.historyBytes > tmuxAttachmentHistoryMaxBytes-len(chunk)) {
+			stream.closed = true
+			delete(r.streams, stream.key)
+			for sub := range stream.subscribers {
+				sub.closeResync()
+			}
+			stream.subscribers = nil
+			r.mu.Unlock()
+			// Retiring the attachment, instead of truncating history, makes the
+			// next join obtain a new snapshot with a new watermark. The source
+			// cleanup also stops the old tmux control client.
+			stream.closePipe()
+			return
+		}
 		if stream.recordHistory {
 			stream.history = append(stream.history, append([]byte(nil), chunk...))
+			stream.historyBytes += len(chunk)
 		}
 		for sub := range stream.subscribers {
 			if sub.deliver(chunk) {

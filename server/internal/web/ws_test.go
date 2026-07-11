@@ -261,6 +261,125 @@ func TestTmuxSharedAtomicAttachmentLateSubscriberReplaysThroughJoinWatermark(t *
 	secondCleanup()
 }
 
+func TestTmuxAtomicAttachmentRetiresAtHistoryCapAndResyncs(t *testing.T) {
+	registry := &tmuxStreamRegistry{}
+	key := "session\x00window"
+	firstSource := make(chan []byte, 1)
+	secondSource := make(chan []byte, 1)
+	firstStop := make(chan struct{})
+	var attachCount atomic.Int32
+	var firstCleanupOnce sync.Once
+	var secondCleanupOnce sync.Once
+	attach := func(context.Context, string, string) (*PaneAttachment, error) {
+		switch attachCount.Add(1) {
+		case 1:
+			return &PaneAttachment{
+				Snapshot: []byte("old snapshot"),
+				Chunks:   firstSource,
+				Cleanup: func() {
+					firstCleanupOnce.Do(func() { close(firstStop) })
+				},
+			}, nil
+		default:
+			return &PaneAttachment{
+				Snapshot: []byte("fresh snapshot"),
+				Chunks:   secondSource,
+				Cleanup: func() {
+					secondCleanupOnce.Do(func() { close(secondSource) })
+				},
+			}, nil
+		}
+	}
+
+	snapshot, first, firstCleanup, err := registry.subscribeAttachedWithStatus(context.Background(), key, "session", "window", attach)
+	if err != nil {
+		t.Fatalf("first subscribe: %v", err)
+	}
+	if string(snapshot) != "old snapshot" {
+		t.Fatalf("first snapshot = %q, want old snapshot", snapshot)
+	}
+	var oldStream *tmuxSharedStream
+	registry.mu.Lock()
+	oldStream = registry.streams[key]
+	registry.mu.Unlock()
+
+	drainDone := make(chan struct{})
+	go func() {
+		for range first.chunks {
+		}
+		close(drainDone)
+	}()
+	chunk := bytes.Repeat([]byte{'x'}, tmuxAttachmentHistoryMaxBytes/tmuxAttachmentHistoryMaxChunks)
+	producerDone := make(chan struct{})
+	go func() {
+		defer close(producerDone)
+		for i := 0; i < tmuxAttachmentHistoryMaxChunks+1; i++ {
+			select {
+			case firstSource <- chunk:
+			case <-firstStop:
+				return
+			}
+		}
+	}()
+	select {
+	case <-first.resync:
+	case <-first.slow:
+		t.Fatal("subscriber was evicted before the attachment history cap")
+	case <-time.After(3 * time.Second):
+		t.Fatal("atomic attachment did not retire at the history cap")
+	}
+	select {
+	case <-drainDone:
+	case <-time.After(time.Second):
+		t.Fatal("retired attachment did not close its subscriber")
+	}
+	registry.mu.Lock()
+	_, retained := registry.streams[key]
+	gotHistoryChunks, gotHistoryBytes := len(oldStream.history), oldStream.historyBytes
+	registry.mu.Unlock()
+	if retained {
+		t.Fatal("retired attachment remained in the registry")
+	}
+	if gotHistoryChunks != tmuxAttachmentHistoryMaxChunks || gotHistoryBytes != tmuxAttachmentHistoryMaxBytes {
+		t.Fatalf("history before retirement = chunks=%d bytes=%d, want chunks=%d bytes=%d", gotHistoryChunks, gotHistoryBytes, tmuxAttachmentHistoryMaxChunks, tmuxAttachmentHistoryMaxBytes)
+	}
+	firstCleanup()
+	select {
+	case <-producerDone:
+	case <-time.After(time.Second):
+		t.Fatal("retired attachment producer did not stop")
+	}
+
+	freshSnapshot, second, secondCleanup, err := registry.subscribeAttachedWithStatus(context.Background(), key, "session", "window", attach)
+	if err != nil {
+		t.Fatalf("resync subscribe: %v", err)
+	}
+	if string(freshSnapshot) != "fresh snapshot" {
+		t.Fatalf("resync snapshot = %q, want fresh snapshot", freshSnapshot)
+	}
+	select {
+	case _, ok := <-second.initial:
+		if ok {
+			t.Fatal("fresh attachment unexpectedly replayed retired history")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("fresh attachment initial replay did not close")
+	}
+	secondSource <- []byte("fresh live")
+	select {
+	case got := <-second.chunks:
+		if string(got) != "fresh live" {
+			t.Fatalf("fresh live chunk = %q, want fresh live", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("fresh attachment did not receive live output")
+	}
+	if got := attachCount.Load(); got != 2 {
+		t.Fatalf("attach count = %d, want fresh attachment after cap", got)
+	}
+	secondCleanup()
+}
+
 func TestTmuxAtomicAttachmentDoesNotBlockUnrelatedKeys(t *testing.T) {
 	registry := &tmuxStreamRegistry{}
 	slowStarted := make(chan struct{})

@@ -1094,12 +1094,13 @@ func AttachPane(session, window string) (*PaneAttachment, error) {
 }
 
 // AttachPaneContext returns an atomic snapshot/live handoff. tmux is attached
-// and captures the pane through the same serialized control-mode client. Any
-// output emitted while setup and capture run is discarded as pre-watermark
-// output. The %end response for capture-pane is the formal watermark:
-// control-mode notifications never occur inside a response block, so
-// notifications before that response are represented by the snapshot and only
-// notifications after it are emitted on Chunks.
+// and captures the pane through the same serialized control-mode client. The
+// snapshot is written by tmux to a uniquely named paste buffer and then to a
+// private file; the control responses contain no pane bytes. The %end response
+// for save-buffer is the formal watermark. The reader starts consuming the
+// same control-mode stream after that response, so queued %output
+// notifications are delivered on Chunks rather than being guessed into or
+// out of the snapshot.
 //
 // The context controls setup cancellation. The caller must invoke Cleanup to
 // release the control-mode client when the stream is no longer needed.
@@ -1108,22 +1109,42 @@ func AttachPaneContext(ctx context.Context, session, window string) (*PaneAttach
 		return nil, err
 	}
 
+	token := make([]byte, 16)
+	if _, err := rand.Read(token); err != nil {
+		return nil, fmt.Errorf("tmux control attachment token: %w", err)
+	}
+	bufferName := "ccx-attach-" + hex.EncodeToString(token)
+	snapshotFile, err := os.CreateTemp("", "ccx-attach-*.snapshot")
+	if err != nil {
+		return nil, fmt.Errorf("tmux control snapshot file: %w", err)
+	}
+	snapshotPath := snapshotFile.Name()
+	if err := snapshotFile.Close(); err != nil {
+		_ = os.Remove(snapshotPath)
+		return nil, fmt.Errorf("tmux control snapshot file close: %w", err)
+	}
+
+	removeSnapshot := sync.OnceFunc(func() { _ = os.Remove(snapshotPath) })
+
 	processCtx, processCancel := context.WithCancel(context.Background())
 	cmd := execCommandContext(processCtx, "tmux", "-C", "-f", "/dev/null", "attach-session", "-t", "="+session)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		processCancel()
+		removeSnapshot()
 		return nil, fmt.Errorf("tmux control stdout: %w", err)
 	}
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		processCancel()
+		removeSnapshot()
 		return nil, fmt.Errorf("tmux control stdin: %w", err)
 	}
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Start(); err != nil {
 		processCancel()
+		removeSnapshot()
 		return nil, fmt.Errorf("tmux control attach: %w", err)
 	}
 
@@ -1147,6 +1168,7 @@ func AttachPaneContext(ctx context.Context, session, window string) (*PaneAttach
 	var cleanupOnce sync.Once
 	cleanup := func() {
 		cleanupOnce.Do(func() {
+			removeSnapshot()
 			finishSetup()
 			processCancel()
 			close(stop)
@@ -1157,7 +1179,20 @@ func AttachPaneContext(ctx context.Context, session, window string) (*PaneAttach
 		})
 	}
 
+	bufferCreated := false
+	deleteBuffer := func() {
+		if !bufferCreated {
+			return
+		}
+		bufferCreated = false
+		// The response is intentionally consumed by streamControlOutput after
+		// the watermark. It must not be read here because queued pane output
+		// can occur between save-buffer's %end and this cleanup command.
+		_ = writeControlCommand(stdin, "delete-buffer", "-b", tmuxControlQuote(bufferName))
+	}
+
 	fail := func(err error) (*PaneAttachment, error) {
+		deleteBuffer()
 		cleanup()
 		<-waitDone
 		if stderr.Len() > 0 {
@@ -1187,17 +1222,29 @@ func AttachPaneContext(ctx context.Context, session, window string) (*PaneAttach
 	if _, err := readControlResponse(reader); err != nil {
 		return fail(fmt.Errorf("tmux control enable pane output response: %w", err))
 	}
-	if err := writeControlCommand(stdin, "capture-pane", "-p", "-e", "-S", "-200", "-t", tmuxControlQuote(paneID)); err != nil {
+	if err := writeControlCommand(stdin, "capture-pane", "-b", tmuxControlQuote(bufferName), "-e", "-S", "-200", "-t", tmuxControlQuote(paneID)); err != nil {
 		return fail(fmt.Errorf("tmux control capture pane: %w", err))
 	}
-	snapshot, err := readControlResponse(reader)
-	if err != nil {
+	bufferCreated = true
+	if _, err := readControlResponse(reader); err != nil {
 		return fail(fmt.Errorf("tmux control capture pane response: %w", err))
 	}
+	if err := writeControlCommand(stdin, "save-buffer", "-b", tmuxControlQuote(bufferName), tmuxControlQuote(snapshotPath)); err != nil {
+		return fail(fmt.Errorf("tmux control save pane snapshot: %w", err))
+	}
+	_, pending, err := readControlResponseWithOutput(reader, paneID)
+	if err != nil {
+		return fail(fmt.Errorf("tmux control save pane snapshot response: %w", err))
+	}
+	snapshot, err := os.ReadFile(snapshotPath)
+	if err != nil {
+		return fail(fmt.Errorf("tmux control read pane snapshot: %w", err))
+	}
+	deleteBuffer()
 
 	finishSetup()
 	chunks := make(chan []byte, 128)
-	go streamControlOutput(reader, paneID, chunks, stop)
+	go streamControlOutput(reader, paneID, chunks, stop, pending)
 	return &PaneAttachment{Snapshot: snapshot, Chunks: chunks, Cleanup: cleanup}, nil
 }
 
@@ -1231,15 +1278,25 @@ func parseTmuxControlFrame(line, marker string) (tmuxControlFrame, bool) {
 }
 
 func readControlResponse(reader *bufio.Reader) ([]byte, error) {
+	body, _, err := readControlResponseWithOutput(reader, "")
+	return body, err
+}
+
+func readControlResponseWithOutput(reader *bufio.Reader, paneID string) ([]byte, [][]byte, error) {
+	var pending [][]byte
 	for {
 		line, err := readControlLine(reader)
 		if err != nil {
-			return nil, err
+			return nil, pending, err
+		}
+		if chunk, ok := parseControlOutput(line, paneID); ok {
+			pending = append(pending, chunk)
+			continue
 		}
 		opening, ok := parseTmuxControlFrame(line, "%begin")
 		if !ok {
 			if strings.HasPrefix(line, "%exit") {
-				return nil, errors.New(strings.TrimSpace(line))
+				return nil, pending, errors.New(strings.TrimSpace(line))
 			}
 			continue
 		}
@@ -1248,13 +1305,13 @@ func readControlResponse(reader *bufio.Reader) ([]byte, error) {
 		for {
 			line, err = readControlLine(reader)
 			if err != nil {
-				return nil, err
+				return nil, pending, err
 			}
 			if closing, ok := parseTmuxControlFrame(line, "%end"); ok && closing.fields == opening.fields {
-				return body.Bytes(), nil
+				return body.Bytes(), pending, nil
 			}
 			if closing, ok := parseTmuxControlFrame(line, "%error"); ok && closing.fields == opening.fields {
-				return nil, fmt.Errorf("tmux control command error: %s", strings.TrimSpace(line))
+				return nil, pending, fmt.Errorf("tmux control command error: %s", strings.TrimSpace(line))
 			}
 			body.WriteString(line)
 			body.WriteByte('\n')
@@ -1270,23 +1327,38 @@ func readControlLine(reader *bufio.Reader) (string, error) {
 	return strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r"), nil
 }
 
-func streamControlOutput(reader *bufio.Reader, paneID string, chunks chan<- []byte, stop <-chan struct{}) {
+func parseControlOutput(line, paneID string) ([]byte, bool) {
+	if paneID == "" || !strings.HasPrefix(line, "%output ") {
+		return nil, false
+	}
+	value := strings.TrimPrefix(line, "%output ")
+	separator := strings.IndexByte(value, ' ')
+	if separator < 0 || value[:separator] != paneID {
+		return nil, false
+	}
+	chunk := decodeControlOutput(value[separator+1:])
+	if len(chunk) == 0 {
+		return nil, false
+	}
+	return chunk, true
+}
+
+func streamControlOutput(reader *bufio.Reader, paneID string, chunks chan<- []byte, stop <-chan struct{}, pending [][]byte) {
 	defer close(chunks)
+	for _, chunk := range pending {
+		select {
+		case chunks <- chunk:
+		case <-stop:
+			return
+		}
+	}
 	for {
 		line, err := readControlLine(reader)
 		if err != nil {
 			return
 		}
-		if !strings.HasPrefix(line, "%output ") {
-			continue
-		}
-		value := strings.TrimPrefix(line, "%output ")
-		separator := strings.IndexByte(value, ' ')
-		if separator < 0 || value[:separator] != paneID {
-			continue
-		}
-		chunk := decodeControlOutput(value[separator+1:])
-		if len(chunk) == 0 {
+		chunk, ok := parseControlOutput(line, paneID)
+		if !ok {
 			continue
 		}
 		select {
