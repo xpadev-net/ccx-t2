@@ -28,36 +28,39 @@ import (
 
 // Server serves the browser-facing REST API.
 type Server struct {
-	configMu        sync.RWMutex
-	cfg             *config.Config
-	configPath      string
-	ledger          *ledger.Ledger
-	manager         *runtimepkg.Manager
-	registry        *worker.Registry
-	trigger         Triggerer
-	cleaner         WorkerCleaner
-	pipeOutput      PipeOutputFunc
-	pipeBytes       PipeBytesFunc
-	capturePane     CapturePaneFunc
-	attachPane      AttachPaneFunc
-	sendKeys        SendKeysFunc
-	sendRawKeys     SendRawKeysFunc
-	resizePane      ResizePaneFunc
-	isSessionAlive  SessionAliveFunc
-	isWindowAlive   WindowAliveFunc
-	isPaneIdle      PaneIdleFunc
-	tmuxSession     string
-	projectScoped   bool
-	pendingTriggers *pendingTriggerSet
-	secret          string
-	authDisabled    bool
-	allowedOrigins  map[string]bool
-	harnesses       []harnessResponse
-	mux             *http.ServeMux
-	ledgerClientsMu sync.Mutex
-	ledgerClients   map[string]map[*ledgerWSClient]struct{}
-	tmuxStreams     *tmuxStreamRegistry
-	startLocks      *orchestratorStartLocks
+	configMu           sync.RWMutex
+	cfg                *config.Config
+	configPath         string
+	ledger             *ledger.Ledger
+	manager            *runtimepkg.Manager
+	registry           *worker.Registry
+	trigger            Triggerer
+	cleaner            WorkerCleaner
+	pipeOutput         PipeOutputFunc
+	pipeBytes          PipeBytesFunc
+	capturePane        CapturePaneFunc
+	attachPane         AttachPaneFunc
+	sendKeys           SendKeysFunc
+	sendRawKeys        SendRawKeysFunc
+	resizePane         ResizePaneFunc
+	isSessionAlive     SessionAliveFunc
+	isWindowAlive      WindowAliveFunc
+	isPaneIdle         PaneIdleFunc
+	listProjectWindows ListProjectWindowsFunc
+	createShellWindow  CreateShellWindowFunc
+	killWindow         KillWindowFunc
+	tmuxSession        string
+	projectScoped      bool
+	pendingTriggers    *pendingTriggerSet
+	secret             string
+	authDisabled       bool
+	allowedOrigins     map[string]bool
+	harnesses          []harnessResponse
+	mux                *http.ServeMux
+	ledgerClientsMu    sync.Mutex
+	ledgerClients      map[string]map[*ledgerWSClient]struct{}
+	tmuxStreams        *tmuxStreamRegistry
+	startLocks         *orchestratorStartLocks
 }
 
 const deleteCleanupLease = 5 * time.Minute
@@ -68,57 +71,69 @@ const orchestratorStartTimeout = 30 * time.Second
 
 // Deps contains dependencies needed by the web API.
 type Deps struct {
-	Config         *config.Config
-	ConfigPath     string
-	Ledger         *ledger.Ledger
-	Manager        *runtimepkg.Manager
-	Registry       *worker.Registry
-	Trigger        Triggerer
-	Cleaner        WorkerCleaner
-	PipeOutput     PipeOutputFunc
-	PipeBytes      PipeBytesFunc
-	CapturePane    CapturePaneFunc
-	AttachPane     AttachPaneFunc
-	SendKeys       SendKeysFunc
-	SendRawKeys    SendRawKeysFunc
-	ResizePane     ResizePaneFunc
-	IsSessionAlive SessionAliveFunc
-	IsWindowAlive  WindowAliveFunc
-	IsPaneIdle     PaneIdleFunc
-	Session        string
-	Secret         string
-	AuthDisabled   bool
-	AllowedOrigins []string
+	Config             *config.Config
+	ConfigPath         string
+	Ledger             *ledger.Ledger
+	Manager            *runtimepkg.Manager
+	Registry           *worker.Registry
+	Trigger            Triggerer
+	Cleaner            WorkerCleaner
+	PipeOutput         PipeOutputFunc
+	PipeBytes          PipeBytesFunc
+	CapturePane        CapturePaneFunc
+	AttachPane         AttachPaneFunc
+	SendKeys           SendKeysFunc
+	SendRawKeys        SendRawKeysFunc
+	ResizePane         ResizePaneFunc
+	IsSessionAlive     SessionAliveFunc
+	IsWindowAlive      WindowAliveFunc
+	IsPaneIdle         PaneIdleFunc
+	ListProjectWindows ListProjectWindowsFunc
+	CreateShellWindow  CreateShellWindowFunc
+	KillWindow         KillWindowFunc
+	Session            string
+	Secret             string
+	AuthDisabled       bool
+	AllowedOrigins     []string
 }
+
+type ListProjectWindowsFunc func(ctx context.Context, session, projectSlug string) ([]tmux.WindowInfo, error)
+
+type CreateShellWindowFunc func(ctx context.Context, session, projectSlug, repoPath string) (tmux.WindowInfo, error)
+
+type KillWindowFunc func(ctx context.Context, session, window string) error
 
 // New constructs a web API handler.
 func New(deps Deps) *Server {
 	cfg := config.Clone(deps.Config)
 	s := &Server{
-		cfg:            cfg,
-		configPath:     deps.ConfigPath,
-		ledger:         deps.Ledger,
-		manager:        deps.Manager,
-		registry:       deps.Registry,
-		trigger:        deps.Trigger,
-		pipeOutput:     deps.PipeOutput,
-		pipeBytes:      deps.PipeBytes,
-		capturePane:    deps.CapturePane,
-		attachPane:     deps.AttachPane,
-		sendKeys:       deps.SendKeys,
-		sendRawKeys:    deps.SendRawKeys,
-		resizePane:     deps.ResizePane,
-		isSessionAlive: deps.IsSessionAlive,
-		isWindowAlive:  deps.IsWindowAlive,
-		isPaneIdle:     deps.IsPaneIdle,
-		tmuxSession:    deps.Session,
-		secret:         deps.Secret,
-		authDisabled:   deps.AuthDisabled,
-		allowedOrigins: allowedOriginSet(deps.AllowedOrigins),
-		harnesses:      harnessResponsesFromConfig(cfg),
-		mux:            http.NewServeMux(),
-		tmuxStreams:    &tmuxStreamRegistry{},
-		startLocks:     &orchestratorStartLocks{},
+		cfg:                cfg,
+		configPath:         deps.ConfigPath,
+		ledger:             deps.Ledger,
+		manager:            deps.Manager,
+		registry:           deps.Registry,
+		trigger:            deps.Trigger,
+		pipeOutput:         deps.PipeOutput,
+		pipeBytes:          deps.PipeBytes,
+		capturePane:        deps.CapturePane,
+		attachPane:         deps.AttachPane,
+		sendKeys:           deps.SendKeys,
+		sendRawKeys:        deps.SendRawKeys,
+		resizePane:         deps.ResizePane,
+		isSessionAlive:     deps.IsSessionAlive,
+		isWindowAlive:      deps.IsWindowAlive,
+		isPaneIdle:         deps.IsPaneIdle,
+		listProjectWindows: deps.ListProjectWindows,
+		createShellWindow:  deps.CreateShellWindow,
+		killWindow:         deps.KillWindow,
+		tmuxSession:        deps.Session,
+		secret:             deps.Secret,
+		authDisabled:       deps.AuthDisabled,
+		allowedOrigins:     allowedOriginSet(deps.AllowedOrigins),
+		harnesses:          harnessResponsesFromConfig(cfg),
+		mux:                http.NewServeMux(),
+		tmuxStreams:        &tmuxStreamRegistry{},
+		startLocks:         &orchestratorStartLocks{},
 		pendingTriggers: &pendingTriggerSet{
 			tasks: make(map[string]triggerState),
 		},
@@ -163,6 +178,15 @@ func New(deps Deps) *Server {
 	}
 	if s.isPaneIdle == nil && deps.IsSessionAlive == nil && deps.IsWindowAlive == nil {
 		s.isPaneIdle = tmux.IsPaneIdleContext
+	}
+	if s.listProjectWindows == nil {
+		s.listProjectWindows = tmux.ListProjectWindowsContext
+	}
+	if s.createShellWindow == nil {
+		s.createShellWindow = tmux.CreateProjectShellWindowContext
+	}
+	if s.killWindow == nil {
+		s.killWindow = tmux.KillWindowContext
 	}
 	if s.ledger != nil {
 		s.ledger.SetOnChange(s.broadcastLedgerChange)
@@ -369,7 +393,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/ws/worker/", s.handleWorkerLogWS)
 	s.mux.HandleFunc("/ws/orchestrator", s.handleOrchestratorLogWS)
 	s.mux.HandleFunc("/ws/ledger", s.handleLedgerWS)
-	s.mux.HandleFunc("/ws/projects/", s.handleProjectWS)
+	s.mux.HandleFunc("/ws/projects/", s.handleProjectWSRoute)
 }
 
 func (s *Server) handleProjects(w http.ResponseWriter, r *http.Request) {
@@ -501,6 +525,15 @@ func (s *Server) handleProjectRoute(w http.ResponseWriter, r *http.Request) {
 			}
 			return
 		}
+	case "terminals":
+		if len(parts) == 2 {
+			projectServer.handleProjectTerminals(w, r)
+			return
+		}
+		if len(parts) == 3 {
+			projectServer.deleteProjectTerminal(w, r, parts[2])
+			return
+		}
 	case "workers":
 		if len(parts) == 2 {
 			projectServer.handleWorkers(w, r)
@@ -517,6 +550,210 @@ func (s *Server) handleProjectRoute(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeError(w, http.StatusNotFound, "project route not found")
+}
+
+func (s *Server) handleProjectTerminals(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		s.listProjectTerminals(w, r)
+	case http.MethodPost:
+		s.createProjectTerminal(w, r)
+	default:
+		methodNotAllowed(w, http.MethodGet, http.MethodPost)
+	}
+}
+
+func (s *Server) listProjectTerminals(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), followupTmuxOperationTimeout)
+	defer cancel()
+	slug, err := s.projectSlug()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	session, err := s.tmuxSessionName()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	windows, err := s.listProjectWindows(ctx, session, slug)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "list project terminals")
+		return
+	}
+	terminals := make([]terminalResponse, 0, len(windows))
+	for _, window := range windows {
+		if terminal := terminalResponseFromWindow(slug, window); terminal.Kind != "" {
+			terminals = append(terminals, terminal)
+		}
+	}
+	sort.SliceStable(terminals, func(i, j int) bool {
+		if terminals[i].Window != terminals[j].Window {
+			return terminals[i].Window < terminals[j].Window
+		}
+		return terminals[i].ID < terminals[j].ID
+	})
+	writeJSON(w, http.StatusOK, terminals)
+}
+
+func (s *Server) createProjectTerminal(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), followupTmuxOperationTimeout)
+	defer cancel()
+	slug, err := s.projectSlug()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	session, err := s.tmuxSessionName()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	cfg, ok := s.configSnapshot()
+	if !ok || cfg.Project.RepoPath == "" {
+		writeError(w, http.StatusInternalServerError, "project repository is not configured")
+		return
+	}
+	window, err := s.createShellWindow(ctx, session, slug, cfg.Project.RepoPath)
+	if err != nil {
+		if errors.Is(err, tmux.ErrSessionNotFound) {
+			writeError(w, http.StatusServiceUnavailable, "tmux session is unavailable")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "create project terminal")
+		return
+	}
+	terminal := terminalResponseFromWindow(slug, window)
+	if terminal.Kind != "shell" {
+		writeError(w, http.StatusInternalServerError, "created terminal is not a project shell")
+		return
+	}
+	writeJSON(w, http.StatusCreated, terminal)
+}
+
+func (s *Server) deleteProjectTerminal(w http.ResponseWriter, r *http.Request, window string) {
+	if !requireMethod(w, r, http.MethodDelete) {
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), followupTmuxOperationTimeout)
+	defer cancel()
+	slug, err := s.projectSlug()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	kind, status := projectTerminalRouteKind(slug, window)
+	if status != 0 {
+		writeError(w, status, terminalRouteError(status))
+		return
+	}
+	if kind != "shell" {
+		writeError(w, http.StatusForbidden, "harness terminal is protected")
+		return
+	}
+	session, err := s.tmuxSessionName()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if err := s.killWindow(ctx, session, window); err != nil && !isMissingTmuxWindowError(err) {
+		writeError(w, http.StatusInternalServerError, "delete project terminal")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": true, "window": window})
+}
+
+func (s *Server) projectSlug() (string, error) {
+	cfg, ok := s.configSnapshot()
+	if !ok || strings.TrimSpace(cfg.Project.Slug) == "" {
+		return "", fmt.Errorf("project is not configured")
+	}
+	return strings.TrimSpace(cfg.Project.Slug), nil
+}
+
+func (s *Server) handleProjectWSRoute(w http.ResponseWriter, r *http.Request) {
+	rest := strings.TrimPrefix(r.URL.Path, "/ws/projects/")
+	parts := strings.Split(rest, "/")
+	if len(parts) >= 2 && parts[1] == "terminal" {
+		if len(parts) != 3 || parts[0] == "" || parts[2] == "" {
+			writeError(w, http.StatusBadRequest, "project terminal websocket route is malformed")
+			return
+		}
+		projectServer, err := s.projectServer(parts[0])
+		if err != nil {
+			writeError(w, http.StatusNotFound, "project not found")
+			return
+		}
+		_, status := projectTerminalRouteKind(parts[0], parts[2])
+		if status != 0 {
+			writeError(w, status, terminalRouteError(status))
+			return
+		}
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w, http.MethodGet)
+			return
+		}
+		projectServer.handleTmuxLogWS(w, r, parts[2], "terminal")
+		return
+	}
+	s.handleProjectWS(w, r)
+}
+
+func terminalRouteError(status int) string {
+	switch status {
+	case http.StatusBadRequest:
+		return "project terminal window is malformed"
+	case http.StatusForbidden:
+		return "project terminal window is outside project"
+	default:
+		return "project terminal window not found"
+	}
+}
+
+func projectTerminalRouteKind(slug, window string) (string, int) {
+	if window == "" {
+		return "", http.StatusBadRequest
+	}
+	if err := tmux.ValidateWindowName(window); err != nil {
+		return "", http.StatusBadRequest
+	}
+	if !strings.HasPrefix(window, tmux.ProjectWindowPrefix(slug)) {
+		return "", http.StatusForbidden
+	}
+	if kind := projectTerminalKind(slug, window); kind != "" {
+		return kind, 0
+	}
+	return "", http.StatusNotFound
+}
+
+func projectTerminalKind(slug, window string) string {
+	prefix := tmux.ProjectWindowPrefix(slug)
+	if err := tmux.ValidateWindowName(window); err != nil {
+		return ""
+	}
+	if window == prefix+"orchestrator" {
+		return "orchestrator"
+	}
+	if isProjectWorkerWindowName(prefix, window) {
+		return "worker"
+	}
+	if err := tmux.ValidateProjectShellWindowName(slug, window); err == nil {
+		return "shell"
+	}
+	return ""
+}
+
+func isProjectWorkerWindowName(prefix, window string) bool {
+	if !strings.HasPrefix(window, prefix+"worker-") {
+		return false
+	}
+	taskID := strings.TrimPrefix(window, prefix+"worker-")
+	return taskID != "" && taskID != "orchestrator" &&
+		!strings.HasPrefix(taskID, "shell-") &&
+		!strings.HasPrefix(taskID, "worker-") &&
+		!strings.Contains(taskID, "-shell-") &&
+		!strings.Contains(taskID, "-worker-") &&
+		!strings.HasSuffix(taskID, "-orchestrator")
 }
 
 func (s *Server) deleteProject(w http.ResponseWriter, _ *http.Request, slug string) {
@@ -577,30 +814,33 @@ func (s *Server) projectServer(slug string) (*Server, error) {
 		return nil, err
 	}
 	out := &Server{
-		cfg:             project.Config,
-		ledger:          project.Ledger,
-		manager:         s.manager,
-		registry:        project.Registry,
-		trigger:         project.Orchestrator,
-		pipeOutput:      s.pipeOutput,
-		pipeBytes:       s.pipeBytes,
-		capturePane:     s.capturePane,
-		attachPane:      s.attachPane,
-		sendKeys:        s.sendKeys,
-		sendRawKeys:     s.sendRawKeys,
-		resizePane:      s.resizePane,
-		isSessionAlive:  s.isSessionAlive,
-		isWindowAlive:   s.isWindowAlive,
-		isPaneIdle:      s.isPaneIdle,
-		tmuxSession:     project.Session,
-		projectScoped:   true,
-		pendingTriggers: s.pendingTriggers,
-		secret:          s.secret,
-		authDisabled:    s.authDisabled,
-		allowedOrigins:  s.allowedOrigins,
-		harnesses:       s.harnesses,
-		tmuxStreams:     s.tmuxStreams,
-		startLocks:      s.startLocks,
+		cfg:                project.Config,
+		ledger:             project.Ledger,
+		manager:            s.manager,
+		registry:           project.Registry,
+		trigger:            project.Orchestrator,
+		pipeOutput:         s.pipeOutput,
+		pipeBytes:          s.pipeBytes,
+		capturePane:        s.capturePane,
+		attachPane:         s.attachPane,
+		sendKeys:           s.sendKeys,
+		sendRawKeys:        s.sendRawKeys,
+		resizePane:         s.resizePane,
+		isSessionAlive:     s.isSessionAlive,
+		isWindowAlive:      s.isWindowAlive,
+		isPaneIdle:         s.isPaneIdle,
+		listProjectWindows: s.listProjectWindows,
+		createShellWindow:  s.createShellWindow,
+		killWindow:         s.killWindow,
+		tmuxSession:        project.Session,
+		projectScoped:      true,
+		pendingTriggers:    s.pendingTriggers,
+		secret:             s.secret,
+		authDisabled:       s.authDisabled,
+		allowedOrigins:     s.allowedOrigins,
+		harnesses:          s.harnesses,
+		tmuxStreams:        s.tmuxStreams,
+		startLocks:         s.startLocks,
 	}
 	out.cleaner = defaultWorkerCleaner{
 		deps: func() cleanupDependencies {
@@ -1324,6 +1564,29 @@ type projectResponse struct {
 	Slug     string `json:"slug"`
 	RepoPath string `json:"repo_path"`
 	Session  string `json:"session,omitempty"`
+}
+
+type terminalResponse struct {
+	ID        string `json:"id"`
+	Window    string `json:"window"`
+	Title     string `json:"title"`
+	Kind      string `json:"kind"`
+	Active    bool   `json:"active"`
+	Available bool   `json:"available"`
+	Closable  bool   `json:"closable"`
+}
+
+func terminalResponseFromWindow(slug string, window tmux.WindowInfo) terminalResponse {
+	kind := projectTerminalKind(slug, window.Name)
+	return terminalResponse{
+		ID:        window.Name,
+		Window:    window.Name,
+		Title:     window.Name,
+		Kind:      kind,
+		Active:    true,
+		Available: true,
+		Closable:  kind == "shell",
+	}
 }
 
 type taskCreateResponse struct {

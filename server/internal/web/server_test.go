@@ -21,6 +21,7 @@ import (
 	"github.com/xpadev/ccx-t2/internal/config"
 	"github.com/xpadev/ccx-t2/internal/ledger"
 	runtimepkg "github.com/xpadev/ccx-t2/internal/runtime"
+	"github.com/xpadev/ccx-t2/internal/tmux"
 	"github.com/xpadev/ccx-t2/internal/worker"
 )
 
@@ -3492,6 +3493,285 @@ func TestMethodNotAllowed(t *testing.T) {
 	}
 	if allow := resp.Header().Get("Allow"); allow != "GET, POST" {
 		t.Fatalf("Allow = %q, want GET, POST", allow)
+	}
+}
+
+func TestProjectTerminalsListUsesSelectedProjectAndClassifiesWindows(t *testing.T) {
+	cfg, manager := newTestProjectManager(t, "alpha", "beta")
+	var gotSession, gotSlug string
+	handler := New(Deps{
+		Config:  cfg,
+		Manager: manager,
+		ListProjectWindows: func(ctx context.Context, session, slug string) ([]tmux.WindowInfo, error) {
+			gotSession, gotSlug = session, slug
+			return []tmux.WindowInfo{
+				{ID: "@3", Name: "beta-worker-task-001"},
+				{ID: "@1", Name: "beta-shell-1"},
+				{ID: "@2", Name: "beta-orchestrator"},
+			}, nil
+		},
+		AuthDisabled: true,
+	})
+
+	resp := performRequest(handler, http.MethodGet, "/api/projects/beta/terminals")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	if gotSession != "ccx-test" || gotSlug != "beta" {
+		t.Fatalf("list args = %q %q, want ccx-test beta", gotSession, gotSlug)
+	}
+	var terminals []terminalResponse
+	if err := json.Unmarshal(resp.Body.Bytes(), &terminals); err != nil {
+		t.Fatalf("decode terminals: %v", err)
+	}
+	if len(terminals) != 3 {
+		t.Fatalf("terminals = %#v, want three entries", terminals)
+	}
+	if terminals[0].Window != "beta-orchestrator" || terminals[0].Kind != "orchestrator" || terminals[0].Closable {
+		t.Fatalf("orchestrator terminal = %#v, want protected orchestrator", terminals[0])
+	}
+	if terminals[1].Window != "beta-shell-1" || terminals[1].Kind != "shell" || !terminals[1].Closable {
+		t.Fatalf("shell terminal = %#v, want closable shell", terminals[1])
+	}
+	if terminals[2].Window != "beta-worker-task-001" || terminals[2].Kind != "worker" || terminals[2].Closable {
+		t.Fatalf("worker terminal = %#v, want protected worker", terminals[2])
+	}
+	for _, terminal := range terminals {
+		if terminal.ID != terminal.Window || terminal.Title == "" || !terminal.Active || !terminal.Available {
+			t.Fatalf("terminal = %#v, want stable active/available DTO fields", terminal)
+		}
+	}
+}
+
+func TestProjectTerminalCreateUsesSelectedRepository(t *testing.T) {
+	cfg, manager := newTestProjectManager(t, "alpha", "beta")
+	var gotSession, gotSlug, gotRepo string
+	handler := New(Deps{
+		Config:  cfg,
+		Manager: manager,
+		CreateShellWindow: func(ctx context.Context, session, slug, repoPath string) (tmux.WindowInfo, error) {
+			gotSession, gotSlug, gotRepo = session, slug, repoPath
+			return tmux.WindowInfo{ID: "@9", Name: "beta-shell-1"}, nil
+		},
+		AuthDisabled: true,
+	})
+
+	resp := performRequest(handler, http.MethodPost, "/api/projects/beta/terminals")
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusCreated, resp.Body.String())
+	}
+	beta, err := manager.Project("beta")
+	if err != nil {
+		t.Fatalf("Project beta: %v", err)
+	}
+	if gotSession != "ccx-test" || gotSlug != "beta" || gotRepo != beta.Config.Project.RepoPath {
+		t.Fatalf("create args = %q %q %q, want ccx-test beta %q", gotSession, gotSlug, gotRepo, beta.Config.Project.RepoPath)
+	}
+	var terminal terminalResponse
+	if err := json.Unmarshal(resp.Body.Bytes(), &terminal); err != nil {
+		t.Fatalf("decode terminal: %v", err)
+	}
+	if terminal.Window != "beta-shell-1" || terminal.Kind != "shell" || !terminal.Closable {
+		t.Fatalf("terminal = %#v, want created shell", terminal)
+	}
+}
+
+func TestProjectTerminalDeleteRejectsForeignAndProtectedWindows(t *testing.T) {
+	cfg, manager := newTestProjectManager(t, "alpha", "beta")
+	var kills int
+	handler := New(Deps{
+		Config:  cfg,
+		Manager: manager,
+		KillWindow: func(ctx context.Context, session, window string) error {
+			kills++
+			return nil
+		},
+		AuthDisabled: true,
+	})
+
+	for _, test := range []struct {
+		name   string
+		window string
+		status int
+	}{
+		{name: "foreign", window: "beta-shell-1", status: http.StatusForbidden},
+		{name: "malformed", window: "alpha-shell-foo", status: http.StatusNotFound},
+		{name: "whitespace", window: "alpha-shell-1%20", status: http.StatusBadRequest},
+		{name: "orchestrator", window: "alpha-orchestrator", status: http.StatusForbidden},
+		{name: "worker", window: "alpha-worker-task-001", status: http.StatusForbidden},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			resp := performRequest(handler, http.MethodDelete, "/api/projects/alpha/terminals/"+test.window)
+			if resp.Code != test.status {
+				t.Fatalf("status = %d, want %d; body=%s", resp.Code, test.status, resp.Body.String())
+			}
+		})
+	}
+	if kills != 0 {
+		t.Fatalf("kill calls = %d, want none for rejected windows", kills)
+	}
+	method := performRequest(handler, http.MethodGet, "/api/projects/alpha/terminals/alpha-shell-1")
+	if method.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("GET delete status = %d, want %d", method.Code, http.StatusMethodNotAllowed)
+	}
+	if kills != 0 {
+		t.Fatalf("kill calls after wrong method = %d, want none", kills)
+	}
+}
+
+func TestProjectTerminalDeleteIsIdempotentWhenWindowDisappears(t *testing.T) {
+	cfg, manager := newTestProjectManager(t, "alpha")
+	var gotSession, gotWindow string
+	handler := New(Deps{
+		Config:  cfg,
+		Manager: manager,
+		KillWindow: func(ctx context.Context, session, window string) error {
+			gotSession, gotWindow = session, window
+			return errors.New("tmux: can't find window: alpha-shell-1")
+		},
+		AuthDisabled: true,
+	})
+
+	resp := performRequest(handler, http.MethodDelete, "/api/projects/alpha/terminals/alpha-shell-1")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	if gotSession != "ccx-test" || gotWindow != "alpha-shell-1" {
+		t.Fatalf("kill args = %q %q, want ccx-test alpha-shell-1", gotSession, gotWindow)
+	}
+}
+
+func TestProjectTerminalWebSocketUsesAtomicTransportInputAndResize(t *testing.T) {
+	cfg, manager := newTestProjectManager(t, "alpha")
+	live := make(chan []byte, 1)
+	cleaned := make(chan struct{})
+	var cleanupOnce sync.Once
+	var gotInput string
+	var gotResize [2]int
+	inputReceived := make(chan struct{})
+	resizeReceived := make(chan struct{})
+	server := httptest.NewServer(New(Deps{
+		Config:  cfg,
+		Manager: manager,
+		AttachPane: func(ctx context.Context, session, window string) (*PaneAttachment, error) {
+			if session != "ccx-test" || window != "alpha-shell-1" {
+				t.Fatalf("attach args = %q %q, want ccx-test alpha-shell-1", session, window)
+			}
+			return &PaneAttachment{
+				Snapshot: []byte("snapshot"),
+				Chunks:   live,
+				Cleanup: func() {
+					cleanupOnce.Do(func() {
+						close(cleaned)
+						close(live)
+					})
+				},
+			}, nil
+		},
+		SendRawKeys: func(ctx context.Context, session, window, keys string) error {
+			gotInput = keys
+			close(inputReceived)
+			return nil
+		},
+		ResizePane: func(ctx context.Context, session, window string, cols, rows int) error {
+			gotResize = [2]int{cols, rows}
+			close(resizeReceived)
+			return nil
+		},
+		AuthDisabled: true,
+	}))
+	defer server.Close()
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(server.URL, "/ws/projects/alpha/terminal/alpha-shell-1"), nil)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	var message wsMessage
+	if err := conn.ReadJSON(&message); err != nil {
+		t.Fatalf("ReadJSON snapshot: %v", err)
+	}
+	if message.Type != "chunk" || message.Data != "snapshot" {
+		t.Fatalf("snapshot = %#v, want snapshot chunk", message)
+	}
+	if err := conn.WriteJSON(wsMessage{Type: "input", Data: "echo hi"}); err != nil {
+		t.Fatalf("WriteJSON input: %v", err)
+	}
+	if err := conn.WriteJSON(wsMessage{Type: "resize", Cols: 120, Rows: 40}); err != nil {
+		t.Fatalf("WriteJSON resize: %v", err)
+	}
+	select {
+	case <-inputReceived:
+	case <-time.After(time.Second):
+		t.Fatal("input was not forwarded")
+	}
+	select {
+	case <-resizeReceived:
+	case <-time.After(time.Second):
+		t.Fatal("resize was not forwarded")
+	}
+	if gotInput != "echo hi" || gotResize != [2]int{120, 40} {
+		t.Fatalf("transport mutations = %q %#v, want input and resize", gotInput, gotResize)
+	}
+	live <- []byte("live")
+	if err := conn.ReadJSON(&message); err != nil {
+		t.Fatalf("ReadJSON live: %v", err)
+	}
+	if message.Type != "chunk" || message.Data != "live" {
+		t.Fatalf("live = %#v, want live chunk", message)
+	}
+	_ = conn.Close()
+	select {
+	case <-cleaned:
+	case <-time.After(time.Second):
+		t.Fatal("attachment cleanup was not called")
+	}
+}
+
+func TestProjectTerminalWebSocketRejectsForeignWindowBeforeAttach(t *testing.T) {
+	cfg, manager := newTestProjectManager(t, "alpha", "beta")
+	server := httptest.NewServer(New(Deps{
+		Config:  cfg,
+		Manager: manager,
+		AttachPane: func(ctx context.Context, session, window string) (*PaneAttachment, error) {
+			t.Fatal("AttachPane called for foreign terminal")
+			return nil, nil
+		},
+		AuthDisabled: true,
+	}))
+	defer server.Close()
+
+	_, resp, err := websocket.DefaultDialer.Dial(wsURL(server.URL, "/ws/projects/alpha/terminal/beta-shell-1"), nil)
+	if err == nil {
+		t.Fatal("Dial error = nil, want forbidden")
+	}
+	if resp == nil || resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("response = %#v, want 403", resp)
+	}
+}
+
+func TestProjectTerminalWebSocketToleratesDisappearingWindow(t *testing.T) {
+	cfg, manager := newTestProjectManager(t, "alpha")
+	server := httptest.NewServer(New(Deps{
+		Config:  cfg,
+		Manager: manager,
+		AttachPane: func(ctx context.Context, session, window string) (*PaneAttachment, error) {
+			return nil, errors.New("tmux: can't find window: alpha-shell-1")
+		},
+		AuthDisabled: true,
+	}))
+	defer server.Close()
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(server.URL, "/ws/projects/alpha/terminal/alpha-shell-1"), nil)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer conn.Close()
+	var message wsMessage
+	if err := conn.ReadJSON(&message); err != nil {
+		t.Fatalf("ReadJSON: %v", err)
+	}
+	if message.Type != "error" || message.Data != "open terminal log stream" {
+		t.Fatalf("message = %#v, want terminal stream error", message)
 	}
 }
 
