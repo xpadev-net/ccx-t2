@@ -172,8 +172,9 @@ type wsWriter struct {
 var errWSWriterClosed = errors.New("websocket writer is closed")
 
 type tmuxStreamRegistry struct {
-	mu      sync.Mutex
-	streams map[string]*tmuxSharedStream
+	mu             sync.Mutex
+	streams        map[string]*tmuxSharedStream
+	attachmentLock map[string]*sync.Mutex
 }
 
 type tmuxSharedStream struct {
@@ -235,48 +236,25 @@ func (s *tmuxStreamSubscription) wasSlowEvicted() bool {
 	}
 }
 
-func (r *tmuxStreamRegistry) subscribeAttachedWithStatus(ctx context.Context, key, session, window string, attach AttachPaneFunc) ([]byte, *tmuxStreamSubscription, func(), error) {
-	if attach == nil {
-		return nil, nil, nil, errors.New("tmux pane attachment is not configured")
-	}
+func (r *tmuxStreamRegistry) lockAttachment(key string) func() {
 	r.mu.Lock()
-	if r.streams == nil {
-		r.streams = make(map[string]*tmuxSharedStream)
+	if r.attachmentLock == nil {
+		r.attachmentLock = make(map[string]*sync.Mutex)
 	}
-	stream := r.streams[key]
-	var streamChunks <-chan []byte
-	startStream := false
-	if stream == nil || stream.closed {
-		attachment, err := attach(ctx, session, window)
-		if err != nil {
-			r.mu.Unlock()
-			return nil, nil, nil, err
-		}
-		if attachment == nil || attachment.Chunks == nil {
-			r.mu.Unlock()
-			if attachment != nil && attachment.Cleanup != nil {
-				attachment.Cleanup()
-			}
-			return nil, nil, nil, errors.New("tmux pane attachment returned no stream")
-		}
-		stream = &tmuxSharedStream{
-			key:         key,
-			cleanup:     attachment.Cleanup,
-			snapshot:    append([]byte(nil), attachment.Snapshot...),
-			subscribers: make(map[*tmuxSubscriber]struct{}),
-		}
-		r.streams[key] = stream
-		streamChunks = attachment.Chunks
-		startStream = true
+	lock := r.attachmentLock[key]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		r.attachmentLock[key] = lock
 	}
+	r.mu.Unlock()
+	lock.Lock()
+	return lock.Unlock
+}
+
+func (r *tmuxStreamRegistry) addSubscriberLocked(key string, stream *tmuxSharedStream) (*tmuxStreamSubscription, []byte, func()) {
 	sub := &tmuxSubscriber{chunks: make(chan []byte, 128), slow: make(chan struct{})}
 	stream.subscribers[sub] = struct{}{}
 	snapshot := append([]byte(nil), stream.snapshot...)
-	r.mu.Unlock()
-	if startStream {
-		go r.runStream(stream, streamChunks)
-	}
-
 	var once sync.Once
 	cleanup := func() {
 		var closePipe bool
@@ -300,7 +278,62 @@ func (r *tmuxStreamRegistry) subscribeAttachedWithStatus(ctx context.Context, ke
 			stream.closePipe()
 		}
 	}
-	return snapshot, &tmuxStreamSubscription{chunks: sub.chunks, slow: sub.slow}, cleanup, nil
+	return &tmuxStreamSubscription{chunks: sub.chunks, slow: sub.slow}, snapshot, cleanup
+}
+
+func (r *tmuxStreamRegistry) subscribeAttachedWithStatus(ctx context.Context, key, session, window string, attach AttachPaneFunc) ([]byte, *tmuxStreamSubscription, func(), error) {
+	if attach == nil {
+		return nil, nil, nil, errors.New("tmux pane attachment is not configured")
+	}
+	unlockAttachment := r.lockAttachment(key)
+	defer unlockAttachment()
+
+	r.mu.Lock()
+	if r.streams == nil {
+		r.streams = make(map[string]*tmuxSharedStream)
+	}
+	stream := r.streams[key]
+	if stream != nil && !stream.closed {
+		subscription, snapshot, cleanup := r.addSubscriberLocked(key, stream)
+		r.mu.Unlock()
+		return snapshot, subscription, cleanup, nil
+	}
+	r.mu.Unlock()
+
+	// Do not hold the registry mutex across tmux control-mode I/O. The
+	// per-key lock above still prevents duplicate attachments for this pane,
+	// while unrelated panes can attach concurrently.
+	attachment, err := attach(ctx, session, window)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if attachment == nil || attachment.Chunks == nil {
+		if attachment != nil && attachment.Cleanup != nil {
+			attachment.Cleanup()
+		}
+		return nil, nil, nil, errors.New("tmux pane attachment returned no stream")
+	}
+
+	r.mu.Lock()
+	if stream = r.streams[key]; stream != nil && !stream.closed {
+		subscription, snapshot, cleanup := r.addSubscriberLocked(key, stream)
+		r.mu.Unlock()
+		if attachment.Cleanup != nil {
+			attachment.Cleanup()
+		}
+		return snapshot, subscription, cleanup, nil
+	}
+	stream = &tmuxSharedStream{
+		key:         key,
+		cleanup:     attachment.Cleanup,
+		snapshot:    append([]byte(nil), attachment.Snapshot...),
+		subscribers: make(map[*tmuxSubscriber]struct{}),
+	}
+	r.streams[key] = stream
+	subscription, snapshot, cleanup := r.addSubscriberLocked(key, stream)
+	r.mu.Unlock()
+	go r.runStream(stream, attachment.Chunks)
+	return snapshot, subscription, cleanup, nil
 }
 
 type orchestratorStartLocks struct {
@@ -977,6 +1010,9 @@ func (r *tmuxStreamRegistry) runStream(stream *tmuxSharedStream, chunks <-chan [
 		stream.subscribers = nil
 	}
 	r.mu.Unlock()
+	// The source ending is a terminal lifecycle event, not just a subscriber
+	// notification: release the tmux attachment even when clients stayed open.
+	stream.closePipe()
 }
 
 func (s *tmuxSharedStream) closePipe() {

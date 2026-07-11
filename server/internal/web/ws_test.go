@@ -196,6 +196,99 @@ func TestTmuxSharedAtomicAttachmentReusesSnapshotAndCleansUpAfterLastSubscriber(
 	}
 }
 
+func TestTmuxAtomicAttachmentDoesNotBlockUnrelatedKeys(t *testing.T) {
+	registry := &tmuxStreamRegistry{}
+	slowStarted := make(chan struct{})
+	releaseSlow := make(chan struct{})
+	makeAttachment := func() *PaneAttachment {
+		chunks := make(chan []byte)
+		var once sync.Once
+		return &PaneAttachment{
+			Chunks: chunks,
+			Cleanup: func() {
+				once.Do(func() { close(chunks) })
+			},
+		}
+	}
+	attach := func(_ context.Context, _ string, window string) (*PaneAttachment, error) {
+		if window == "slow" {
+			close(slowStarted)
+			<-releaseSlow
+		}
+		return makeAttachment(), nil
+	}
+
+	slowResult := make(chan error, 1)
+	go func() {
+		_, _, cleanup, err := registry.subscribeAttachedWithStatus(context.Background(), "session\x00slow", "session", "slow", attach)
+		if cleanup != nil {
+			defer cleanup()
+		}
+		slowResult <- err
+	}()
+	select {
+	case <-slowStarted:
+	case <-time.After(time.Second):
+		t.Fatal("slow attachment did not start")
+	}
+
+	fastResult := make(chan error, 1)
+	go func() {
+		_, _, cleanup, err := registry.subscribeAttachedWithStatus(context.Background(), "session\x00fast", "session", "fast", attach)
+		if cleanup != nil {
+			cleanup()
+		}
+		fastResult <- err
+	}()
+	select {
+	case err := <-fastResult:
+		if err != nil {
+			t.Fatalf("fast attachment: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("unrelated fast attachment was blocked by slow tmux I/O")
+	}
+	close(releaseSlow)
+	select {
+	case err := <-slowResult:
+		if err != nil {
+			t.Fatalf("slow attachment: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("slow attachment did not finish after release")
+	}
+}
+
+func TestTmuxAtomicAttachmentCleansUpWhenSourceEnds(t *testing.T) {
+	registry := &tmuxStreamRegistry{}
+	source := make(chan []byte)
+	cleaned := make(chan struct{})
+	snapshot, subscription, cleanup, err := registry.subscribeAttachedWithStatus(context.Background(), "session\x00window", "session", "window", func(context.Context, string, string) (*PaneAttachment, error) {
+		return &PaneAttachment{Snapshot: []byte("snapshot"), Chunks: source, Cleanup: func() { close(cleaned) }}, nil
+	})
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	if string(snapshot) != "snapshot" {
+		t.Fatalf("snapshot = %q, want snapshot", snapshot)
+	}
+	close(source)
+	select {
+	case <-cleaned:
+	case <-time.After(time.Second):
+		t.Fatal("source completion did not clean up attachment")
+	}
+	select {
+	case _, ok := <-subscription.chunks:
+		if ok {
+			t.Fatal("subscriber stream remained open after source completion")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("subscriber stream did not close after source completion")
+	}
+	cleanup()
+}
+
 func TestWSWriterSerializesConcurrentMessagesAndPing(t *testing.T) {
 	const messageCount = 4 * 24
 	handlerErrors := make(chan error, 1)

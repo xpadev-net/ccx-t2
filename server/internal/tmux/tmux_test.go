@@ -112,7 +112,7 @@ done
 func TestAttachPaneContextCancelsDuringSetup(t *testing.T) {
 	oldExecCommandContext := execCommandContext
 	execCommandContext = func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
-		return exec.CommandContext(ctx, "sh", "-c", "sleep 10")
+		return exec.CommandContext(ctx, "sh", "-c", "exec sleep 10")
 	}
 	t.Cleanup(func() { execCommandContext = oldExecCommandContext })
 
