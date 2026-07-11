@@ -2,6 +2,7 @@ package tmux
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -1075,6 +1076,229 @@ func CapturePaneContext(ctx context.Context, session, window string) ([]byte, er
 		return nil, fmt.Errorf("capture-pane: %w", err)
 	}
 	return out, nil
+}
+
+// PaneAttachment is an atomic pane snapshot/live stream. Snapshot contains
+// all pane state through the attachment watermark. Chunks contains only
+// ordered pane output after that watermark. Cleanup is idempotent and ends the
+// tmux control-mode client.
+type PaneAttachment struct {
+	Snapshot []byte
+	Chunks   <-chan []byte
+	Cleanup  func()
+}
+
+// AttachPane attaches to one pane using a single tmux control-mode client.
+func AttachPane(session, window string) (*PaneAttachment, error) {
+	return AttachPaneContext(context.Background(), session, window)
+}
+
+// AttachPaneContext returns an atomic snapshot/live handoff. tmux is attached
+// and captures the pane through the same serialized control-mode client. Any
+// output emitted while setup and capture run is discarded as pre-watermark
+// output. The %end response for capture-pane is the formal watermark:
+// control-mode notifications never occur inside a response block, so
+// notifications before that response are represented by the snapshot and only
+// notifications after it are emitted on Chunks.
+//
+// The context controls setup cancellation. The caller must invoke Cleanup to
+// release the control-mode client when the stream is no longer needed.
+func AttachPaneContext(ctx context.Context, session, window string) (*PaneAttachment, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	processCtx, processCancel := context.WithCancel(context.Background())
+	cmd := execCommandContext(processCtx, "tmux", "-C", "-f", "/dev/null", "attach-session", "-t", "="+session)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		processCancel()
+		return nil, fmt.Errorf("tmux control stdout: %w", err)
+	}
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		processCancel()
+		return nil, fmt.Errorf("tmux control stdin: %w", err)
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		processCancel()
+		return nil, fmt.Errorf("tmux control attach: %w", err)
+	}
+
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- cmd.Wait() }()
+	reader := bufio.NewReader(stdout)
+	stop := make(chan struct{})
+	setupDone := make(chan struct{})
+	var setupOnce sync.Once
+	finishSetup := func() { setupOnce.Do(func() { close(setupDone) }) }
+	go func() {
+		select {
+		case <-ctx.Done():
+			processCancel()
+			if cmd.Process != nil {
+				_ = cmd.Process.Kill()
+			}
+		case <-setupDone:
+		}
+	}()
+	var cleanupOnce sync.Once
+	cleanup := func() {
+		cleanupOnce.Do(func() {
+			finishSetup()
+			processCancel()
+			close(stop)
+			_ = stdin.Close()
+			if cmd.Process != nil {
+				_ = cmd.Process.Kill()
+			}
+		})
+	}
+
+	fail := func(err error) (*PaneAttachment, error) {
+		cleanup()
+		<-waitDone
+		if stderr.Len() > 0 {
+			return nil, fmt.Errorf("%w: %s", err, strings.TrimSpace(stderr.String()))
+		}
+		return nil, err
+	}
+
+	if _, err := readControlResponse(reader); err != nil {
+		return fail(fmt.Errorf("tmux control attach response: %w", err))
+	}
+	target := session + ":" + window
+	if err := writeControlCommand(stdin, "display-message", "-p", "-t", tmuxControlQuote(target), tmuxControlQuote("#{pane_id}")); err != nil {
+		return fail(fmt.Errorf("tmux control pane lookup: %w", err))
+	}
+	paneResponse, err := readControlResponse(reader)
+	if err != nil {
+		return fail(fmt.Errorf("tmux control pane lookup response: %w", err))
+	}
+	paneID := strings.TrimSpace(string(paneResponse))
+	if paneID == "" || strings.ContainsAny(paneID, "\r\n \t") {
+		return fail(fmt.Errorf("tmux control pane lookup returned invalid pane id %q", paneID))
+	}
+	if err := writeControlCommand(stdin, "refresh-client", "-A", tmuxControlQuote(paneID+":on")); err != nil {
+		return fail(fmt.Errorf("tmux control enable pane output: %w", err))
+	}
+	if _, err := readControlResponse(reader); err != nil {
+		return fail(fmt.Errorf("tmux control enable pane output response: %w", err))
+	}
+	if err := writeControlCommand(stdin, "capture-pane", "-p", "-e", "-S", "-200", "-t", tmuxControlQuote(paneID)); err != nil {
+		return fail(fmt.Errorf("tmux control capture pane: %w", err))
+	}
+	snapshot, err := readControlResponse(reader)
+	if err != nil {
+		return fail(fmt.Errorf("tmux control capture pane response: %w", err))
+	}
+
+	finishSetup()
+	chunks := make(chan []byte, 128)
+	go streamControlOutput(reader, paneID, chunks, stop)
+	return &PaneAttachment{Snapshot: snapshot, Chunks: chunks, Cleanup: cleanup}, nil
+}
+
+func writeControlCommand(w io.Writer, command string, args ...string) error {
+	if _, err := io.WriteString(w, command); err != nil {
+		return err
+	}
+	for _, arg := range args {
+		if _, err := io.WriteString(w, " "+arg); err != nil {
+			return err
+		}
+	}
+	_, err := io.WriteString(w, "\n")
+	return err
+}
+
+func tmuxControlQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
+}
+
+func readControlResponse(reader *bufio.Reader) ([]byte, error) {
+	for {
+		line, err := readControlLine(reader)
+		if err != nil {
+			return nil, err
+		}
+		if !strings.HasPrefix(line, "%begin ") {
+			if strings.HasPrefix(line, "%exit") {
+				return nil, errors.New(strings.TrimSpace(line))
+			}
+			continue
+		}
+
+		var body bytes.Buffer
+		for {
+			line, err = readControlLine(reader)
+			if err != nil {
+				return nil, err
+			}
+			if strings.HasPrefix(line, "%end ") {
+				return body.Bytes(), nil
+			}
+			if strings.HasPrefix(line, "%error ") {
+				return nil, fmt.Errorf("tmux control command error: %s", strings.TrimSpace(line))
+			}
+			body.WriteString(line)
+			body.WriteByte('\n')
+		}
+	}
+}
+
+func readControlLine(reader *bufio.Reader) (string, error) {
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r"), nil
+}
+
+func streamControlOutput(reader *bufio.Reader, paneID string, chunks chan<- []byte, stop <-chan struct{}) {
+	defer close(chunks)
+	for {
+		line, err := readControlLine(reader)
+		if err != nil {
+			return
+		}
+		if !strings.HasPrefix(line, "%output ") {
+			continue
+		}
+		value := strings.TrimPrefix(line, "%output ")
+		separator := strings.IndexByte(value, ' ')
+		if separator < 0 || value[:separator] != paneID {
+			continue
+		}
+		chunk := decodeControlOutput(value[separator+1:])
+		if len(chunk) == 0 {
+			continue
+		}
+		select {
+		case chunks <- chunk:
+		case <-stop:
+			return
+		}
+	}
+}
+
+func decodeControlOutput(value string) []byte {
+	decoded := make([]byte, 0, len(value))
+	for i := 0; i < len(value); i++ {
+		if value[i] == '\\' && i+3 < len(value) && isOctal(value[i+1]) && isOctal(value[i+2]) && isOctal(value[i+3]) {
+			decoded = append(decoded, (value[i+1]-'0')*64+(value[i+2]-'0')*8+(value[i+3]-'0'))
+			i += 3
+			continue
+		}
+		decoded = append(decoded, value[i])
+	}
+	return decoded
+}
+
+func isOctal(value byte) bool {
+	return value >= '0' && value <= '7'
 }
 
 // PipeOutput redirects pane output to a temporary file and streams it line by

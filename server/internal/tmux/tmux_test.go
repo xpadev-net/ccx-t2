@@ -1,8 +1,10 @@
 package tmux
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -59,6 +61,128 @@ func TestListWindowsContextParsesMetadataWithTabs(t *testing.T) {
 	}}
 	if !reflect.DeepEqual(windows, want) {
 		t.Fatalf("windows = %#v, want %#v", windows, want)
+	}
+}
+
+func TestAttachPaneContextUsesCaptureResponseAsWatermark(t *testing.T) {
+	oldExecCommandContext := execCommandContext
+	execCommandContext = func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+		script := `
+printf '%s\n' '%begin 0 1 0' '%end 0 1 0'
+while IFS= read -r line; do
+  case "$line" in
+    display-message*) printf '%s\n' '%begin 0 2 0' '%0' '%end 0 2 0' ;;
+    refresh-client*) printf '%s\n' '%begin 0 3 0' '%end 0 3 0' '%output %0 pre-before-capture' ;;
+	    capture-pane*) printf '%s\n' '%begin 0 4 0' 'snapshot' '%end 0 4 0' '%output %0 live\012' '%output %0 after\134' ;;
+  esac
+done
+`
+		return exec.CommandContext(ctx, "sh", "-c", script)
+	}
+	t.Cleanup(func() { execCommandContext = oldExecCommandContext })
+
+	attachment, err := AttachPaneContext(context.Background(), "session", "window")
+	if err != nil {
+		t.Fatalf("AttachPaneContext: %v", err)
+	}
+	if got, want := string(attachment.Snapshot), "snapshot\n"; got != want {
+		t.Fatalf("snapshot = %q, want %q", got, want)
+	}
+	for i, want := range []string{"live\n", "after\\"} {
+		select {
+		case chunk := <-attachment.Chunks:
+			if got := string(chunk); got != want {
+				t.Fatalf("live chunk %d = %q, want %q", i, got, want)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("live chunk %d was not delivered", i)
+		}
+	}
+	attachment.Cleanup()
+	select {
+	case _, ok := <-attachment.Chunks:
+		if ok {
+			t.Fatal("attachment stream remained open after cleanup")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("attachment stream did not close after cleanup")
+	}
+}
+
+func TestAttachPaneContextCancelsDuringSetup(t *testing.T) {
+	oldExecCommandContext := execCommandContext
+	execCommandContext = func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+		return exec.CommandContext(ctx, "sh", "-c", "sleep 10")
+	}
+	t.Cleanup(func() { execCommandContext = oldExecCommandContext })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := AttachPaneContext(ctx, "session", "window")
+		result <- err
+	}()
+	time.Sleep(25 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-result:
+		if err == nil {
+			t.Fatal("AttachPaneContext error = nil, want cancellation failure")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("AttachPaneContext did not stop after cancellation")
+	}
+}
+
+func TestAttachPaneContextUsesRealTmuxControlMode(t *testing.T) {
+	socket := fmt.Sprintf("ccx-t9-attach-%d", os.Getpid())
+	session := "ccx-t9-attach"
+	run := func(args ...string) []byte {
+		cmd := exec.Command("tmux", append([]string{"-L", socket, "-f", "/dev/null"}, args...)...)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("tmux %v: %v: %s", args, err, out)
+		}
+		return out
+	}
+	_ = exec.Command("tmux", "-L", socket, "-f", "/dev/null", "kill-server").Run()
+	run("new-session", "-d", "-s", session)
+	t.Cleanup(func() {
+		cmd := exec.Command("tmux", "-L", socket, "-f", "/dev/null", "kill-server")
+		_ = cmd.Run()
+	})
+	run("send-keys", "-t", "="+session+":0", "printf pre", "C-m")
+	time.Sleep(200 * time.Millisecond)
+
+	oldExecCommandContext := execCommandContext
+	execCommandContext = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		return exec.CommandContext(ctx, name, append([]string{"-L", socket}, args...)...)
+	}
+	t.Cleanup(func() { execCommandContext = oldExecCommandContext })
+
+	attachment, err := AttachPaneContext(context.Background(), session, "0")
+	if err != nil {
+		t.Fatalf("AttachPaneContext: %v", err)
+	}
+	defer attachment.Cleanup()
+	if !bytes.Contains(attachment.Snapshot, []byte("pre")) {
+		t.Fatalf("snapshot = %q, want pre-boundary output", attachment.Snapshot)
+	}
+	run("send-keys", "-t", "="+session+":0", "printf live", "C-m")
+	deadline := time.NewTimer(2 * time.Second)
+	defer deadline.Stop()
+	for {
+		select {
+		case chunk, ok := <-attachment.Chunks:
+			if !ok {
+				t.Fatal("real tmux control-mode stream closed before live output")
+			}
+			if bytes.Contains(chunk, []byte("live")) {
+				return
+			}
+		case <-deadline.C:
+			t.Fatal("real tmux control-mode output was not delivered")
+		}
 	}
 }
 

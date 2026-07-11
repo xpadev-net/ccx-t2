@@ -139,6 +139,63 @@ func TestTmuxSharedStreamSignalsSlowSubscriberWithoutStarvingHealthySubscriber(t
 	}
 }
 
+func TestTmuxSharedAtomicAttachmentReusesSnapshotAndCleansUpAfterLastSubscriber(t *testing.T) {
+	registry := &tmuxStreamRegistry{}
+	source := make(chan []byte, 2)
+	cleanupCalled := make(chan struct{})
+	attachCalls := atomic.Int32{}
+	attach := func(context.Context, string, string) (*PaneAttachment, error) {
+		attachCalls.Add(1)
+		return &PaneAttachment{
+			Snapshot: []byte("snapshot"),
+			Chunks:   source,
+			Cleanup: func() {
+				close(cleanupCalled)
+				close(source)
+			},
+		}, nil
+	}
+
+	snapshot1, first, firstCleanup, err := registry.subscribeAttachedWithStatus(context.Background(), "session\x00window", "session", "window", attach)
+	if err != nil {
+		t.Fatalf("first subscribe: %v", err)
+	}
+	snapshot2, second, secondCleanup, err := registry.subscribeAttachedWithStatus(context.Background(), "session\x00window", "session", "window", attach)
+	if err != nil {
+		t.Fatalf("second subscribe: %v", err)
+	}
+	if got := attachCalls.Load(); got != 1 {
+		t.Fatalf("attach calls = %d, want one shared attachment", got)
+	}
+	if string(snapshot1) != "snapshot" || string(snapshot2) != "snapshot" {
+		t.Fatalf("snapshots = %q and %q, want shared snapshot", snapshot1, snapshot2)
+	}
+
+	source <- []byte("same")
+	for name, subscription := range map[string]*tmuxStreamSubscription{"first": first, "second": second} {
+		select {
+		case chunk := <-subscription.chunks:
+			if string(chunk) != "same" {
+				t.Fatalf("%s chunk = %q, want same", name, chunk)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("%s subscriber did not receive live output", name)
+		}
+	}
+	firstCleanup()
+	select {
+	case <-cleanupCalled:
+		t.Fatal("shared attachment cleaned up before last subscriber")
+	case <-time.After(25 * time.Millisecond):
+	}
+	secondCleanup()
+	select {
+	case <-cleanupCalled:
+	case <-time.After(time.Second):
+		t.Fatal("shared attachment cleanup was not called after last subscriber")
+	}
+}
+
 func TestWSWriterSerializesConcurrentMessagesAndPing(t *testing.T) {
 	const messageCount = 4 * 24
 	handlerErrors := make(chan error, 1)

@@ -22,6 +22,16 @@ type PipeOutputFunc func(session, window string) (<-chan string, func(), error)
 // function that stops the stream.
 type PipeBytesFunc func(session, window string) (<-chan []byte, func(), error)
 
+// PaneAttachment is the web-layer form of an atomic tmux pane handoff.
+// Snapshot ends at the tmux watermark; Chunks contains only subsequent output.
+type PaneAttachment struct {
+	Snapshot []byte
+	Chunks   <-chan []byte
+	Cleanup  func()
+}
+
+type AttachPaneFunc func(ctx context.Context, session, window string) (*PaneAttachment, error)
+
 type CapturePaneFunc func(ctx context.Context, session, window string) ([]byte, error)
 
 type SendKeysFunc func(ctx context.Context, session, window, keys string) error
@@ -171,6 +181,7 @@ type tmuxSharedStream struct {
 	cleanup     func()
 	cleanupOnce sync.Once
 	subscribers map[*tmuxSubscriber]struct{}
+	snapshot    []byte
 	closed      bool
 }
 
@@ -222,6 +233,74 @@ func (s *tmuxStreamSubscription) wasSlowEvicted() bool {
 	default:
 		return false
 	}
+}
+
+func (r *tmuxStreamRegistry) subscribeAttachedWithStatus(ctx context.Context, key, session, window string, attach AttachPaneFunc) ([]byte, *tmuxStreamSubscription, func(), error) {
+	if attach == nil {
+		return nil, nil, nil, errors.New("tmux pane attachment is not configured")
+	}
+	r.mu.Lock()
+	if r.streams == nil {
+		r.streams = make(map[string]*tmuxSharedStream)
+	}
+	stream := r.streams[key]
+	var streamChunks <-chan []byte
+	startStream := false
+	if stream == nil || stream.closed {
+		attachment, err := attach(ctx, session, window)
+		if err != nil {
+			r.mu.Unlock()
+			return nil, nil, nil, err
+		}
+		if attachment == nil || attachment.Chunks == nil {
+			r.mu.Unlock()
+			if attachment != nil && attachment.Cleanup != nil {
+				attachment.Cleanup()
+			}
+			return nil, nil, nil, errors.New("tmux pane attachment returned no stream")
+		}
+		stream = &tmuxSharedStream{
+			key:         key,
+			cleanup:     attachment.Cleanup,
+			snapshot:    append([]byte(nil), attachment.Snapshot...),
+			subscribers: make(map[*tmuxSubscriber]struct{}),
+		}
+		r.streams[key] = stream
+		streamChunks = attachment.Chunks
+		startStream = true
+	}
+	sub := &tmuxSubscriber{chunks: make(chan []byte, 128), slow: make(chan struct{})}
+	stream.subscribers[sub] = struct{}{}
+	snapshot := append([]byte(nil), stream.snapshot...)
+	r.mu.Unlock()
+	if startStream {
+		go r.runStream(stream, streamChunks)
+	}
+
+	var once sync.Once
+	cleanup := func() {
+		var closePipe bool
+		once.Do(func() {
+			r.mu.Lock()
+			current := r.streams[key]
+			if current == stream && !stream.closed {
+				if _, ok := stream.subscribers[sub]; ok {
+					delete(stream.subscribers, sub)
+					sub.closeNormally()
+				}
+				if len(stream.subscribers) == 0 {
+					stream.closed = true
+					delete(r.streams, key)
+					closePipe = true
+				}
+			}
+			r.mu.Unlock()
+		})
+		if closePipe {
+			stream.closePipe()
+		}
+	}
+	return snapshot, &tmuxStreamSubscription{chunks: sub.chunks, slow: sub.slow}, cleanup, nil
 }
 
 type orchestratorStartLocks struct {
@@ -505,17 +584,25 @@ func (s *Server) handleTmuxLogWS(w http.ResponseWriter, r *http.Request, window,
 	defer writer.close()
 
 	var snapshot []byte
-	if s.capturePane != nil {
-		captureCtx, captureCancel := context.WithTimeout(ctx, followupTmuxOperationTimeout)
-		var err error
-		snapshot, err = s.capturePane(captureCtx, session, window)
-		captureCancel()
-		if err != nil {
-			_ = writer.send(ctx, wsMessage{Type: "error", Data: "capture " + label + " pane"})
-			return
+	var subscription *tmuxStreamSubscription
+	var cleanup func()
+	if s.attachPane != nil {
+		if s.tmuxStreams == nil {
+			s.tmuxStreams = &tmuxStreamRegistry{}
 		}
+		snapshot, subscription, cleanup, err = s.tmuxStreams.subscribeAttachedWithStatus(ctx, session+"\x00"+window, session, window, s.attachPane)
+	} else {
+		if s.capturePane != nil {
+			captureCtx, captureCancel := context.WithTimeout(ctx, followupTmuxOperationTimeout)
+			snapshot, err = s.capturePane(captureCtx, session, window)
+			captureCancel()
+			if err != nil {
+				_ = writer.send(ctx, wsMessage{Type: "error", Data: "capture " + label + " pane"})
+				return
+			}
+		}
+		subscription, cleanup, err = s.subscribeTmuxStreamWithStatus(session, window)
 	}
-	subscription, cleanup, err := s.subscribeTmuxStreamWithStatus(session, window)
 	if err != nil {
 		_ = writer.send(ctx, wsMessage{Type: "error", Data: "open " + label + " log stream"})
 		return

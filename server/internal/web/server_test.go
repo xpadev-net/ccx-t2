@@ -2594,6 +2594,72 @@ func TestProjectOrchestratorLogWebSocketSendsInitialPaneSnapshot(t *testing.T) {
 	}
 }
 
+func TestProjectOrchestratorLogWebSocketUsesAtomicPaneAttachment(t *testing.T) {
+	cfg, manager := newTestProjectManager(t, "alpha")
+	live := make(chan []byte, 4)
+	attached := make(chan struct{})
+	cleaned := make(chan struct{})
+	server := httptest.NewServer(New(Deps{
+		Config:  cfg,
+		Manager: manager,
+		IsSessionAlive: func(context.Context, string) (bool, error) {
+			return true, nil
+		},
+		IsWindowAlive: func(context.Context, string, string) (bool, error) {
+			return true, nil
+		},
+		AttachPane: func(ctx context.Context, session, window string) (*PaneAttachment, error) {
+			if session != "ccx-test" || window != "alpha-orchestrator" {
+				t.Fatalf("attach args = %q %q, want ccx-test alpha-orchestrator", session, window)
+			}
+			close(attached)
+			return &PaneAttachment{
+				Snapshot: []byte("same\n"),
+				Chunks:   live,
+				Cleanup: func() {
+					close(cleaned)
+					close(live)
+				},
+			}, nil
+		},
+		AuthDisabled: true,
+	}))
+	defer server.Close()
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(server.URL, "/ws/projects/alpha/orchestrator"), nil)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	var msg wsMessage
+	if err := conn.ReadJSON(&msg); err != nil {
+		t.Fatalf("ReadJSON snapshot: %v", err)
+	}
+	if msg.Type != "chunk" || msg.Data != "same\n" {
+		t.Fatalf("snapshot message = %#v, want one snapshot chunk", msg)
+	}
+	select {
+	case <-attached:
+	default:
+		t.Fatal("atomic attachment was not used")
+	}
+	live <- []byte("same")
+	live <- []byte("same")
+	for i := 0; i < 2; i++ {
+		if err := conn.ReadJSON(&msg); err != nil {
+			t.Fatalf("ReadJSON live %d: %v", i, err)
+		}
+		if msg.Type != "chunk" || msg.Data != "same" {
+			t.Fatalf("live message %d = %#v, want repeated live chunk", i, msg)
+		}
+	}
+	_ = conn.Close()
+	select {
+	case <-cleaned:
+	case <-time.After(time.Second):
+		t.Fatal("atomic attachment cleanup was not called")
+	}
+}
+
 func TestProjectOrchestratorLogWebSocketForwardsTerminalInput(t *testing.T) {
 	cfg, manager := newTestProjectManager(t, "alpha")
 	lines := make(chan string)
