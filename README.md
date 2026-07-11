@@ -1,41 +1,38 @@
 # ccx-t2
 
-`ccx-t2` は、`task-pr-orchestrator` / `task-pr-worker` の運用を補助するための
-Go バックエンドと React Web UI です。単一プロセスで複数プロジェクトのタスク台帳、
-worker の tmux セッション、worktree、MCP エンドポイント、PR 状態を扱います。
+`ccx-t2` は、複数プロジェクトの tmux terminal をブラウザから扱う WebShell と、
+coding-agent の task/worktree/runtime を支える Go サービスです。普段の操作面は
+terminal-first で、左の project sidebar、project ごとの shell 一覧、上部の tab、
+1つの full-height terminal で構成されます。
 
-## 主な機能
+## WebShell の使い方
 
-- グローバル設定に登録された複数プロジェクトの管理
-- `tasks/ledger.md` 形式のタスク台帳の読み書き、作成、更新、分割、削除
-- task ごとの git worktree と tmux worker window の管理
-- orchestrator / worker 向け MCP HTTP エンドポイント
-- worker 完了通知、フォローアップ、PR 状態確認
-- WebSocket による台帳、orchestrator ログ、worker ログの更新通知
-- React Web UI によるプロジェクト切り替え、タスク、orchestrator/worker web shell、worker followup、harness、設定の操作
+- sidebar で project を選ぶと、その project に属する tmux window だけが表示されます。
+- `New shell` は project repository を cwd にした shell window を作成します。
+- sidebar または上部 tab で terminal を切り替えます。terminal ごとの scrollback と入力先は分離されます。
+- shell tab は status bar の `Close` で閉じられます。orchestrator / worker window は通常の terminal として表示・操作できますが、harness lifecycle を壊さないよう close は保護されます。
+- terminal stream が切れると自動的に再接続を続けます。`Reconnect` で即時再試行でき、browser が online に戻った時や visible になった時にも復帰を試みます。
+- window がなくなった場合や認証に失敗した場合は、再試行中とは区別して状態を表示します。
 
-## 現在の運用方針
+接続時は tmux pane の snapshot と後続の live output を順序どおり受け取ります。入力は選択中の
+project/window の WebSocket にだけ送り、表示領域の変更は tmux pane の rows/columns に同期します。
+再接続後は snapshot から表示を回復し、最後に測定した terminal size を再送します。
 
-このプロジェクトは、過去の `task-pr-orchestrator` / `task-pr-worker` 運用に合わせて、
-Worker が専用 worktree 内で実装、検証、PR 作成、`gh-review-hook`、PR マージまで完了し、
-その後 `notify(type="completed")` で PR URL と merge commit を Go ハーネスへ通知する
-モデルを採用します。Go ハーネスは worktree / tmux / 台帳 / notify / archive などの機械的な
-状態管理を担い、Orchestrator Agent はタスク整理、分割、worker 起動、完了タスクの archive を
-MCP ツール経由で判断します。
+## セキュリティ境界
 
-Orchestrator セッションは Web UI の Orchestrator パネルで、ログ閲覧用の画面ではなく
-tmux window に接続された対話可能な Web shell として操作できます。タスク追加、削除、
-整理のような継続的な調整は、ブラウザ上の shell に直接入力して選択中プロジェクトの
-orchestrator window へ送ります。
+- project slug と window ID は server 側で検証され、別 project の window は列挙・接続・削除できません。
+- UI が作成した project shell だけが generic terminal API から削除できます。
+- orchestrator / worker window は discoverable な protected terminal で、generic delete の対象外です。
+- API token は HTTP の `Authorization: Bearer` と WebSocket query に使用されます。config API は secret をマスクします。
+- terminal は shell と同じ権限で動作します。信頼できる host/network で稼働させ、外部公開時は TLS、認証、reverse proxy の access control を設定してください。
 
 ## リポジトリ構成
 
 ```text
 .
-├── docs/      要件と実装計画
-├── server/    Go バックエンドと ccx serve コマンド
-├── tasks/     タスク台帳
-└── web/       Vite + React + TypeScript UI
+├── docs/      要件、実装計画、受け入れシナリオ
+├── server/    Go backend、terminal REST/WS、埋め込み Web UI
+└── web/       Vite + React + TypeScript + xterm WebShell
 ```
 
 ## 必要なもの
@@ -44,80 +41,18 @@ orchestrator window へ送ります。
 - Node.js と npm
 - git
 - tmux
-- 利用する agent harness の CLI
-  - `claude`
-  - `codex`
-  - `opencode`
-  - `cursor-agent`
+- 利用する agent harness CLI（`claude`, `codex`, `opencode`, `cursor-agent`）
 
-## セットアップ
+## セットアップと起動
 
 ```sh
 cd server
 go test ./...
-```
-
-```sh
-cd web
-npm install
-npm run build
-```
-
-## 開発時の確認
-
-バックエンドのテスト:
-
-```sh
-cd server
-go test ./...
-go test ./... -race -timeout 120s
-```
-
-Web UI の開発サーバー:
-
-```sh
-cd web
-npm run dev
-```
-
-Vite dev server は `127.0.0.1:5173` で起動し、`/api` と `/ws` を
-`127.0.0.1:8080` の Go サーバーへ proxy します。
-
-単一プロセス起動:
-
-```sh
-cd server
 go run ./cmd/ccx
 ```
 
-既定では `~/.config/ccx-t2/config.yaml` を読みます。存在しない場合は、project を空のままにした
-config を自動生成します。利用可能な harness CLI は PATH から検出し、検出できたものだけを
-登録します。対応 CLI では `--yolo` や dangerous permissions 系の flag を best-effort で付与します。
-Web UI は、配布時には `server/internal/webui/dist` から Go バイナリに埋め込まれたビルド済み
-asset を通常のフォールバックとして配信します。起動時には有効な `--web-dir` パス（既定は
-`web/dist`）を先に確認し、そのディレクトリが存在する場合だけ外部配信元として優先します。
-ローカルの `web/dist` を確認したい開発時の override として使います。
-
-Web UI を更新した場合は、release workflow と同じ流れで `web/src` から `web/dist` をビルドし、
-埋め込み用 asset と同期してから差分を検証します。
-
-```sh
-cd web
-npm run build
-npm run embedded:sync
-npm run embedded:check
-```
-
-`embedded:sync` を実行した場合は、Web UI のソース変更と一緒に
-`server/internal/webui/dist` も commit します。
-CI では `npm run build` 後に `npm run embedded:check` を実行し、同期漏れを検出します。
-
-## 設定
-
-設定は YAML で扱います。`${VAR}` 形式の環境変数プレースホルダーはロード時に展開されます。
-`mcp_secret` や GitHub token のような secret は、Web API ではマスクされます。
-
-例:
+既定では `~/.config/ccx-t2/config.yaml` を読みます。存在しない場合は project が空の config を
+生成します。project は config API または設定ファイルで登録してください。
 
 ```yaml
 server:
@@ -129,69 +64,49 @@ runtime:
   tmux_session: ccx-t2
   worktree_base: /path/to/worktrees
 
-orchestrator:
-  harness: claude
-  heartbeat_interval: 60s
-  timeout: 30m
-
-worker_harnesses:
-  - claude
-  - codex
-
-harnesses:
-  claude:
-    command: claude
-    mcp_args: "--mcp-url {url} --mcp-secret {secret}"
-  codex:
-    command: codex
-    mcp_args: "--mcp-url {url} --mcp-secret {secret}"
-
-projects: {}
+projects:
+  my-project:
+    repo_path: /path/to/my-project
 ```
 
-project は Web UI の Settings から追加できます。
+Web UI の開発時は別 terminal で次を実行します。
 
-## API
+```sh
+cd web
+npm install
+npm run dev
+```
 
-Web UI 向け:
+Vite は `127.0.0.1:5173` で起動し、`/api` と `/ws` を `127.0.0.1:8080` へ proxy します。
 
-- `GET /api/tasks`
-- `POST /api/tasks` — `request` または `body` だけの自然文 intake も登録できます
-- `PATCH /api/tasks/{id}`
-- `DELETE /api/tasks/{id}`
-- `GET /api/workers`
-- `POST /api/workers/{worker_id}/followup`
+## Build と embedded assets
+
+配布時は `server/internal/webui/dist` の asset が Go binary に埋め込まれます。`--web-dir`
+（既定 `web/dist`）が存在する場合だけ外部 directory を優先するため、開発 build の確認にも使えます。
+
+Web UI を変更した時は clean build を同期し、一致を検証します。
+
+```sh
+cd web
+npm run build
+npm run embedded:sync
+npm run embedded:check
+```
+
+## Terminal API
+
 - `GET /api/projects`
-- `GET /api/projects/{slug}/tasks`
-- `POST /api/projects/{slug}/tasks` — `request` または `body` だけの自然文 intake も登録できます
-- `PATCH /api/projects/{slug}/tasks/{id}`
-- `DELETE /api/projects/{slug}/tasks/{id}`
-- `GET /api/projects/{slug}/workers`
-- `POST /api/projects/{slug}/workers/{worker_id}/followup`
-- `GET /api/harnesses`
-- `GET /api/config`
-- `PATCH /api/config`
-- `GET /ws/ledger`
-- `GET /ws/orchestrator`
-- `GET /ws/worker/{window}`
-- `GET /ws/projects/{slug}/ledger`
-- `GET /ws/projects/{slug}/orchestrator`
-- `GET /ws/projects/{slug}/worker/{window}`
+- `GET /api/projects/{slug}/terminals`
+- `POST /api/projects/{slug}/terminals`
+- `DELETE /api/projects/{slug}/terminals/{window}`
+- `GET /ws/projects/{slug}/terminal/{window}`
 
-MCP 向け:
+WebSocket の client frame は `input` と `resize`、server frame は terminal `chunk` と `error` を扱います。
+task/worker/config/MCP API は harness compatibility のため引き続き提供されますが、primary WebShell
+surface ではありません。
 
-- `POST /mcp/orchestrator`
-- `POST /mcp/worker`
-
-自然文 intake は `Natural language intake` の仮タイトルで台帳に保存され、Orchestrator が
-コードベースを調査してから MCP の `update_task` / `create_task` / `split_task` /
-`archive_task` で調査結果、実装範囲、禁止範囲、検証方法、または不足情報を明記します。
-Web UI の Add Task は自然文入力を `request` として同じ backend API に送ります。
-
-詳細な要件は [docs/requirements.md](docs/requirements.md)、実装の段階計画は
-[docs/implementation-plan.md](docs/implementation-plan.md) を参照してください。自然文投入から
-PR マージ後の完了通知までの受け入れ確認は
-[docs/acceptance-scenario.md](docs/acceptance-scenario.md) にまとめています。
+詳細は [要件](docs/requirements.md)、[実装計画](docs/implementation-plan.md)、
+[手動受け入れシナリオ](docs/acceptance-scenario.md) を参照してください。
 
 ## ライセンス
 

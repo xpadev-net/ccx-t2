@@ -232,7 +232,8 @@ Worker からのイベントを直列に処理し、Orchestrator を適切なタ
 
 ### 目標
 
-台帳 CRUD・Worker ログストリーミング・タスク追加フォームが動く Web UI を実装する。
+project sidebar、project-scoped terminal tabs、1つの full-height xterm からなる WebShell を実装する。
+task/orchestrator/worker dashboard は primary UI から外し、harness window は protected terminal entry として統合する。
 
 ### 実装内容
 
@@ -247,12 +248,16 @@ Worker からのイベントを直列に処理し、Orchestrator を適切なタ
   - `DELETE /api/projects/:slug/tasks/:id` — タスク削除（in_progress の場合は stop_worker・worktree 削除を連動）
   - `GET /api/projects/:slug/workers` — 対象プロジェクトの Worker 一覧（内部 Worker レジストリから返す。tmux ウィンドウ一覧と同期）
   - `POST /api/projects/:slug/workers/:worker_id/followup` — 対象プロジェクトの active Worker tmux window に followup 入力を送信
+  - `GET /api/projects/:slug/terminals` — project window を stable DTO で列挙
+  - `POST /api/projects/:slug/terminals` — repository cwd の project shell を作成
+  - `DELETE /api/projects/:slug/terminals/:window` — closable shell だけを削除し harness window を保護
   - `GET /api/harnesses` — ハーネス一覧
   - `GET /api/config` — グローバル設定取得（GitHub トークン等のシークレットは返さない）
   - `PATCH /api/config` — グローバル設定更新。プロジェクト追加・更新・削除を含む
 - 静的ファイル配信は `server/cmd/ccx/main.go` で登録される。有効な `--web-dir` パス（既定は `web/dist`）が存在する場合は外部 directory を配信し、存在しない場合は `server/internal/webui/dist` から embed された asset を配信する
 
 **`server/internal/web/ws.go`**
+- `GET /ws/projects/:slug/terminal/:window` — snapshot/live 境界を保った generic terminal stream。raw input、resize、keepalive、slow-client resync を扱う
 - `GET /ws/projects/:slug/orchestrator` — tmux pipe-pane をブリッジして Orchestrator ログをストリーミング
 - `GET /ws/projects/:slug/worker/:window` — tmux pipe-pane をブリッジして Worker ログをストリーミング
 - `GET /ws/projects/:slug/ledger` — 対象プロジェクトの台帳変更（MCP ツール実行・REST 書き込みの後）を push 通知
@@ -262,12 +267,17 @@ Worker からのイベントを直列に処理し、Orchestrator を適切なタ
 - 本番ビルド（`vite build`）の出力 `web/dist/` は `npm run embedded:sync` で `server/internal/webui/dist` に同期し、Go サーバーは同期済みの embed asset を通常配信する
 - release workflow は `cd web && npm run build && npm run embedded:sync && npm run embedded:check` で `web/src`、`web/dist`、`server/internal/webui/dist` を同期・検証し、同期後の `server/internal/webui/dist` を Web UI のソース変更と一緒に commit する。CI は `npm run build` 後に `npm run embedded:check` を実行し、同期漏れを stale asset として検出する
 - 画面構成
-  - プロジェクト切り替え
-  - タスク台帳ビュー（一覧・編集・削除）
-  - タスク追加フォーム（自然言語入力 → 既存の `POST /api/projects/:slug/tasks` / `POST /api/tasks` 経由で Orchestrator へトリガー。backend が `body` のみの入力を intake として扱うため、追加 UI redesign は不要）
-  - Orchestrator console（ログストリーミング）
-  - Worker ダッシュボード（ログストリーミング・followup 送信）
-  - グローバル設定画面（harness と project 登録）
+  - project と terminal を階層表示する sidebar
+  - 選択 project の horizontal tab strip
+  - 選択 terminal 1つだけを表示する full-height xterm surface
+  - New shell、closable shell の確認付き close、refresh、manual reconnect
+  - connecting/open/retrying/missing/unauthorized/failed の接続状態
+  - orchestrator / worker を close 不可の protected terminal として表示
+- lifecycle / recovery
+  - project+window generation で stale socket/output/input/resize を拒否
+  - bounded exponential delay + jitter で無期限 retry
+  - online / visibility / manual retry で待機中接続をwake
+  - reconnect 後に snapshot/live stream と最後の resize を復元
 
 ---
 
@@ -307,5 +317,5 @@ Worker からのイベントを直列に処理し、Orchestrator を適切なタ
 | 2.5 | 単一コマンド起動・runtime manager | フェーズ1,2 | `ccx serve` が複数プロジェクト runtime と HTTP server を起動できる |
 | 3 | MCP サーバー | フェーズ2.5 | curl で project_slug 付きツールを呼べる |
 | 4 | イベントキュー・Orchestrator トリガー | フェーズ3 | Worker notify → Orchestrator 起動が動く |
-| 5 | Web UI | フェーズ4 | ブラウザからプロジェクトを切り替えて台帳操作・Worker ログ閲覧ができる |
+| 5 | WebShell UI | フェーズ4 | projectごとのshellを作成・切替・入力・resize・再接続・closeでき、harness windowが保護される |
 | 6 | ハーネス統合テスト | フェーズ5 | 対応ハーネスでエンドツーエンドフローが通る |
