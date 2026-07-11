@@ -42,8 +42,11 @@ function App() {
   const terminalsByProjectRef = useRef<TerminalMap>({});
   const loadGenerationRef = useRef(0);
   const terminalMutationGenerationRef = useRef(0);
+  const credentialGenerationRef = useRef(0);
+  const tokenRef = useRef(token);
   selectedProjectSlugRef.current = selectedProjectSlug;
   terminalsByProjectRef.current = terminalsByProject;
+  tokenRef.current = token;
 
   const client = useMemo(() => createTerminalApiClient({ token }), [token]);
 
@@ -182,26 +185,36 @@ function App() {
     if (!selectedProjectSlug || busyAction || loading || refreshing) {
       return;
     }
+    const projectSlug = selectedProjectSlug;
+    const credentialGeneration = credentialGenerationRef.current;
+    const mutationToken = token;
     setBusyAction("create");
     setError("");
     setNotice("");
     try {
-      const terminal = await client.createProjectTerminal(selectedProjectSlug);
+      const terminal = await client.createProjectTerminal(projectSlug);
+      if (credentialGeneration !== credentialGenerationRef.current || mutationToken !== tokenRef.current) {
+        return;
+      }
       terminalMutationGenerationRef.current += 1;
       setTerminalsByProject((current) => ({
         ...current,
-        [selectedProjectSlug]: [...(current[selectedProjectSlug] ?? []), terminal]
+        [projectSlug]: [...(current[projectSlug] ?? []), terminal]
       }));
-      if (selectedProjectSlugRef.current === selectedProjectSlug) {
-        setSelectedTerminalKey(terminalKey(selectedProjectSlug, terminal.window));
+      if (selectedProjectSlugRef.current === projectSlug) {
+        setSelectedTerminalKey(terminalKey(projectSlug, terminal.window));
       }
       setNotice(`Opened ${terminal.title}.`);
     } catch (err) {
-      setError(`Could not open a shell: ${errorMessage(err)}`);
+      if (credentialGeneration === credentialGenerationRef.current && mutationToken === tokenRef.current) {
+        setError(`Could not open a shell: ${errorMessage(err)}`);
+      }
     } finally {
-      setBusyAction("");
+      if (credentialGeneration === credentialGenerationRef.current && mutationToken === tokenRef.current) {
+        setBusyAction("");
+      }
     }
-  }, [busyAction, client, loading, refreshing, selectedProjectSlug]);
+  }, [busyAction, client, loading, refreshing, selectedProjectSlug, token]);
 
   const handleCloseTerminal = useCallback(async () => {
     if (!selectedTerminal?.closable || busyAction || loading || refreshing || !selectedProjectSlug) {
@@ -213,6 +226,8 @@ function App() {
     const projectSlug = selectedProjectSlug;
     const key = terminalKey(projectSlug, selectedTerminal.window);
     const windowName = selectedTerminal.window;
+    const credentialGeneration = credentialGenerationRef.current;
+    const mutationToken = token;
     const successor = (terminalsByProject[projectSlug] ?? []).find((terminal) => terminal.window !== windowName);
     const successorKey = successor ? terminalKey(projectSlug, successor.window) : "";
     setBusyAction("delete");
@@ -220,6 +235,9 @@ function App() {
     setNotice("");
     try {
       await client.deleteProjectTerminal(projectSlug, windowName);
+      if (credentialGeneration !== credentialGenerationRef.current || mutationToken !== tokenRef.current) {
+        return;
+      }
       terminalMutationGenerationRef.current += 1;
       setTerminalsByProject((current) => ({
         ...current,
@@ -249,11 +267,15 @@ function App() {
       }
       setNotice(`${selectedTerminal.title} closed.`);
     } catch (err) {
-      setError(`Could not close ${selectedTerminal.title}: ${errorMessage(err)}`);
+      if (credentialGeneration === credentialGenerationRef.current && mutationToken === tokenRef.current) {
+        setError(`Could not close ${selectedTerminal.title}: ${errorMessage(err)}`);
+      }
     } finally {
-      setBusyAction("");
+      if (credentialGeneration === credentialGenerationRef.current && mutationToken === tokenRef.current) {
+        setBusyAction("");
+      }
     }
-  }, [busyAction, client, loading, refreshing, selectedProjectSlug, selectedTerminal]);
+  }, [busyAction, client, loading, refreshing, selectedProjectSlug, selectedTerminal, token]);
 
   const handleTerminalState = useCallback((key: string, state: TerminalState) => {
     setConnections((current) => ({ ...current, [key]: state }));
@@ -278,7 +300,20 @@ function App() {
       return;
     }
     storeToken(nextToken);
+    credentialGenerationRef.current += 1;
     loadGenerationRef.current += 1;
+    setBusyAction("");
+    setProjects([]);
+    setTerminalsByProject({});
+    terminalsByProjectRef.current = {};
+    setTerminalLoadErrors({});
+    setSelectedProjectSlug("");
+    selectedProjectSlugRef.current = "";
+    setSelectedTerminalKey("");
+    setBuffers({});
+    setConnections({});
+    setRetrySignals({});
+    tabRefs.current = {};
     setLoading(true);
     setToken(nextToken);
     setNotice("Access token applied. Refreshing workspace…");
@@ -364,7 +399,7 @@ function App() {
             <span>Access token</span>
             <input type="password" value={tokenDraft} onChange={(event) => setTokenDraft(event.target.value)} placeholder="Optional bearer token" aria-label="Access token" />
           </label>
-          <button className="sidebar-token-button" type="button" onClick={applyToken}>Apply token</button>
+          <button className="sidebar-token-button" type="button" onClick={applyToken} disabled={loading || refreshing || Boolean(busyAction)}>Apply token</button>
         </div>
       </aside>
 
