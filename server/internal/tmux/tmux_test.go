@@ -73,7 +73,7 @@ while IFS= read -r line; do
   case "$line" in
     display-message*) printf '%s\n' '%begin 0 2 0' '%0' '%end 0 2 0' ;;
     refresh-client*) printf '%s\n' '%begin 0 3 0' '%end 0 3 0' '%output %0 pre-before-capture' ;;
-	    capture-pane*) printf '%s\n' '%begin 0 4 0' 'snapshot' '%end 0 4 0' '%output %0 live\012' '%output %0 after\134' ;;
+	    capture-pane*) printf '%s\n' '%begin 0 4 0' 'snapshot' '%end 1 2 3' '%error 1 2 3' '%end 0 4 0' '%output %0 live\012' '%output %0 after\134' ;;
   esac
 done
 `
@@ -85,7 +85,7 @@ done
 	if err != nil {
 		t.Fatalf("AttachPaneContext: %v", err)
 	}
-	if got, want := string(attachment.Snapshot), "snapshot\n"; got != want {
+	if got, want := string(attachment.Snapshot), "snapshot\n%end 1 2 3\n%error 1 2 3\n"; got != want {
 		t.Fatalf("snapshot = %q, want %q", got, want)
 	}
 	for i, want := range []string{"live\n", "after\\"} {
@@ -152,6 +152,7 @@ func TestAttachPaneContextUsesRealTmuxControlMode(t *testing.T) {
 		_ = cmd.Run()
 	})
 	run("send-keys", "-t", "="+session+":0", "printf pre", "C-m")
+	run("send-keys", "-t", "="+session+":0", "printf '%s\\n' '%end 1 2 3' '%error 1 2 3'", "C-m")
 	time.Sleep(200 * time.Millisecond)
 
 	oldExecCommandContext := execCommandContext
@@ -167,6 +168,11 @@ func TestAttachPaneContextUsesRealTmuxControlMode(t *testing.T) {
 	defer attachment.Cleanup()
 	if !bytes.Contains(attachment.Snapshot, []byte("pre")) {
 		t.Fatalf("snapshot = %q, want pre-boundary output", attachment.Snapshot)
+	}
+	for _, literal := range []string{"%end 1 2 3", "%error 1 2 3"} {
+		if !bytes.Contains(attachment.Snapshot, []byte(literal)) {
+			t.Fatalf("snapshot = %q, want literal pane line %q", attachment.Snapshot, literal)
+		}
 	}
 	run("send-keys", "-t", "="+session+":0", "printf live", "C-m")
 	deadline := time.NewTimer(2 * time.Second)

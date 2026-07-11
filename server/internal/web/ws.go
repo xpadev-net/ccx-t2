@@ -183,7 +183,11 @@ type tmuxSharedStream struct {
 	cleanupOnce sync.Once
 	subscribers map[*tmuxSubscriber]struct{}
 	snapshot    []byte
-	closed      bool
+	// history is ordered output after snapshot's tmux watermark. A joiner
+	// receives a private replay of this prefix before it consumes future chunks.
+	history       [][]byte
+	recordHistory bool
+	closed        bool
 }
 
 type tmuxSubscriber struct {
@@ -195,8 +199,9 @@ type tmuxSubscriber struct {
 }
 
 type tmuxStreamSubscription struct {
-	chunks <-chan []byte
-	slow   <-chan struct{}
+	initial <-chan []byte
+	chunks  <-chan []byte
+	slow    <-chan struct{}
 }
 
 func (s *tmuxSubscriber) deliver(chunk []byte) bool {
@@ -255,6 +260,11 @@ func (r *tmuxStreamRegistry) addSubscriberLocked(key string, stream *tmuxSharedS
 	sub := &tmuxSubscriber{chunks: make(chan []byte, 128), slow: make(chan struct{})}
 	stream.subscribers[sub] = struct{}{}
 	snapshot := append([]byte(nil), stream.snapshot...)
+	initial := make(chan []byte, len(stream.history))
+	for _, chunk := range stream.history {
+		initial <- append([]byte(nil), chunk...)
+	}
+	close(initial)
 	var once sync.Once
 	cleanup := func() {
 		var closePipe bool
@@ -278,7 +288,7 @@ func (r *tmuxStreamRegistry) addSubscriberLocked(key string, stream *tmuxSharedS
 			stream.closePipe()
 		}
 	}
-	return &tmuxStreamSubscription{chunks: sub.chunks, slow: sub.slow}, snapshot, cleanup
+	return &tmuxStreamSubscription{initial: initial, chunks: sub.chunks, slow: sub.slow}, snapshot, cleanup
 }
 
 func (r *tmuxStreamRegistry) subscribeAttachedWithStatus(ctx context.Context, key, session, window string, attach AttachPaneFunc) ([]byte, *tmuxStreamSubscription, func(), error) {
@@ -324,10 +334,11 @@ func (r *tmuxStreamRegistry) subscribeAttachedWithStatus(ctx context.Context, ke
 		return snapshot, subscription, cleanup, nil
 	}
 	stream = &tmuxSharedStream{
-		key:         key,
-		cleanup:     attachment.Cleanup,
-		snapshot:    append([]byte(nil), attachment.Snapshot...),
-		subscribers: make(map[*tmuxSubscriber]struct{}),
+		key:           key,
+		cleanup:       attachment.Cleanup,
+		snapshot:      append([]byte(nil), attachment.Snapshot...),
+		recordHistory: true,
+		subscribers:   make(map[*tmuxSubscriber]struct{}),
 	}
 	r.streams[key] = stream
 	subscription, snapshot, cleanup := r.addSubscriberLocked(key, stream)
@@ -645,6 +656,16 @@ func (s *Server) handleTmuxLogWS(w http.ResponseWriter, r *http.Request, window,
 
 	if len(snapshot) > 0 {
 		if err := writer.send(ctx, wsMessage{Type: "chunk", Data: string(snapshot)}); err != nil {
+			return
+		}
+	}
+	for initial := subscription.initial; initial != nil; {
+		chunk, ok := <-initial
+		if !ok {
+			initial = nil
+			break
+		}
+		if err := writer.send(ctx, wsMessage{Type: "chunk", Data: string(chunk)}); err != nil {
 			return
 		}
 	}
@@ -976,6 +997,9 @@ func (r *tmuxStreamRegistry) runStream(stream *tmuxSharedStream, chunks <-chan [
 		if stream.closed {
 			r.mu.Unlock()
 			return
+		}
+		if stream.recordHistory {
+			stream.history = append(stream.history, append([]byte(nil), chunk...))
 		}
 		for sub := range stream.subscribers {
 			if sub.deliver(chunk) {

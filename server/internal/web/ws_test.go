@@ -196,6 +196,71 @@ func TestTmuxSharedAtomicAttachmentReusesSnapshotAndCleansUpAfterLastSubscriber(
 	}
 }
 
+func TestTmuxSharedAtomicAttachmentLateSubscriberReplaysThroughJoinWatermark(t *testing.T) {
+	registry := &tmuxStreamRegistry{}
+	source := make(chan []byte, 4)
+	attach := func(context.Context, string, string) (*PaneAttachment, error) {
+		return &PaneAttachment{
+			Snapshot: []byte("base"),
+			Chunks:   source,
+			Cleanup:  func() { close(source) },
+		}, nil
+	}
+
+	snapshot1, first, firstCleanup, err := registry.subscribeAttachedWithStatus(context.Background(), "session\x00window", "session", "window", attach)
+	if err != nil {
+		t.Fatalf("first subscribe: %v", err)
+	}
+	if string(snapshot1) != "base" {
+		t.Fatalf("first snapshot = %q, want base", snapshot1)
+	}
+	source <- []byte("X")
+	select {
+	case chunk := <-first.chunks:
+		if string(chunk) != "X" {
+			t.Fatalf("first live chunk = %q, want X", chunk)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first subscriber did not receive X")
+	}
+
+	snapshot2, second, secondCleanup, err := registry.subscribeAttachedWithStatus(context.Background(), "session\x00window", "session", "window", attach)
+	if err != nil {
+		t.Fatalf("late subscribe: %v", err)
+	}
+	if string(snapshot2) != "base" {
+		t.Fatalf("late snapshot = %q, want base", snapshot2)
+	}
+	select {
+	case replay, ok := <-second.initial:
+		if !ok || string(replay) != "X" {
+			t.Fatalf("late replay = %q, open=%v; want X", replay, ok)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("late subscriber did not receive replay through join watermark")
+	}
+	select {
+	case _, ok := <-second.initial:
+		if ok {
+			t.Fatal("late replay remained open after watermark")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("late replay did not finish before future live output")
+	}
+
+	source <- []byte("Y")
+	select {
+	case chunk := <-second.chunks:
+		if string(chunk) != "Y" {
+			t.Fatalf("late future chunk = %q, want Y", chunk)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("late subscriber did not receive future output")
+	}
+	firstCleanup()
+	secondCleanup()
+}
+
 func TestTmuxAtomicAttachmentDoesNotBlockUnrelatedKeys(t *testing.T) {
 	registry := &tmuxStreamRegistry{}
 	slowStarted := make(chan struct{})

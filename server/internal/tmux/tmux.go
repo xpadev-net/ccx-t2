@@ -1218,13 +1218,26 @@ func tmuxControlQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
 }
 
+type tmuxControlFrame struct {
+	fields [3]string
+}
+
+func parseTmuxControlFrame(line, marker string) (tmuxControlFrame, bool) {
+	parts := strings.Fields(line)
+	if len(parts) != 4 || parts[0] != marker {
+		return tmuxControlFrame{}, false
+	}
+	return tmuxControlFrame{fields: [3]string{parts[1], parts[2], parts[3]}}, true
+}
+
 func readControlResponse(reader *bufio.Reader) ([]byte, error) {
 	for {
 		line, err := readControlLine(reader)
 		if err != nil {
 			return nil, err
 		}
-		if !strings.HasPrefix(line, "%begin ") {
+		opening, ok := parseTmuxControlFrame(line, "%begin")
+		if !ok {
 			if strings.HasPrefix(line, "%exit") {
 				return nil, errors.New(strings.TrimSpace(line))
 			}
@@ -1237,10 +1250,10 @@ func readControlResponse(reader *bufio.Reader) ([]byte, error) {
 			if err != nil {
 				return nil, err
 			}
-			if strings.HasPrefix(line, "%end ") {
+			if closing, ok := parseTmuxControlFrame(line, "%end"); ok && closing.fields == opening.fields {
 				return body.Bytes(), nil
 			}
-			if strings.HasPrefix(line, "%error ") {
+			if closing, ok := parseTmuxControlFrame(line, "%error"); ok && closing.fields == opening.fields {
 				return nil, fmt.Errorf("tmux control command error: %s", strings.TrimSpace(line))
 			}
 			body.WriteString(line)
