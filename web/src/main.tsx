@@ -1,1798 +1,609 @@
-import { StrictMode, useEffect, useMemo, useRef, useState } from "react";
-import type { Dispatch, FormEvent, SetStateAction } from "react";
+import { StrictMode, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { KeyboardEvent } from "react";
 import { createRoot } from "react-dom/client";
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
+import {
+  ApiError,
+  createTerminalApiClient,
+  type ProjectInfo,
+  type TerminalInfo,
+  type TerminalState
+} from "./terminal";
+import { useTerminalController } from "./terminal";
 import "./styles.css";
 
-type Task = {
-  id: string;
-  title?: string;
-  status?: string;
-  branch?: string;
-  worker_id?: string;
-  harness?: string;
-  pr_url?: string;
-  reason?: string;
-  body?: string;
-};
+type TerminalMap = Record<string, TerminalInfo[]>;
+type BufferMap = Record<string, string[]>;
+type ConnectionMap = Record<string, TerminalState>;
 
-type TaskCreateResponse = {
-  task: Task;
-  orchestrator_triggered: boolean;
-  trigger_error?: string;
-};
-
-type TaskDeleteResponse = {
-  deleted: Task;
-  worker_cleaned?: boolean;
-  cleanup_error?: string;
-  delete_pending?: boolean;
-};
-
-type WorkerFollowupResponse = {
-  sent: boolean;
-  task_id: string;
-  worker_id: string;
-  session: string;
-  window: string;
-};
-
-type WorkerInfo = {
-  worker_id: string;
-  task_id: string;
-  harness?: string;
-  worktree_path?: string;
-  started_at?: string;
-};
-
-type ProjectInfo = {
-  slug: string;
-  repo_path: string;
-  session?: string;
-};
-
-type ConfigResponse = {
-  project: {
-    slug: string;
-    repo_path: string;
-    worktree_base: string;
-  };
-  server: {
-    host: string;
-    port: number;
-  };
-  runtime?: {
-    tmux_session: string;
-    worktree_base: string;
-  };
-  orchestrator: {
-    harness: string;
-    heartbeat_interval: string;
-    timeout: string;
-  };
-  worker_harnesses: string[] | null;
-  harnesses: Record<string, { command: string }>;
-  github: {
-    owner?: string;
-    repo?: string;
-  };
-  projects?: Record<
-    string,
-    {
-      slug: string;
-      repo_path: string;
-      worktree_base: string;
-      ledger_path?: string;
-    }
-  >;
-};
-
-type ConfigDraft = {
-  projectSlug: string;
-  repoPath: string;
-  worktreeBase: string;
-  serverHost: string;
-  serverPort: string;
-  orchestratorHarness: string;
-  heartbeatInterval: string;
-  timeout: string;
-  workerHarnesses: string;
-  harnesses: Record<string, string>;
-  githubOwner: string;
-  githubRepo: string;
-};
-
-type TaskEditorDirty = {
-  title: boolean;
-  body: boolean;
-  status: boolean;
-};
-
-type ConnectionPhase =
-  | "idle"
-  | "connecting"
-  | "open"
-  | "retrying"
-  | "unauthorized"
-  | "forbidden"
-  | "blocked"
-  | "missing"
-  | "failed";
-type FailureConnectionPhase = "unauthorized" | "forbidden" | "blocked" | "missing" | "failed";
-
-type ConnectionState =
-  | {
-      phase: Exclude<ConnectionPhase, "retrying">;
-      detail?: string;
-    }
-  | {
-      phase: "retrying";
-      detail?: string;
-      attempt: number;
-      maxAttempts: number;
-      retryInMs: number;
-    };
-
-type HarnessInfo = {
-  name: string;
-  available: boolean;
-  usage: {
-    command?: string;
-    note?: string;
-  };
-};
-
-type WebSocketDiagnosis = {
-  phase: FailureConnectionPhase;
-  detail: string;
-  retryable: boolean;
-};
-
-type ReconnectingWebSocketOptions = {
-  path: string;
-  token: string;
-  notFoundPhase?: FailureConnectionPhase;
-  setState: (state: ConnectionState) => void;
-  onMessage: (event: MessageEvent) => void;
-  onOpen?: (socket: WebSocket) => void;
-  onClose?: () => void;
-  onSocketError?: () => void;
-};
-
-type LogSetter = Dispatch<SetStateAction<string[]>>;
-
-const statusOptions = ["unstarted", "in_progress", "blocked", "completed", "split"];
 const tokenStorageKey = "ccx.webToken";
-const reconnectDelaysMs = [250, 500, 1000, 2000, 4000];
-const stableOpenResetDelayMs = 10000;
+const maxBufferedChunks = 1600;
+const retainedBufferedChunks = 1200;
 
 function App() {
-  const [tasks, setTasks] = useState<Task[]>([]);
-  const [selectedID, setSelectedID] = useState("");
-  const [title, setTitle] = useState("");
-  const [body, setBody] = useState("");
-  const [status, setStatus] = useState("unstarted");
-  const [newRequest, setNewRequest] = useState("");
   const [token, setToken] = useState(() => initialToken());
   const [tokenDraft, setTokenDraft] = useState(() => initialToken());
-  const [workers, setWorkers] = useState<WorkerInfo[]>([]);
-  const [selectedWorkerID, setSelectedWorkerID] = useState("");
-  const [orchestratorLog, setOrchestratorLog] = useState<string[]>([]);
-  const [workerLog, setWorkerLog] = useState<string[]>([]);
-  const [ledgerConnection, setLedgerConnection] = useState<ConnectionState>(() => idleConnection("Ledger stream is idle."));
-  const [orchestratorConnection, setOrchestratorConnection] = useState<ConnectionState>(() =>
-    idleConnection("Select a project to open the orchestrator log.")
-  );
-  const [workerConnection, setWorkerConnection] = useState<ConnectionState>(() =>
-    idleConnection("Select a worker to open its log stream.")
-  );
-  const [followupMessage, setFollowupMessage] = useState("");
-  const [followupSending, setFollowupSending] = useState(false);
   const [projects, setProjects] = useState<ProjectInfo[]>([]);
+  const [terminalsByProject, setTerminalsByProject] = useState<TerminalMap>({});
   const [selectedProjectSlug, setSelectedProjectSlug] = useState("");
-  const [newProjectSlug, setNewProjectSlug] = useState("");
-  const [newProjectRepoPath, setNewProjectRepoPath] = useState("");
-  const [config, setConfig] = useState<ConfigResponse | null>(null);
-  const [configDraft, setConfigDraft] = useState<ConfigDraft>(() => emptyConfigDraft());
-  const [settingsDirty, setSettingsDirty] = useState(false);
-  const [harnesses, setHarnesses] = useState<HarnessInfo[]>([]);
-  const [settingsLoading, setSettingsLoading] = useState(true);
+  const [selectedTerminalKey, setSelectedTerminalKey] = useState("");
+  const [buffers, setBuffers] = useState<BufferMap>({});
+  const [connections, setConnections] = useState<ConnectionMap>({});
   const [loading, setLoading] = useState(true);
-  const [saving, setSaving] = useState(false);
-  const [message, setMessage] = useState("");
-  const [warning, setWarning] = useState("");
+  const [refreshing, setRefreshing] = useState(false);
+  const [busyAction, setBusyAction] = useState<"create" | "delete" | "">("");
   const [error, setError] = useState("");
-  const settingsDirtyRef = useRef(false);
+  const [notice, setNotice] = useState("");
+  const [retrySignals, setRetrySignals] = useState<Record<string, number>>({});
   const selectedProjectSlugRef = useRef("");
-  const tokenRef = useRef(token);
-  const orchestratorSocketRef = useRef<WebSocket | null>(null);
-  const orchestratorTerminalSizeRef = useRef<{ cols: number; rows: number } | null>(null);
-  const taskEditorDirtyRef = useRef<TaskEditorDirty>(emptyTaskEditorDirty());
-  const taskEditorTaskIDRef = useRef("");
+  selectedProjectSlugRef.current = selectedProjectSlug;
 
-  const selectedTask = useMemo(
-    () => tasks.find((task) => task.id === selectedID) ?? tasks[0],
-    [selectedID, tasks]
+  const client = useMemo(() => createTerminalApiClient({ token }), [token]);
+
+  const loadWorkspace = useCallback(
+    async (signal?: AbortSignal, isRefresh = false) => {
+      if (isRefresh) {
+        setRefreshing(true);
+      } else {
+        setLoading(true);
+      }
+      setError("");
+      try {
+        const nextProjects = await client.listProjects(signal);
+        if (signal?.aborted) {
+          return;
+        }
+        const terminalResults = await Promise.all(
+          nextProjects.map(async (project) => {
+            try {
+              return [project.slug, await client.listProjectTerminals(project.slug, signal)] as const;
+            } catch (err) {
+              if (!signal?.aborted) {
+                setError(`${project.slug}: ${errorMessage(err)}`);
+              }
+              return [project.slug, []] as const;
+            }
+          })
+        );
+        if (signal?.aborted) {
+          return;
+        }
+        const nextTerminals = Object.fromEntries(terminalResults) as TerminalMap;
+        const currentProjectSlug = selectedProjectSlugRef.current;
+        const nextSelectedProjectSlug = nextProjects.some((project) => project.slug === currentProjectSlug)
+          ? currentProjectSlug
+          : nextProjects[0]?.slug ?? "";
+        setProjects(nextProjects);
+        setTerminalsByProject(nextTerminals);
+        setSelectedProjectSlug(nextSelectedProjectSlug);
+        setSelectedTerminalKey((current) => {
+          if (hasTerminalInProject(nextTerminals, nextSelectedProjectSlug, current)) {
+            return current;
+          }
+          return firstTerminalKey(nextSelectedProjectSlug, nextTerminals);
+        });
+      } catch (err) {
+        if (!signal?.aborted) {
+          setError(errorMessage(err));
+        }
+      } finally {
+        if (isRefresh) {
+          setRefreshing(false);
+        } else {
+          setLoading(false);
+        }
+      }
+    },
+    [client]
   );
-  const selectedWorker = useMemo(
-    () => workers.find((worker) => worker.worker_id === selectedWorkerID) ?? workers[0],
-    [selectedWorkerID, workers]
-  );
-  const selectedWorkerTask = useMemo(
-    () => tasks.find((task) => task.id === selectedWorker?.task_id),
-    [selectedWorker?.task_id, tasks]
-  );
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void loadWorkspace(controller.signal);
+    return () => controller.abort();
+  }, [loadWorkspace]);
+
   const selectedProject = useMemo(
     () => projects.find((project) => project.slug === selectedProjectSlug),
     [projects, selectedProjectSlug]
   );
-  const harnessNames = useMemo(
-    () => Object.keys(configDraft.harnesses).sort((a, b) => a.localeCompare(b)),
-    [configDraft.harnesses]
+  const selectedTerminals = terminalsByProject[selectedProjectSlug] ?? [];
+  const selectedTerminal = selectedTerminals.find(
+    (terminal) => terminalKey(selectedProjectSlug, terminal.window) === selectedTerminalKey
   );
-  const tmuxSession = selectedProject?.session || config?.runtime?.tmux_session || selectedProjectSlug || "tmux";
-  const orchestratorWindow = selectedProjectSlug ? `${selectedProjectSlug}-orchestrator` : "orchestrator";
+  const selectedConnection = selectedTerminal
+    ? connections[selectedTerminalKey] ?? idleState("Terminal is waiting to connect.")
+    : idleState("Select a terminal to connect.");
 
-  useEffect(() => {
-    void refreshAll(true, token, true);
+  const selectProject = useCallback(
+    (slug: string) => {
+      setSelectedProjectSlug(slug);
+      setSelectedTerminalKey((current) => {
+        const list = terminalsByProject[slug] ?? [];
+        return list.some((terminal) => terminalKey(slug, terminal.window) === current)
+          ? current
+          : firstTerminalKey(slug, terminalsByProject);
+      });
+      setNotice("");
+    },
+    [terminalsByProject]
+  );
+
+  const selectTerminal = useCallback((slug: string, windowName: string) => {
+    setSelectedProjectSlug(slug);
+    setSelectedTerminalKey(terminalKey(slug, windowName));
+    setNotice("");
   }, []);
 
-  useEffect(() => {
-    if (selectedProjectSlug) {
-      void refreshProjectData(true);
+  const refresh = useCallback(() => {
+    const controller = new AbortController();
+    void loadWorkspace(controller.signal, true).finally(() => controller.abort());
+  }, [loadWorkspace]);
+
+  const handleCreateTerminal = useCallback(async () => {
+    if (!selectedProjectSlug || busyAction || refreshing) {
+      return;
     }
-  }, [selectedProjectSlug]);
+    setBusyAction("create");
+    setError("");
+    setNotice("");
+    try {
+      const terminal = await client.createProjectTerminal(selectedProjectSlug);
+      setTerminalsByProject((current) => ({
+        ...current,
+        [selectedProjectSlug]: [...(current[selectedProjectSlug] ?? []), terminal]
+      }));
+      if (selectedProjectSlugRef.current === selectedProjectSlug) {
+        setSelectedTerminalKey(terminalKey(selectedProjectSlug, terminal.window));
+      }
+      setNotice(`Opened ${terminal.title}.`);
+    } catch (err) {
+      setError(`Could not open a shell: ${errorMessage(err)}`);
+    } finally {
+      setBusyAction("");
+    }
+  }, [busyAction, client, refreshing, selectedProjectSlug]);
 
-  useEffect(() => {
-    tokenRef.current = token;
-  }, [token]);
-
-  useEffect(() => {
-    return openReconnectingWebSocket({
-      path: ledgerWSPath(selectedProjectSlug),
-      token,
-      setState: setLedgerConnection,
-      onMessage: (event) => {
-        try {
-          const msg = JSON.parse(String(event.data)) as { type?: string };
-          if (msg.type === "ledger_changed") {
-            void refreshProjectData(false);
-          }
-        } catch {
-          // Ignore malformed websocket messages; the next manual refresh will recover.
+  const handleCloseTerminal = useCallback(async () => {
+    if (!selectedTerminal?.closable || busyAction || refreshing || !selectedProjectSlug) {
+      return;
+    }
+    if (typeof window !== "undefined" && !window.confirm(`Close ${selectedTerminal.title}?`)) {
+      return;
+    }
+    const projectSlug = selectedProjectSlug;
+    const key = terminalKey(projectSlug, selectedTerminal.window);
+    const list = terminalsByProject[projectSlug] ?? [];
+    const nextList = list.filter((terminal) => terminal.window !== selectedTerminal.window);
+    setBusyAction("delete");
+    setError("");
+    setNotice("");
+    try {
+      await client.deleteProjectTerminal(projectSlug, selectedTerminal.window);
+      setTerminalsByProject((current) => ({ ...current, [projectSlug]: nextList }));
+      setSelectedTerminalKey((current) => {
+        if (current !== key) {
+          return current;
         }
-      }
+        return terminalKey(projectSlug, nextList[0]?.window ?? "");
+      });
+      setNotice(`${selectedTerminal.title} closed.`);
+    } catch (err) {
+      setError(`Could not close ${selectedTerminal.title}: ${errorMessage(err)}`);
+    } finally {
+      setBusyAction("");
+    }
+  }, [busyAction, client, refreshing, selectedProjectSlug, selectedTerminal, terminalsByProject]);
+
+  const handleTerminalState = useCallback((key: string, state: TerminalState) => {
+    setConnections((current) => ({ ...current, [key]: state }));
+  }, []);
+
+  const handleTerminalData = useCallback((key: string, data: string) => {
+    setBuffers((current) => {
+      const previous = current[key] ?? [];
+      const next = [...previous, data];
+      return { ...current, [key]: next.length > maxBufferedChunks ? next.slice(-retainedBufferedChunks) : next };
     });
-  }, [selectedProjectSlug, token]);
+  }, []);
 
-  useEffect(() => {
-    if (!selectedWorker) {
-      setSelectedWorkerID("");
-      setWorkerLog([]);
-      setWorkerConnection(idleConnection("Select a worker to open its log stream."));
-      setFollowupMessage("");
-      return;
-    }
-    setSelectedWorkerID(selectedWorker.worker_id);
-    setWorkerLog([]);
-    setFollowupMessage("");
-    return openReconnectingWebSocket({
-      path: workerLogPath(selectedProjectSlug, selectedWorker.worker_id),
-      token,
-      setState: setWorkerConnection,
-      onMessage: (event) => appendLogEvent(event, setWorkerLog),
-      onSocketError: () => appendLogLine(setWorkerLog, "[stream error]", false)
-    });
-  }, [selectedProjectSlug, selectedWorker?.worker_id, token]);
+  const handleTerminalError = useCallback((title: string, err: Error) => {
+    setError(`${title}: ${err.message}`);
+  }, []);
 
-  useEffect(() => {
-    if (!selectedProjectSlug) {
-      setOrchestratorLog([]);
-      setOrchestratorConnection(idleConnection("Select a project to open the orchestrator log."));
-      orchestratorSocketRef.current = null;
-      return;
-    }
-    setOrchestratorLog([]);
-    return openReconnectingWebSocket({
-      path: orchestratorLogPath(selectedProjectSlug),
-      token,
-      notFoundPhase: "missing",
-      setState: setOrchestratorConnection,
-      onMessage: (event) => appendLogEvent(event, setOrchestratorLog),
-      onOpen: (socket) => {
-        orchestratorSocketRef.current = socket;
-        const size = orchestratorTerminalSizeRef.current;
-        if (size) {
-          socket.send(JSON.stringify({ type: "resize", cols: size.cols, rows: size.rows }));
-        }
-      },
-      onClose: () => {
-        orchestratorSocketRef.current = null;
-      },
-      onSocketError: () => appendLogLine(setOrchestratorLog, "[stream error]", false)
-    });
-  }, [selectedProjectSlug, token]);
+  const applyToken = () => {
+    const nextToken = tokenDraft.trim();
+    storeToken(nextToken);
+    setToken(nextToken);
+    setNotice("Access token applied. Refreshing workspace…");
+  };
 
-  useEffect(() => {
-    if (!selectedTask) {
-      setSelectedID("");
-      setTitle("");
-      setBody("");
-      setStatus("unstarted");
-      taskEditorTaskIDRef.current = "";
-      clearTaskEditorDirty();
-      return;
-    }
-    const taskChanged = taskEditorTaskIDRef.current !== selectedTask.id;
-    setSelectedID(selectedTask.id);
-    if (taskChanged) {
-      taskEditorTaskIDRef.current = selectedTask.id;
-      setTitle(selectedTask.title ?? "");
-      setBody(selectedTask.body ?? "");
-      setStatus(selectedTask.status || "unstarted");
-      clearTaskEditorDirty();
-      return;
-    }
-    const dirty = taskEditorDirtyRef.current;
-    if (!dirty.title) {
-      setTitle(selectedTask.title ?? "");
-    }
-    if (!dirty.body) {
-      setBody(selectedTask.body ?? "");
-    }
-    if (!dirty.status) {
-      setStatus(selectedTask.status || "unstarted");
-    }
-  }, [selectedTask?.id, selectedTask?.title, selectedTask?.body, selectedTask?.status]);
-
-  async function refreshTasks(
-    showLoading = true,
-    authToken = token,
-    projectSlug = selectedProjectSlug,
-    rethrowErrors = false
-  ) {
-    if (!projectSlug) {
-      if (isCurrentRefresh(projectSlug, authToken)) {
-        setTasks([]);
-        setSelectedID("");
-        setLoading(false);
-      }
-      return;
-    }
-    const currentRefresh = isCurrentRefresh(projectSlug, authToken);
-    if (showLoading && currentRefresh) {
-      setLoading(true);
-    }
-    if (currentRefresh) {
-      setError("");
-    }
-    try {
-      const data = normalizeArray(await api<Task[] | null>(tasksPath(projectSlug), {}, authToken));
-      if (!isCurrentRefresh(projectSlug, authToken)) {
+  const tabRefs = useRef<Record<string, HTMLButtonElement | null>>({});
+  const handleTabKeyDown = useCallback(
+    (event: KeyboardEvent<HTMLButtonElement>, index: number) => {
+      if (!selectedTerminals.length || !["ArrowRight", "ArrowLeft", "Home", "End"].includes(event.key)) {
         return;
       }
-      setTasks(data);
-      setSelectedID((current) => (data.some((task) => task.id === current) ? current : data[0]?.id || ""));
-    } catch (err) {
-      if (!isCurrentRefresh(projectSlug, authToken)) {
-        return;
-      }
-      setError(errorMessage(err));
-      if (rethrowErrors) {
-        throw err;
-      }
-    } finally {
-      if (isCurrentRefresh(projectSlug, authToken)) {
-        setLoading(false);
-      }
-    }
-  }
-
-  async function refreshWorkers(authToken = token, projectSlug = selectedProjectSlug, rethrowErrors = false) {
-    if (!projectSlug) {
-      if (isCurrentRefresh(projectSlug, authToken)) {
-        setWorkers([]);
-        setSelectedWorkerID("");
-      }
-      return;
-    }
-    try {
-      const data = normalizeArray(await api<WorkerInfo[] | null>(workersPath(projectSlug), {}, authToken));
-      if (!isCurrentRefresh(projectSlug, authToken)) {
-        return;
-      }
-      setWorkers(data);
-      setSelectedWorkerID((current) =>
-        data.some((worker) => worker.worker_id === current) ? current : data[0]?.worker_id || ""
-      );
-    } catch (err) {
-      if (!isCurrentRefresh(projectSlug, authToken)) {
-        return;
-      }
-      setError(errorMessage(err));
-      if (rethrowErrors) {
-        throw err;
-      }
-    }
-  }
-
-  async function refreshAll(showLoading = true, authToken = token, replaceSettingsDraft = false) {
-    const projectSlug = await refreshSettings(authToken, replaceSettingsDraft);
-    await refreshProjectData(showLoading, authToken, projectSlug);
-  }
-
-  async function refreshProjectData(
-    showLoading = true,
-    authToken = token,
-    projectSlug = selectedProjectSlug,
-    rethrowErrors = false
-  ) {
-    await Promise.all([
-      refreshTasks(showLoading, authToken, projectSlug, rethrowErrors),
-      refreshWorkers(authToken, projectSlug, rethrowErrors)
-    ]);
-  }
-
-  async function refreshSettings(
-    authToken = token,
-    replaceDraft = false,
-    preferredProjectSlug = "",
-    rethrowErrors = false
-  ) {
-    setSettingsLoading(true);
-    try {
-      const [configData, harnessData, projectData] = await Promise.all([
-        api<ConfigResponse>("/api/config", {}, authToken),
-        api<HarnessInfo[] | null>("/api/harnesses", {}, authToken),
-        api<ProjectInfo[] | null>("/api/projects", {}, authToken)
-      ]);
-      const projects = normalizeArray(projectData);
-      const availableHarnesses = normalizeArray(harnessData);
-      if (authToken !== tokenRef.current) {
-        return selectedProjectSlugRef.current;
-      }
-      setConfig(configData);
-      setProjects(projects);
-      const normalizedProjectSlug = normalizedProjectSelection(
-        projects,
-        selectedProjectSlugRef.current,
-        preferredProjectSlug
-      );
-      setProjectSlug(normalizedProjectSlug);
-      if (replaceDraft || !settingsDirtyRef.current) {
-        setConfigDraft(configToDraft(configData));
-        settingsDirtyRef.current = false;
-        setSettingsDirty(false);
-      }
-      setHarnesses(availableHarnesses);
-      return normalizedProjectSlug;
-    } catch (err) {
-      if (authToken !== tokenRef.current) {
-        return selectedProjectSlugRef.current;
-      }
-      setError(errorMessage(err));
-      if (rethrowErrors) {
-        throw err;
-      }
-      return selectedProjectSlugRef.current;
-    } finally {
-      if (authToken === tokenRef.current) {
-        setSettingsLoading(false);
-      }
-    }
-  }
-
-  async function createTask(event: FormEvent) {
-    event.preventDefault();
-    const request = newRequest.trim();
-    if (!request) {
-      return;
-    }
-    setSaving(true);
-    setError("");
-    setMessage("");
-    setWarning("");
-    try {
-      const response = await api<TaskCreateResponse>(
-        tasksPath(selectedProjectSlug),
-        {
-          method: "POST",
-          body: JSON.stringify({
-            request
-          })
-        },
-        token
-      );
-      setNewRequest("");
-      if (response.trigger_error) {
-        setWarning(`Task created; orchestrator trigger failed: ${response.trigger_error}`);
-      } else if (!response.orchestrator_triggered) {
-        setWarning("Task created; orchestrator was not triggered.");
-      } else {
-        setMessage("Task created and orchestrator notified.");
-      }
-      await refreshAll(false);
-      setSelectedID(response.task.id);
-    } catch (err) {
-      setError(errorMessage(err));
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  async function saveTask(event: FormEvent) {
-    event.preventDefault();
-    if (!selectedTask) {
-      return;
-    }
-    setSaving(true);
-    setError("");
-    setMessage("");
-    setWarning("");
-    try {
-      await api<Task>(
-        taskPath(selectedProjectSlug, selectedTask.id),
-        {
-          method: "PATCH",
-          body: JSON.stringify({ title, body, status })
-        },
-        token
-      );
-      setMessage("Task updated.");
-      clearTaskEditorDirty();
-      await refreshTasks(false);
-    } catch (err) {
-      setError(errorMessage(err));
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  async function deleteTask() {
-    if (!selectedTask) {
-      return;
-    }
-    setSaving(true);
-    setError("");
-    setMessage("");
-    setWarning("");
-    try {
-      const response = await api<TaskDeleteResponse>(
-        taskPath(selectedProjectSlug, selectedTask.id),
-        { method: "DELETE" },
-        token
-      );
-      if (response.cleanup_error) {
-        setWarning(`Delete requested; worker cleanup needs retry: ${response.cleanup_error}`);
-      } else if (response.delete_pending) {
-        setWarning("Delete is already in progress.");
-      } else {
-        setMessage("Task deleted.");
-      }
-      setSelectedID("");
-      await refreshAll(false);
-    } catch (err) {
-      setError(errorMessage(err));
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  async function sendWorkerFollowup(event: FormEvent) {
-    event.preventDefault();
-    if (!selectedWorker || !followupMessage.trim()) {
-      return;
-    }
-    setFollowupSending(true);
-    setError("");
-    setMessage("");
-    setWarning("");
-    try {
-      const response = await api<WorkerFollowupResponse>(
-        workerFollowupPath(selectedProjectSlug, selectedWorker.worker_id),
-        {
-          method: "POST",
-          body: JSON.stringify({ message: followupMessage })
-        },
-        token
-      );
-      setFollowupMessage("");
-      setMessage(`Followup sent to ${response.window}.`);
-    } catch (err) {
-      setError(errorMessage(err));
-    } finally {
-      setFollowupSending(false);
-    }
-  }
-
-  function sendOrchestratorTerminalInput(data: string) {
-    const socket = orchestratorSocketRef.current;
-    if (!socket || socket.readyState !== WebSocket.OPEN || !data) {
-      return;
-    }
-    socket.send(JSON.stringify({ type: "input", data }));
-  }
-
-  function sendOrchestratorTerminalResize(cols: number, rows: number) {
-    orchestratorTerminalSizeRef.current = { cols, rows };
-    const socket = orchestratorSocketRef.current;
-    if (!socket || socket.readyState !== WebSocket.OPEN) {
-      return;
-    }
-    socket.send(JSON.stringify({ type: "resize", cols, rows }));
-  }
-
-  async function saveConfig(event: FormEvent) {
-    event.preventDefault();
-    setSaving(true);
-    setError("");
-    setMessage("");
-    setWarning("");
-    try {
-      const updated = await api<ConfigResponse>(
-        "/api/config",
-        {
-          method: "PATCH",
-          body: JSON.stringify(configPatchFromDraft(configDraft))
-        },
-        token
-      );
-      settingsDirtyRef.current = false;
-      setSettingsDirty(false);
-      const projectSlug = await refreshSettings(token, true, updated.project.slug, true);
-      await refreshProjectData(false, token, projectSlug, true);
-      setMessage("Settings updated.");
-    } catch (err) {
-      setError(errorMessage(err));
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  async function addProject() {
-    const slug = newProjectSlug.trim();
-    const repoPath = newProjectRepoPath.trim();
-    if (!slug || !repoPath) {
-      setError("Project slug and repository path are required.");
-      setWarning("");
-      return;
-    }
-    setSaving(true);
-    setError("");
-    setMessage("");
-    setWarning("");
-    try {
-      await api<ProjectInfo>(
-        "/api/projects",
-        {
-          method: "POST",
-          body: JSON.stringify({
-            slug,
-            repo_path: repoPath,
-            worktree_base: config?.runtime?.worktree_base || config?.project.worktree_base || ""
-          })
-        },
-        token
-      );
-      setNewProjectSlug("");
-      setNewProjectRepoPath("");
-      setProjectSlug(slug);
-      await refreshSettings(token, true);
-      setMessage("Project added.");
-    } catch (err) {
-      setError(errorMessage(err));
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  async function deleteProject(slug: string) {
-    if (!slug || !window.confirm(`Delete project "${slug}" from this server?`)) {
-      return;
-    }
-    setSaving(true);
-    setError("");
-    setMessage("");
-    setWarning("");
-    try {
-      await api<{ status: string }>(`/api/projects/${encodeURIComponent(slug)}`, { method: "DELETE" }, token);
-      setTasks([]);
-      setWorkers([]);
-      setSelectedID("");
-      setSelectedWorkerID("");
-      setProjectSlug(selectedProjectSlugRef.current === slug ? "" : selectedProjectSlugRef.current);
-      await refreshSettings(token, true);
-      setMessage("Project deleted.");
-    } catch (err) {
-      setError(errorMessage(err));
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  function selectProject(slug: string) {
-    setProjectSlug(slug);
-    setTasks([]);
-    setWorkers([]);
-    setSelectedID("");
-    setSelectedWorkerID("");
-    setWorkerLog([]);
-    setOrchestratorLog([]);
-    orchestratorSocketRef.current = null;
-    setFollowupMessage("");
-  }
-
-  function updateConfigDraft(patch: Partial<ConfigDraft>) {
-    markSettingsDirty();
-    setConfigDraft((current) => ({ ...current, ...patch }));
-  }
-
-  function setProjectSlug(slug: string) {
-    selectedProjectSlugRef.current = slug;
-    setSelectedProjectSlug(slug);
-  }
-
-  function isCurrentRefresh(projectSlug: string, authToken: string) {
-    return projectSlug === selectedProjectSlugRef.current && authToken === tokenRef.current;
-  }
-
-  function updateTaskTitle(value: string) {
-    setTitle(value);
-    markTaskEditorDirty("title");
-  }
-
-  function updateTaskBody(value: string) {
-    setBody(value);
-    markTaskEditorDirty("body");
-  }
-
-  function updateTaskStatus(value: string) {
-    setStatus(value);
-    markTaskEditorDirty("status");
-  }
-
-  function updateHarnessCommand(name: string, command: string) {
-    markSettingsDirty();
-    setConfigDraft((current) => ({
-      ...current,
-      harnesses: {
-        ...current.harnesses,
-        [name]: command
-      }
-    }));
-  }
-
-  function markSettingsDirty() {
-    settingsDirtyRef.current = true;
-    setSettingsDirty(true);
-  }
-
-  function markTaskEditorDirty(field: keyof TaskEditorDirty) {
-    taskEditorDirtyRef.current = {
-      ...taskEditorDirtyRef.current,
-      [field]: true
-    };
-  }
-
-  function clearTaskEditorDirty() {
-    taskEditorDirtyRef.current = emptyTaskEditorDirty();
-  }
+      event.preventDefault();
+      const nextIndex = event.key === "Home"
+        ? 0
+        : event.key === "End"
+          ? selectedTerminals.length - 1
+          : (index + (event.key === "ArrowRight" ? 1 : -1) + selectedTerminals.length) % selectedTerminals.length;
+      const nextTerminal = selectedTerminals[nextIndex];
+      const nextKey = terminalKey(selectedProjectSlug, nextTerminal.window);
+      selectTerminal(selectedProjectSlug, nextTerminal.window);
+      window.requestAnimationFrame(() => tabRefs.current[nextKey]?.focus());
+    },
+    [selectTerminal, selectedProjectSlug, selectedTerminals]
+  );
 
   return (
-    <main className="app-shell">
-      <header className="topbar">
-        <div>
-          <h1>ccx-t2</h1>
-          <p>Task ledger and worker orchestration</p>
+    <div className="app-shell">
+      <aside className="project-sidebar" aria-label="Projects and terminals">
+        <div className="brand-lockup">
+          <span className="brand-mark" aria-hidden="true">cc</span>
+          <span>
+            <strong>ccx-t2</strong>
+            <small>WebShell</small>
+          </span>
         </div>
-        <div className="topbar-actions">
-          <button className="secondary" type="button" onClick={() => void refreshAll()} disabled={loading}>
-            Refresh
+        <div className="sidebar-heading">
+          <div>
+            <span className="eyebrow">Workspace</span>
+            <h1>Projects</h1>
+          </div>
+          <button className="icon-button" type="button" onClick={refresh} disabled={refreshing || Boolean(busyAction)} aria-label="Refresh projects and terminals" title="Refresh">
+            {refreshing ? "…" : "↻"}
           </button>
         </div>
-      </header>
-
-      <section className="notice-row" aria-live="polite">
-        {error && <div className="notice error">{error}</div>}
-        {warning && <div className="notice warning">{warning}</div>}
-        {message && <div className="notice success">{message}</div>}
-      </section>
-
-      <section className="workspace">
-        <aside className="project-sidebar" aria-label="Projects">
-          <div className="section-heading">
-            <h2>Projects</h2>
-            <span>{projects.length} total</span>
-          </div>
-          <div className="project-overview">
-            <div>
-              <span>Current</span>
-              <strong>{selectedProject?.slug || "None"}</strong>
-            </div>
-            <div>
-              <span>Tasks</span>
-              <strong>{selectedProject ? tasks.length : 0}</strong>
-            </div>
-            <div>
-              <span>Workers</span>
-              <strong>{selectedProject ? workers.length : 0}</strong>
-            </div>
-          </div>
-          <div className="project-list">
-            {projects.map((project) => {
-              const isSelected = project.slug === selectedProjectSlug;
-              return (
-                <button
-                  aria-current={isSelected ? "true" : undefined}
-                  className={`project-row ${isSelected ? "selected" : ""}`}
-                  key={project.slug}
-                  type="button"
-                  onClick={() => selectProject(project.slug)}
-                >
-                  <span>{project.slug}</span>
-                  <small>{project.repo_path}</small>
-                </button>
-              );
-            })}
-            {projects.length === 0 && <div className="empty">No projects configured.</div>}
-          </div>
-          <div className="sidebar-project-actions">
-            <label>
-              Slug
-              <input value={newProjectSlug} onChange={(event) => setNewProjectSlug(event.target.value)} />
-            </label>
-            <label>
-              Repository path
-              <input value={newProjectRepoPath} onChange={(event) => setNewProjectRepoPath(event.target.value)} />
-            </label>
-            <button
-              type="button"
-              onClick={() => void addProject()}
-              disabled={saving || !newProjectSlug.trim() || !newProjectRepoPath.trim()}
-            >
-              Add Project
-            </button>
-            <button
-              className="danger"
-              type="button"
-              onClick={() => void deleteProject(selectedProjectSlug)}
-              disabled={saving || !selectedProjectSlug}
-            >
-              Delete Selected
-            </button>
-          </div>
-        </aside>
-
-        <aside className="task-list" aria-label="Task ledger">
-          <div className="section-heading">
-            <h2>Tasks</h2>
-            <div className="heading-status">
-              <span>{loading ? "Loading" : `${tasks.length} total`}</span>
-              <ConnectionBadge label="Ledger" state={ledgerConnection} />
-            </div>
-          </div>
-          <div className="rows">
-            {tasks.map((task) => {
-              const isSelected = task.id === selectedTask?.id;
-              return (
-                <button
-                  aria-current={isSelected ? "true" : undefined}
-                  className={`task-row ${isSelected ? "selected" : ""}`}
-                  key={task.id}
-                  type="button"
-                  onClick={() => setSelectedID(task.id)}
-                >
-                  <span className="task-title">{task.title || task.body || task.id}</span>
-                  <span className={`status ${task.status || "unstarted"}`}>{task.status || "unstarted"}</span>
-                </button>
-              );
-            })}
-            {!loading && tasks.length === 0 && <div className="empty">No active tasks.</div>}
-          </div>
-        </aside>
-
-        <section className="task-editor" aria-label="Task editor">
-          <div className="section-heading">
-            <h2>{selectedTask ? selectedTask.id : "No task selected"}</h2>
-            {selectedTask?.worker_id && <span>{selectedTask.worker_id}</span>}
-          </div>
-          <form onSubmit={saveTask} className="form-grid">
-            <label>
-              Title
-              <input value={title} onChange={(event) => updateTaskTitle(event.target.value)} disabled={!selectedTask} />
-            </label>
-            <label>
-              Status
-              <select value={status} onChange={(event) => updateTaskStatus(event.target.value)} disabled={!selectedTask}>
-                {statusOptions.map((option) => (
-                  <option key={option} value={option}>
-                    {option}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label className="wide">
-              Body
-              <textarea value={body} onChange={(event) => updateTaskBody(event.target.value)} disabled={!selectedTask} />
-            </label>
-            {selectedTask?.branch && <div className="metadata">Branch: {selectedTask.branch}</div>}
-            {selectedTask?.reason && <div className="metadata">Reason: {selectedTask.reason}</div>}
-            <div className="actions wide">
-              <button type="submit" disabled={!selectedTask || saving}>
-                Save
-              </button>
-              <button className="danger" type="button" onClick={() => void deleteTask()} disabled={!selectedTask || saving}>
-                Delete
-              </button>
-            </div>
-          </form>
-        </section>
-
-        <section className="task-create" aria-label="Create task">
-          <div className="section-heading">
-            <h2>Add Task</h2>
-            <span>Orchestrator trigger</span>
-          </div>
-          <form onSubmit={createTask} className="form-grid">
-            <label className="wide">
-              Request
-              <textarea
-                className="natural-request"
-                value={newRequest}
-                onChange={(event) => setNewRequest(event.target.value)}
-                placeholder="Describe the task in your own words"
-              />
-            </label>
-            <div className="actions wide">
-              <button type="submit" disabled={saving || !newRequest.trim()}>
-                Create
-              </button>
-            </div>
-          </form>
-        </section>
-
-        <section className="orchestrator-dashboard" aria-label="Orchestrator console">
-          <div className="section-heading">
-            <h2>Orchestrator</h2>
-            <div className="heading-status">
-              <span>{selectedProjectSlug || "No project"}</span>
-              <ConnectionBadge label="Orchestrator log" state={orchestratorConnection} />
-            </div>
-          </div>
-          <div className="console-metadata">
-            <span>Project: {selectedProjectSlug || "None"}</span>
-            <span>Session: {tmuxSession}</span>
-            <span>Window: {orchestratorWindow}</span>
-          </div>
-          <div className="log-panel">
-            <div className="log-heading">
-              <span>{orchestratorWindow}</span>
-              <span>{selectedProject?.repo_path || "No repository"}</span>
-            </div>
-            <TerminalPane
-              chunks={orchestratorLog}
-              connection={orchestratorConnection}
-              emptyText="No orchestrator output yet."
-              idleText="Select a project to open the orchestrator log."
-              onData={sendOrchestratorTerminalInput}
-              onResize={sendOrchestratorTerminalResize}
-            />
-          </div>
-        </section>
-
-        <section className="worker-dashboard" aria-label="Worker dashboard">
-          <div className="section-heading">
-            <h2>Workers</h2>
-            <div className="heading-status">
-              <span>{workers.length} active</span>
-              <ConnectionBadge label="Worker log" state={workerConnection} />
-            </div>
-          </div>
-          <div className="worker-layout">
-            <div className="worker-list">
-              {workers.map((worker) => {
-                const isSelected = worker.worker_id === selectedWorker?.worker_id;
-                return (
-                  <button
-                    aria-current={isSelected ? "true" : undefined}
-                    className={`worker-row ${isSelected ? "selected" : ""}`}
-                    key={worker.worker_id}
-                    type="button"
-                    onClick={() => setSelectedWorkerID(worker.worker_id)}
-                  >
-                    <span className="task-title">{worker.worker_id}</span>
-                    <span>{worker.harness || "worker"}</span>
-                  </button>
-                );
-              })}
-              {workers.length === 0 && <div className="empty">No active workers.</div>}
-            </div>
-            <div className="log-panel">
-              <div className="log-heading">
-                <span>{selectedWorker?.worker_id || "No worker selected"}</span>
-                <span>{selectedWorkerTask?.branch || selectedWorker?.task_id || "No task"}</span>
-              </div>
-              <TerminalPane
-                chunks={workerLog}
-                connection={workerConnection}
-                emptyText="No worker output yet."
-                idleText="Select a worker to open its log stream."
-              />
-            </div>
-          </div>
-          <form className="followup-form" onSubmit={sendWorkerFollowup}>
-            <div className="console-metadata">
-              <span>Project: {selectedProjectSlug || "None"}</span>
-              <span>Session: {tmuxSession}</span>
-              <span>Window: {selectedWorker?.worker_id || "None"}</span>
-              <span>Task: {selectedWorker?.task_id || "None"}</span>
-            </div>
-            <label>
-              Worker followup
-              <textarea
-                value={followupMessage}
-                onChange={(event) => setFollowupMessage(event.target.value)}
-                disabled={!selectedWorker || followupSending}
-              />
-            </label>
-            <div className="actions">
-              <button type="submit" disabled={!selectedWorker || followupSending || !followupMessage.trim()}>
-                Send Followup
-              </button>
-            </div>
-          </form>
-        </section>
-
-        <section className="settings-panel" aria-label="Settings">
-          <div className="section-heading">
-            <h2>Settings</h2>
-            <span>{settingsDirty ? "Unsaved" : settingsLoading ? "Loading" : "Config"}</span>
-          </div>
-          <form onSubmit={saveConfig} className="settings-grid">
-            <label>
-              Project slug
-              <input
-                value={configDraft.projectSlug}
-                onChange={(event) => updateConfigDraft({ projectSlug: event.target.value })}
-                disabled={!config}
-              />
-            </label>
-            <label>
-              Server port
-              <input
-                inputMode="numeric"
-                value={configDraft.serverPort}
-                onChange={(event) => updateConfigDraft({ serverPort: event.target.value })}
-                disabled={!config}
-              />
-            </label>
-            <label>
-              Listen address
-              <input
-                value={configDraft.serverHost}
-                onChange={(event) => updateConfigDraft({ serverHost: event.target.value })}
-                disabled={!config}
-              />
-            </label>
-            <label className="wide">
-              Repository path
-              <input
-                value={configDraft.repoPath}
-                onChange={(event) => updateConfigDraft({ repoPath: event.target.value })}
-                disabled={!config}
-              />
-            </label>
-            <label className="wide">
-              Worktree base
-              <input
-                value={configDraft.worktreeBase}
-                onChange={(event) => updateConfigDraft({ worktreeBase: event.target.value })}
-                disabled={!config}
-              />
-            </label>
-            <label>
-              Orchestrator harness
-              <select
-                value={configDraft.orchestratorHarness}
-                onChange={(event) => updateConfigDraft({ orchestratorHarness: event.target.value })}
-                disabled={!config}
-              >
-                {harnessNames.includes(configDraft.orchestratorHarness) ? null : (
-                  <option value={configDraft.orchestratorHarness}>{configDraft.orchestratorHarness || "Unset"}</option>
-                )}
-                {harnessNames.map((name) => (
-                  <option key={name} value={name}>
-                    {name}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label>
-              Worker harnesses
-              <input
-                value={configDraft.workerHarnesses}
-                onChange={(event) => updateConfigDraft({ workerHarnesses: event.target.value })}
-                disabled={!config}
-              />
-            </label>
-            <label>
-              Heartbeat interval
-              <input
-                value={configDraft.heartbeatInterval}
-                onChange={(event) => updateConfigDraft({ heartbeatInterval: event.target.value })}
-                disabled={!config}
-              />
-            </label>
-            <label>
-              Orchestrator timeout
-              <input
-                value={configDraft.timeout}
-                onChange={(event) => updateConfigDraft({ timeout: event.target.value })}
-                disabled={!config}
-              />
-            </label>
-            <label>
-              GitHub owner
-              <input
-                value={configDraft.githubOwner}
-                onChange={(event) => updateConfigDraft({ githubOwner: event.target.value })}
-                disabled={!config}
-              />
-            </label>
-            <label>
-              GitHub repo
-              <input
-                value={configDraft.githubRepo}
-                onChange={(event) => updateConfigDraft({ githubRepo: event.target.value })}
-                disabled={!config}
-              />
-            </label>
-
-            <div className="wide harness-editor">
-              <div className="subheading">
-                <h3>Harness Commands</h3>
-                <span>{harnessNames.length} configured</span>
-              </div>
-              <div className="harness-grid">
-                {harnessNames.map((name) => (
-                  <label key={name}>
-                    {name}
-                    <input
-                      value={configDraft.harnesses[name] ?? ""}
-                      onChange={(event) => updateHarnessCommand(name, event.target.value)}
-                      disabled={!config}
-                    />
-                  </label>
-                ))}
-                {harnessNames.length === 0 && <div className="empty">No harnesses configured.</div>}
-              </div>
-            </div>
-
-            <div className="wide availability-list">
-              <div className="subheading">
-                <h3>Availability</h3>
-                <span>{harnesses.length} worker harnesses</span>
-              </div>
-              {harnesses.map((harness) => (
-                <div className="availability-row" key={harness.name}>
-                  <span>{harness.name}</span>
-                  <span className={`status ${harness.available ? "completed" : "blocked"}`}>
-                    {harness.available ? "available" : "unavailable"}
+        <div className="project-tree">
+          {loading && <div className="sidebar-empty">Loading projects…</div>}
+          {!loading && projects.length === 0 && <div className="sidebar-empty">No projects are configured.</div>}
+          {projects.map((project) => {
+            const terminals = terminalsByProject[project.slug] ?? [];
+            const projectSelected = project.slug === selectedProjectSlug;
+            return (
+              <section className={`project-group ${projectSelected ? "selected" : ""}`} key={project.slug}>
+                <button className="project-button" type="button" onClick={() => selectProject(project.slug)} aria-current={projectSelected ? "page" : undefined}>
+                  <span className="project-chevron" aria-hidden="true">{projectSelected ? "⌄" : "›"}</span>
+                  <span className="project-copy">
+                    <strong>{project.slug}</strong>
+                    <small title={project.repo_path}>{project.repo_path}</small>
                   </span>
-                  <span>{harness.usage.command || harness.usage.note || "No command"}</span>
+                  <span className="count-badge">{terminals.length}</span>
+                </button>
+                <div className="terminal-tree" role="group" aria-label={`${project.slug} terminals`}>
+                    {terminals.map((terminal) => {
+                      const key = terminalKey(project.slug, terminal.window);
+                      const isSelected = key === selectedTerminalKey;
+                      return (
+                        <button className={`terminal-entry ${isSelected ? "selected" : ""}`} key={terminal.window} type="button" onClick={() => selectTerminal(project.slug, terminal.window)} aria-current={isSelected ? "true" : undefined}>
+                          <span className={`terminal-glyph ${terminal.kind}`} aria-hidden="true">{terminal.kind === "shell" ? "$" : "•"}</span>
+                          <span className="terminal-copy"><strong>{terminal.title}</strong><small>{terminal.kind}{terminal.closable ? " · closable" : " · protected"}</small></span>
+                          <span className={`availability-dot ${terminal.available ? "available" : "missing"}`} title={terminal.available ? "Available" : "Unavailable"} aria-label={terminal.available ? "Available" : "Unavailable"} />
+                        </button>
+                      );
+                    })}
+                    {terminals.length === 0 && <div className="terminal-empty">No shell windows yet.</div>}
                 </div>
-              ))}
-              {!settingsLoading && harnesses.length === 0 && <div className="empty">No worker harnesses configured.</div>}
-            </div>
-
-            <div className="actions wide">
-              <button type="submit" disabled={!config || saving}>
-                Save Settings
-              </button>
-            </div>
-          </form>
-        </section>
-
-        <section className="auth-panel" aria-label="API token">
-          <div className="section-heading">
-            <h2>API Token</h2>
-            <span>Bearer auth</span>
-          </div>
-          <label>
-            Token
-            <input
-              type="password"
-              value={tokenDraft}
-              onChange={(event) => setTokenDraft(event.target.value)}
-            />
+              </section>
+            );
+          })}
+        </div>
+        <div className="sidebar-footer">
+          <label className="token-field">
+            <span>Access token</span>
+            <input type="password" value={tokenDraft} onChange={(event) => setTokenDraft(event.target.value)} placeholder="Optional bearer token" aria-label="Access token" />
           </label>
-          <div className="actions wide">
-            <button
-              type="button"
-              onClick={() => {
-                tokenRef.current = tokenDraft;
-                setToken(tokenDraft);
-                storeToken(tokenDraft);
-                void refreshAll(true, tokenDraft, true);
-              }}
-            >
-              Apply
-            </button>
+          <button className="sidebar-token-button" type="button" onClick={applyToken}>Apply token</button>
+        </div>
+      </aside>
+
+      <main className="workspace" aria-label="Terminal workspace">
+        <header className="workspace-header">
+          <div className="workspace-title">
+            <span className="eyebrow">Project workspace</span>
+            <h2>{selectedProject?.slug ?? "No project selected"}</h2>
+            <p>{selectedProject?.repo_path ?? "Choose a project from the sidebar to open a terminal."}</p>
           </div>
+          <div className="workspace-actions">
+            <button className="toolbar-button" type="button" onClick={refresh} disabled={refreshing || Boolean(busyAction)} aria-label="Refresh terminal list">{refreshing ? "Refreshing…" : "Refresh"}</button>
+            <button className="primary-button" type="button" onClick={() => void handleCreateTerminal()} disabled={!selectedProjectSlug || Boolean(busyAction) || refreshing} aria-label="Open a new shell">＋ New shell</button>
+          </div>
+        </header>
+
+        {(error || notice) && (
+          <div className={`notice-bar ${error ? "error" : "success"}`} role={error ? "alert" : "status"}>
+            <span>{error || notice}</span>
+            <button className="notice-dismiss" type="button" onClick={() => { setError(""); setNotice(""); }} aria-label="Dismiss notification">×</button>
+          </div>
+        )}
+
+        <div className="tab-strip" role="tablist" aria-label="Project terminal tabs" aria-orientation="horizontal">
+          <div className="tab-strip-label"><span className="live-pip" aria-hidden="true" /> terminals</div>
+          <div className="tabs-scroll">
+            {selectedTerminals.map((terminal, index) => {
+              const key = terminalKey(selectedProjectSlug, terminal.window);
+              const selected = key === selectedTerminalKey;
+              const state = connections[key] ?? idleState("Terminal is idle.");
+              const tabId = terminalDomId("terminal-tab", key);
+              const panelId = terminalDomId("terminal-panel", key);
+              return (
+                <button className={`terminal-tab ${selected ? "selected" : ""}`} type="button" role="tab" id={tabId} aria-controls={panelId} aria-selected={selected} tabIndex={selected ? 0 : -1} key={terminal.window} ref={(element) => { tabRefs.current[key] = element; }} onClick={() => selectTerminal(selectedProjectSlug, terminal.window)} onKeyDown={(event) => handleTabKeyDown(event, index)}>
+                  <span className={`tab-status ${state.phase}`} aria-hidden="true" />
+                  <span className="tab-title">{terminal.title}</span>
+                  {!terminal.closable && <span className="protected-mark" title="Protected terminal" aria-label="Protected terminal">◆</span>}
+                </button>
+              );
+            })}
+            {selectedTerminals.length === 0 && <span className="tabs-empty">No tabs</span>}
+          </div>
+        </div>
+
+        <section className="terminal-stage" id={selectedTerminal ? terminalDomId("terminal-panel", selectedTerminalKey) : "terminal-panel-empty"} role="tabpanel" aria-labelledby={selectedTerminal ? terminalDomId("terminal-tab", selectedTerminalKey) : undefined} tabIndex={0} aria-label="Interactive terminal">
+          {selectedTerminal ? (
+            <TerminalSurface
+              key={selectedTerminalKey}
+              projectSlug={selectedProjectSlug}
+              terminal={selectedTerminal}
+              token={token}
+              chunks={buffers[selectedTerminalKey] ?? []}
+              retrySignal={retrySignals[selectedTerminalKey] ?? 0}
+              onData={(data) => handleTerminalData(selectedTerminalKey, data)}
+              onStateChange={(state) => handleTerminalState(selectedTerminalKey, state)}
+              onError={(err) => handleTerminalError(selectedTerminal.title, err)}
+            />
+          ) : (
+            <WorkspaceEmptyState loading={loading} hasProjects={projects.length > 0} onCreate={() => void handleCreateTerminal()} />
+          )}
         </section>
-      </section>
-    </main>
-  );
-}
 
-function emptyConfigDraft(): ConfigDraft {
-  return {
-    projectSlug: "",
-    repoPath: "",
-    worktreeBase: "",
-    serverHost: "",
-    serverPort: "",
-    orchestratorHarness: "",
-    heartbeatInterval: "",
-    timeout: "",
-    workerHarnesses: "",
-    harnesses: {},
-    githubOwner: "",
-    githubRepo: ""
-  };
-}
-
-function emptyTaskEditorDirty(): TaskEditorDirty {
-  return {
-    title: false,
-    body: false,
-    status: false
-  };
-}
-
-function idleConnection(detail: string): ConnectionState {
-  return { phase: "idle", detail };
-}
-
-function openReconnectingWebSocket(options: ReconnectingWebSocketOptions) {
-  let closed = false;
-  let retryTimer: number | undefined;
-  let stableTimer: number | undefined;
-  let socket: WebSocket | undefined;
-  let attempts = 0;
-
-  const connect = () => {
-    if (closed) {
-      return;
-    }
-    let opened = false;
-    options.setState({ phase: "connecting", detail: "Opening stream..." });
-    socket = new WebSocket(webSocketURL(options.path, options.token));
-    const currentSocket = socket;
-    currentSocket.addEventListener("open", () => {
-      if (closed) {
-        return;
-      }
-      opened = true;
-      options.onOpen?.(currentSocket);
-      options.setState({ phase: "open", detail: "Connected." });
-      stableTimer = window.setTimeout(() => {
-        attempts = 0;
-        stableTimer = undefined;
-      }, stableOpenResetDelayMs);
-    });
-    currentSocket.addEventListener("message", (event) => {
-      if (!closed) {
-        options.onMessage(event);
-      }
-    });
-    currentSocket.addEventListener("error", () => {
-      if (!closed && opened) {
-        options.onSocketError?.();
-      }
-    });
-    currentSocket.addEventListener("close", () => {
-      options.onClose?.();
-      if (closed) {
-        return;
-      }
-      clearStableTimer();
-      if (opened) {
-        scheduleReconnect("Stream disconnected.");
-        return;
-      }
-      void diagnoseWebSocketFailure(options.path, options.token, options.notFoundPhase).then((diagnosis) => {
-        if (closed) {
-          return;
-        }
-        if (!diagnosis.retryable) {
-          options.setState({ phase: diagnosis.phase, detail: diagnosis.detail });
-          return;
-        }
-        scheduleReconnect(diagnosis.detail, diagnosis.phase);
-      });
-    });
-  };
-
-  const scheduleReconnect = (detail: string, exhaustedPhase: FailureConnectionPhase = "failed") => {
-    if (attempts >= reconnectDelaysMs.length) {
-      options.setState({ phase: exhaustedPhase, detail: `${detail} Reconnect attempts exhausted.` });
-      return;
-    }
-    const retryInMs = reconnectDelaysMs[attempts];
-    attempts += 1;
-    options.setState({
-      phase: "retrying",
-      detail,
-      attempt: attempts,
-      maxAttempts: reconnectDelaysMs.length,
-      retryInMs
-    });
-    retryTimer = window.setTimeout(connect, retryInMs);
-  };
-
-  const clearStableTimer = () => {
-    if (stableTimer !== undefined) {
-      window.clearTimeout(stableTimer);
-      stableTimer = undefined;
-    }
-  };
-
-  connect();
-
-  return () => {
-    closed = true;
-    if (retryTimer !== undefined) {
-      window.clearTimeout(retryTimer);
-    }
-    clearStableTimer();
-    options.onClose?.();
-    socket?.close();
-  };
-}
-
-async function diagnoseWebSocketFailure(
-  path: string,
-  token: string,
-  notFoundPhase: FailureConnectionPhase = "failed"
-): Promise<WebSocketDiagnosis> {
-  try {
-    const response = await fetch(withTokenQuery(path, token), {
-      cache: "no-store",
-      headers: {
-        Accept: "application/json",
-        ...(token ? { Authorization: `Bearer ${token}` } : {})
-      }
-    });
-    const detail = await responseErrorDetail(response);
-    if (response.status === 401) {
-      return {
-        phase: "unauthorized",
-        detail: "Unauthorized. Apply a valid API token.",
-        retryable: false
-      };
-    }
-    if (response.status === 403) {
-      return {
-        phase: "forbidden",
-        detail: detail || "Forbidden for this stream.",
-        retryable: false
-      };
-    }
-    if (response.status === 409) {
-      return {
-        phase: "blocked",
-        detail: detail || "Another active log stream is already open.",
-        retryable: true
-      };
-    }
-    if (response.status === 404) {
-      return {
-        phase: notFoundPhase,
-        detail: detail || "Stream not found.",
-        retryable: false
-      };
-    }
-    if (response.status >= 500) {
-      return {
-        phase: "failed",
-        detail: detail || "Server failed before opening the stream.",
-        retryable: true
-      };
-    }
-    if (response.status === 400) {
-      return {
-        phase: "failed",
-        detail: "WebSocket handshake did not complete.",
-        retryable: false
-      };
-    }
-    return {
-      phase: "failed",
-      detail: detail || "WebSocket handshake was rejected before opening.",
-      retryable: false
-    };
-  } catch {
-    return {
-      phase: "failed",
-      detail: "Server is unreachable.",
-      retryable: true
-    };
-  }
-}
-
-async function responseErrorDetail(response: Response) {
-  const payload = (await response
-    .clone()
-    .json()
-    .catch(() => undefined)) as { error?: unknown } | undefined;
-  if (payload && typeof payload.error === "string") {
-    return payload.error;
-  }
-  const text = await response.text().catch(() => "");
-  return text.trim() || response.statusText;
-}
-
-function appendLogEvent(event: MessageEvent, setLog: LogSetter) {
-  try {
-    const msg = JSON.parse(String(event.data)) as { type?: string; data?: string };
-    if ((msg.type === "chunk" || msg.type === "line") && typeof msg.data === "string") {
-      appendLogLine(setLog, msg.data);
-    } else if (msg.type === "closed") {
-      appendLogLine(setLog, "[stream closed]", false);
-    } else if (msg.type === "error" && msg.data) {
-      appendLogLine(setLog, `[error] ${msg.data}`, false);
-    }
-  } catch {
-    appendLogLine(setLog, String(event.data));
-  }
-}
-
-function appendLogLine(setLog: LogSetter, line: string, trim = true) {
-  setLog((current) => [...(trim ? current.slice(-999) : current), line]);
-}
-
-function logDisplayText(lines: string[], state: ConnectionState, emptyText: string, idleText: string) {
-  if (lines.length) {
-    return lines.join("\n");
-  }
-  switch (state.phase) {
-    case "idle":
-      return state.detail || idleText;
-    case "connecting":
-      return "Connecting to stream...";
-    case "open":
-      return emptyText;
-    case "retrying":
-      return `${state.detail || "Stream disconnected."} Reconnecting in ${formatRetryDelay(state.retryInMs)} (${state.attempt}/${state.maxAttempts}).`;
-    case "unauthorized":
-    case "forbidden":
-    case "blocked":
-    case "missing":
-    case "failed":
-      return state.detail || connectionLabel(state);
-  }
-}
-
-function TerminalPane({
-  chunks,
-  connection,
-  emptyText,
-  idleText,
-  onData,
-  onResize
-}: {
-  chunks: string[];
-  connection: ConnectionState;
-  emptyText: string;
-  idleText: string;
-  onData?: (data: string) => void;
-  onResize?: (cols: number, rows: number) => void;
-}) {
-  const containerRef = useRef<HTMLDivElement | null>(null);
-  const terminalRef = useRef<Terminal | null>(null);
-  const writtenRef = useRef(0);
-  const sizeRef = useRef<{ cols: number; rows: number } | null>(null);
-
-  useEffect(() => {
-    if (!containerRef.current) {
-      return;
-    }
-    const terminal = new Terminal({
-      allowProposedApi: false,
-      convertEol: false,
-      cursorBlink: Boolean(onData),
-      disableStdin: !onData,
-      fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace',
-      fontSize: 12,
-      lineHeight: 1.2,
-      scrollback: 3000,
-      theme: {
-        background: "#111827",
-        foreground: "#d7e2ec",
-        cursor: "#d7e2ec",
-        selectionBackground: "#2f6f73"
-      }
-    });
-    const fit = new FitAddon();
-    terminal.loadAddon(fit);
-    terminal.open(containerRef.current);
-    terminalRef.current = terminal;
-    const dataDisposable = onData ? terminal.onData(onData) : undefined;
-    for (let index = writtenRef.current; index < chunks.length; index += 1) {
-      terminal.write(chunks[index]);
-    }
-    writtenRef.current = chunks.length;
-    const resize = () => {
-      try {
-        fit.fit();
-        const next = { cols: terminal.cols, rows: terminal.rows };
-        const prev = sizeRef.current;
-        if (next.cols > 0 && next.rows > 0 && (!prev || prev.cols !== next.cols || prev.rows !== next.rows)) {
-          sizeRef.current = next;
-          onResize?.(next.cols, next.rows);
-        }
-      } catch {
-        // The terminal can briefly report zero dimensions while the layout settles.
-      }
-    };
-    resize();
-    const observer = new ResizeObserver(resize);
-    observer.observe(containerRef.current);
-    return () => {
-      observer.disconnect();
-      dataDisposable?.dispose();
-      terminal.dispose();
-      terminalRef.current = null;
-      writtenRef.current = 0;
-    };
-  }, []);
-
-  useEffect(() => {
-    const terminal = terminalRef.current;
-    if (!terminal) {
-      return;
-    }
-    if (chunks.length < writtenRef.current) {
-      terminal.reset();
-      writtenRef.current = 0;
-    }
-    for (let index = writtenRef.current; index < chunks.length; index += 1) {
-      terminal.write(chunks[index]);
-    }
-    writtenRef.current = chunks.length;
-  }, [chunks]);
-
-  const placeholder = chunks.length ? "" : logDisplayText(chunks, connection, emptyText, idleText);
-
-  return (
-    <div
-      className={`terminal-pane ${onData ? "interactive" : ""}`}
-      onMouseDown={() => terminalRef.current?.focus()}
-    >
-      <div ref={containerRef} className="terminal-surface" />
-      {placeholder && <div className="terminal-placeholder">{placeholder}</div>}
+        <footer className="status-bar">
+          <div className="status-context"><span className={`state-dot ${selectedConnection.phase}`} aria-hidden="true" /> <span>{selectedTerminal?.title ?? "No terminal"}</span><span className="status-separator">/</span><span>{selectedProjectSlug || "No project"}</span></div>
+          <div className="status-actions">
+            <span className={`connection-text ${selectedConnection.phase}`}>{terminalStateLabel(selectedConnection)}</span>
+            {selectedTerminal?.closable && <button className="status-button danger-text" type="button" onClick={() => void handleCloseTerminal()} disabled={Boolean(busyAction) || refreshing} aria-label={`Close ${selectedTerminal.title}`}>Close</button>}
+            <button className="status-button" type="button" onClick={() => {
+              if (selectedTerminal) {
+                setRetrySignals((current) => ({ ...current, [selectedTerminalKey]: (current[selectedTerminalKey] ?? 0) + 1 }));
+              }
+            }} disabled={!selectedTerminal || Boolean(busyAction)} aria-label="Reconnect selected terminal">Reconnect</button>
+          </div>
+        </footer>
+      </main>
     </div>
   );
 }
 
-function ConnectionBadge({ label, state }: { label: string; state: ConnectionState }) {
-  const text = connectionLabel(state);
-  const detail = connectionDetail(state);
+function TerminalSurface({
+  projectSlug,
+  terminal,
+  token,
+  chunks,
+  retrySignal,
+  onData,
+  onStateChange,
+  onError
+}: {
+  projectSlug: string;
+  terminal: TerminalInfo;
+  token: string;
+  chunks: string[];
+  retrySignal: number;
+  onData: (data: string) => void;
+  onStateChange: (state: TerminalState) => void;
+  onError: (error: Error) => void;
+}) {
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const terminalRef = useRef<Terminal | null>(null);
+  const fitRef = useRef<FitAddon | null>(null);
+  const writtenRef = useRef(0);
+  const sendInputRef = useRef<(data: string) => boolean>(() => false);
+  const resizeRef = useRef<(size: { cols: number; rows: number }) => boolean>(() => false);
+  const retryRef = useRef<() => void>(() => undefined);
+  const terminalKeyValue = terminalKey(projectSlug, terminal.window);
+
+  const handleData = useCallback((data: string) => onData(data), [onData]);
+  const handleState = useCallback((state: TerminalState) => onStateChange(state), [onStateChange]);
+  const handleError = useCallback((error: Error) => onError(error), [onError]);
+  const { state, retry, sendInput, resize } = useTerminalController({
+    projectSlug,
+    windowName: terminal.window,
+    token,
+    onData: handleData,
+    onStateChange: handleState,
+    onError: handleError
+  });
+
+  sendInputRef.current = sendInput;
+  resizeRef.current = resize;
+  retryRef.current = retry;
+
+  useEffect(() => {
+    if (retrySignal > 0) {
+      retryRef.current();
+    }
+  }, [retrySignal]);
+
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) {
+      return;
+    }
+    const xterm = new Terminal({
+      allowProposedApi: true,
+      convertEol: false,
+      cursorBlink: true,
+      cursorStyle: "bar",
+      fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
+      fontSize: 14,
+      scrollback: 10000,
+      theme: {
+        background: "#111418",
+        foreground: "#d7dde5",
+        cursor: "#79d2b0",
+        selectionBackground: "#2f5360",
+        black: "#1b2027",
+        red: "#e27d86",
+        green: "#83d29a",
+        yellow: "#e7c27d",
+        blue: "#82a9e6",
+        magenta: "#c49ad6",
+        cyan: "#70c5c6",
+        white: "#d7dde5",
+        brightBlack: "#6c7784",
+        brightWhite: "#ffffff"
+      }
+    });
+    const fit = new FitAddon();
+    xterm.loadAddon(fit);
+    xterm.open(container);
+    terminalRef.current = xterm;
+    fitRef.current = fit;
+    const dataDisposable = xterm.onData((data) => { sendInputRef.current(data); });
+    let frame = 0;
+    const fitTerminal = () => {
+      window.cancelAnimationFrame(frame);
+      frame = window.requestAnimationFrame(() => {
+        try {
+          fit.fit();
+          if (xterm.cols > 0 && xterm.rows > 0) {
+            resizeRef.current({ cols: xterm.cols, rows: xterm.rows });
+          }
+        } catch {
+          // Layout can report zero dimensions while the stage is settling.
+        }
+      });
+    };
+    const observer = typeof ResizeObserver === "undefined" ? undefined : new ResizeObserver(fitTerminal);
+    observer?.observe(container);
+    window.addEventListener("resize", fitTerminal);
+    fitTerminal();
+    xterm.focus();
+    return () => {
+      window.cancelAnimationFrame(frame);
+      observer?.disconnect();
+      window.removeEventListener("resize", fitTerminal);
+      dataDisposable.dispose();
+      xterm.dispose();
+      terminalRef.current = null;
+      fitRef.current = null;
+      writtenRef.current = 0;
+    };
+  }, []);
+
+  useEffect(() => {
+    const xterm = terminalRef.current;
+    if (!xterm) {
+      return;
+    }
+    if (writtenRef.current > chunks.length) {
+      xterm.reset();
+      writtenRef.current = 0;
+    }
+    for (let index = writtenRef.current; index < chunks.length; index += 1) {
+      xterm.write(chunks[index]);
+    }
+    writtenRef.current = chunks.length;
+    fitRef.current?.fit();
+  }, [chunks]);
+
+  const placeholder = state.phase === "open" && chunks.length > 0 ? "" : terminalStateDetail(state, terminal.available);
   return (
-    <span
-      aria-label={`${label} connection: ${detail}`}
-      className={`connection-badge ${connectionTone(state.phase)}`}
-      role="status"
-      title={detail}
-    >
-      {text}
-    </span>
+    <div className="terminal-view" onMouseDown={() => terminalRef.current?.focus()}>
+      <div className="terminal-view-header">
+        <div><span className="terminal-view-title">{terminal.title}</span><span className="terminal-view-kind">{terminal.kind}{terminal.closable ? "" : " · protected"}</span></div>
+        <span className={`connection-badge ${state.phase}`} role="status">{terminalStateLabel(state)}</span>
+      </div>
+      <div className="terminal-canvas" ref={containerRef} aria-label={`${terminal.title} terminal`} />
+      {placeholder && <div className="terminal-placeholder" role="status">{placeholder}</div>}
+      <div className="terminal-hint">Click to focus · terminal input is sent to {terminal.title}</div>
+      <span className="sr-only">Terminal identity: {terminalKeyValue}</span>
+    </div>
   );
 }
 
-function connectionLabel(state: ConnectionState) {
+function WorkspaceEmptyState({ loading, hasProjects, onCreate }: { loading: boolean; hasProjects: boolean; onCreate: () => void }) {
+  return (
+    <div className="workspace-empty">
+      <div className="empty-icon" aria-hidden="true">⌘</div>
+      <h3>{loading ? "Loading your workspace" : hasProjects ? "No terminal selected" : "Your workspace is empty"}</h3>
+      <p>{loading ? "Finding projects and shell windows…" : hasProjects ? "Choose a terminal from the sidebar or open a new shell." : "Configure a project on the server to begin."}</p>
+      {hasProjects && <button className="primary-button" type="button" onClick={onCreate}>＋ Open shell</button>}
+    </div>
+  );
+}
+
+function terminalKey(projectSlug: string, windowName: string) {
+  return `${projectSlug}\u0000${windowName}`;
+}
+
+function terminalDomId(prefix: string, key: string) {
+  return `${prefix}-${encodeURIComponent(key).replace(/%/g, "_")}`;
+}
+
+function hasTerminalInProject(terminalsByProject: TerminalMap, projectSlug: string, key: string) {
+  return (terminalsByProject[projectSlug] ?? []).some((terminal) => terminalKey(projectSlug, terminal.window) === key);
+}
+
+function firstTerminalKey(projectSlug: string | undefined, terminalsByProject: TerminalMap) {
+  if (!projectSlug) {
+    return "";
+  }
+  const terminal = terminalsByProject[projectSlug]?.[0];
+  return terminal ? terminalKey(projectSlug, terminal.window) : "";
+}
+
+function idleState(detail: string): TerminalState {
+  return { phase: "idle", detail };
+}
+
+function terminalStateLabel(state: TerminalState) {
   switch (state.phase) {
-    case "idle":
-      return "Idle";
-    case "connecting":
-      return "Connecting";
-    case "open":
-      return "Live";
-    case "retrying":
-      return `Reconnecting ${state.attempt}/${state.maxAttempts}`;
-    case "unauthorized":
-      return "Unauthorized";
-    case "forbidden":
-      return "Forbidden";
-    case "blocked":
-      return "Blocked";
-    case "missing":
-      return "Missing";
-    case "failed":
-      return "Disconnected";
+    case "idle": return "Idle";
+    case "connecting": return "Connecting";
+    case "open": return "Live";
+    case "retrying": return `Retrying ${state.attempt}`;
+    case "missing": return "Missing";
+    case "unauthorized": return "Unauthorized";
+    case "failed": return "Disconnected";
   }
 }
 
-function connectionDetail(state: ConnectionState) {
+function terminalStateDetail(state: TerminalState, available: boolean) {
+  if (!available) {
+    return "This terminal is unavailable. Refresh the workspace or reconnect when it returns.";
+  }
   if (state.phase === "retrying") {
-    return `${state.detail || "Stream disconnected."} Reconnecting in ${formatRetryDelay(state.retryInMs)} (${state.attempt}/${state.maxAttempts}).`;
+    return `${state.detail} Retrying in ${formatDelay(state.retryInMs)}.`;
   }
-  return state.detail || connectionLabel(state);
-}
-
-function connectionTone(phase: ConnectionPhase) {
-  switch (phase) {
-    case "open":
-      return "open";
-    case "connecting":
-    case "retrying":
-      return "pending";
-    case "unauthorized":
-    case "forbidden":
-    case "blocked":
-    case "missing":
-    case "failed":
-      return "problem";
-    case "idle":
-      return "idle";
+  if (state.phase === "open") {
+    return "Connected. Waiting for terminal output…";
   }
+  return state.detail || terminalStateLabel(state);
 }
 
-function formatRetryDelay(delay?: number) {
-  if (delay === undefined) {
-    return "soon";
+function formatDelay(delay: number) {
+  return delay < 1000 ? `${delay}ms` : `${(delay / 1000).toFixed(1)}s`;
+}
+
+function errorMessage(error: unknown) {
+  if (error instanceof ApiError) {
+    if (error.status === 401) return "Unauthorized. Apply a valid access token.";
+    if (error.status === 404) return "Project or terminal was not found.";
+    return error.message || `Request failed (${error.status}).`;
   }
-  if (delay < 1000) {
-    return `${delay}ms`;
-  }
-  return `${delay / 1000}s`;
-}
-
-function normalizeArray<T>(value: T[] | null | undefined): T[] {
-  return Array.isArray(value) ? value : [];
-}
-
-function configToDraft(config: ConfigResponse): ConfigDraft {
-  const workerHarnesses = Array.isArray(config.worker_harnesses) ? config.worker_harnesses : [];
-
-  return {
-    projectSlug: config.project.slug,
-    repoPath: config.project.repo_path,
-    worktreeBase: config.project.worktree_base,
-    serverHost: config.server.host || "127.0.0.1",
-    serverPort: String(config.server.port),
-    orchestratorHarness: config.orchestrator.harness,
-    heartbeatInterval: config.orchestrator.heartbeat_interval,
-    timeout: config.orchestrator.timeout,
-    workerHarnesses: workerHarnesses.join(", "),
-    harnesses: Object.fromEntries(Object.entries(config.harnesses).map(([name, harness]) => [name, harness.command])),
-    githubOwner: config.github.owner ?? "",
-    githubRepo: config.github.repo ?? ""
-  };
-}
-
-function configPatchFromDraft(draft: ConfigDraft) {
-  const trimmedPort = draft.serverPort.trim();
-  if (!/^\d+$/.test(trimmedPort)) {
-    throw new Error("Server port must be an integer");
-  }
-  const serverPort = Number(trimmedPort);
-  if (serverPort < 1 || serverPort > 65535) {
-    throw new Error("Server port must be between 1 and 65535");
-  }
-  return {
-    project: {
-      slug: draft.projectSlug,
-      repo_path: draft.repoPath,
-      worktree_base: draft.worktreeBase
-    },
-    server: {
-      host: draft.serverHost,
-      port: serverPort
-    },
-    orchestrator: {
-      harness: draft.orchestratorHarness,
-      heartbeat_interval: draft.heartbeatInterval,
-      timeout: draft.timeout
-    },
-    worker_harnesses: draft.workerHarnesses
-      .split(",")
-      .map((name) => name.trim())
-      .filter(Boolean),
-    harnesses: Object.fromEntries(
-      Object.entries(draft.harnesses).map(([name, command]) => [name, { command }])
-    ),
-    github: {
-      owner: draft.githubOwner,
-      repo: draft.githubRepo
-    }
-  };
-}
-
-function normalizedProjectSelection(projects: ProjectInfo[], currentSlug: string, preferredSlug = "") {
-  if (preferredSlug && projects.some((project) => project.slug === preferredSlug)) {
-    return preferredSlug;
-  }
-  if (projects.some((project) => project.slug === currentSlug)) {
-    return currentSlug;
-  }
-  return projects[0]?.slug || "";
-}
-
-function tasksPath(projectSlug: string) {
-  return projectSlug ? `/api/projects/${encodeURIComponent(projectSlug)}/tasks` : "/api/tasks";
-}
-
-function workersPath(projectSlug: string) {
-  return projectSlug ? `/api/projects/${encodeURIComponent(projectSlug)}/workers` : "/api/workers";
-}
-
-function taskPath(projectSlug: string, taskID: string) {
-  return projectSlug
-    ? `/api/projects/${encodeURIComponent(projectSlug)}/tasks/${encodeURIComponent(taskID)}`
-    : `/api/tasks/${encodeURIComponent(taskID)}`;
-}
-
-function workerLogPath(projectSlug: string, workerID: string) {
-  return projectSlug
-    ? `/ws/projects/${encodeURIComponent(projectSlug)}/worker/${encodeURIComponent(workerID)}`
-    : `/ws/worker/${encodeURIComponent(workerID)}`;
-}
-
-function ledgerWSPath(projectSlug: string) {
-  return projectSlug ? `/ws/projects/${encodeURIComponent(projectSlug)}/ledger` : "/ws/ledger";
-}
-
-function orchestratorLogPath(projectSlug: string) {
-  return projectSlug ? `/ws/projects/${encodeURIComponent(projectSlug)}/orchestrator` : "/ws/orchestrator";
-}
-
-function workerFollowupPath(projectSlug: string, workerID: string) {
-  return projectSlug
-    ? `/api/projects/${encodeURIComponent(projectSlug)}/workers/${encodeURIComponent(workerID)}/followup`
-    : `/api/workers/${encodeURIComponent(workerID)}/followup`;
-}
-
-function webSocketURL(path: string, token: string) {
-  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-  return `${protocol}//${window.location.host}${withTokenQuery(path, token)}`;
-}
-
-function withTokenQuery(path: string, token: string) {
-  if (!token) {
-    return path;
-  }
-  const separator = path.includes("?") ? "&" : "?";
-  return `${path}${separator}token=${encodeURIComponent(token)}`;
-}
-
-async function api<T>(path: string, init: RequestInit = {}, token = ""): Promise<T> {
-  const response = await fetch(path, {
-    ...init,
-    headers: {
-      "Content-Type": "application/json",
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
-      ...(init.headers ?? {})
-    }
-  });
-  const payload = await response.json().catch(() => undefined);
-  if (!response.ok) {
-    const msg = payload && typeof payload.error === "string" ? payload.error : response.statusText;
-    throw new Error(msg);
-  }
-  return payload as T;
-}
-
-function errorMessage(err: unknown) {
-  return err instanceof Error ? err.message : "Unexpected error";
+  return error instanceof Error ? error.message : "Unexpected request failure.";
 }
 
 function initialToken() {
-  const params = new URLSearchParams(window.location.search);
-  const token = params.get("token") || localStorage.getItem(tokenStorageKey) || "";
+  if (typeof window === "undefined") {
+    return "";
+  }
+  const token = new URLSearchParams(window.location.search).get("token") || window.localStorage.getItem(tokenStorageKey) || "";
   if (token) {
     storeToken(token);
   }
@@ -1800,10 +611,13 @@ function initialToken() {
 }
 
 function storeToken(token: string) {
+  if (typeof window === "undefined") {
+    return;
+  }
   if (token) {
-    localStorage.setItem(tokenStorageKey, token);
+    window.localStorage.setItem(tokenStorageKey, token);
   } else {
-    localStorage.removeItem(tokenStorageKey);
+    window.localStorage.removeItem(tokenStorageKey);
   }
 }
 
