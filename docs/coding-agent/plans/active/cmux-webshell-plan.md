@@ -358,14 +358,53 @@
     owner: worker
     detail: `$deep-review`, independent subagent review, and `gh-review-hook` exit 0.
 
-### Task_7: integrated review and browser acceptance
+### Task_10: reconnect snapshot reset boundary
 - status: in_progress
+- type: fix
+- branch: `codex/webshell-snapshot-reset`
+- thread: `/root/task10_snapshot_reset`
+- worktree: `/Users/xpadev/.codex/worktrees/task10-snapshot/ccx-t2`
+- owns:
+  - `server/internal/web/ws.go`
+  - `server/internal/web/ws_test.go`
+  - `server/internal/web/server_test.go`
+  - `web/src/terminal/**`
+  - `web/src/main.tsx`
+  - `server/internal/webui/dist/**`
+- forbidden:
+  - tmux implementation, docs, manifests/lockfiles, unrelated backend/UI
+- depends_on: [Task_6]
+- acceptance:
+  - Each attachment identifies snapshot/reset separately from live chunks without guessing byte overlap.
+  - Reconnect replaces the prior rendered/buffered pane state before applying the fresh snapshot, then continues live output exactly once.
+  - Rapid project/window/token changes cannot apply a stale reset or snapshot to the current terminal.
+  - Real server restart recovery remains interactive and renders a coherent non-duplicated terminal without page reload.
+- validation:
+  - kind: command
+    required: true
+    owner: worker
+    detail: `cd server && go test ./internal/web && go test -race ./internal/web`
+  - kind: command
+    required: true
+    owner: worker
+    detail: `cd web && npm run build && npm run embedded:sync && npm run embedded:check`
+  - kind: e2e
+    required: true
+    owner: worker
+    detail: Real server stop/restart regression proving snapshot replacement, live continuation, input, and both viewports.
+  - kind: review
+    required: true
+    owner: worker
+    detail: `$deep-review`, independent review, and `gh-review-hook` exit 0.
+
+### Task_7: integrated review and browser acceptance
+- status: waiting_on_Task_10
 - type: review
 - branch: none
 - thread: `/root/task7_integrated_review`
 - worktree: `/Users/xpadev/.codex/worktrees/task7-review/ccx-t2`
 - owns: []
-- depends_on: [Task_6]
+- depends_on: [Task_10]
 - acceptance:
   - Independent reviewer status is APPROVED with no unresolved P0-P2 findings.
   - Browser evidence exists under `.playwright-cli/` for both viewports and all specified flows.
@@ -391,7 +430,8 @@
 - Wave 3 (sequential): [Task_4]
 - Wave 4 (sequential): [Task_5]
 - Wave 5 (sequential): [Task_6]
-- Wave 6 (independent acceptance): [Task_7]
+- Wave 6 (recovery correction): [Task_10]
+- Wave 7 (independent acceptance): [Task_7]
 
 ## E2E / Visual Validation Spec
 - provider: `playwright-cli`
@@ -435,6 +475,8 @@
 - 2026-07-11: Replacement user-owned thread also failed to materialize. Orchestrator created dedicated worktree `/Users/xpadev/.codex/worktrees/task6-docs/ccx-t2` on `codex/webshell-docs-assets` and started bounded collaboration Worker `/root/task6_docs_assets`; runtime does not expose per-worker model selection, so the requested luna-high setting could not be enforced on this fallback.
 - 2026-07-11: Task_6 merged via PR #71 at `e4fd58879d0cc0e2645cb02bf2854e9ad6a3fab2` after exact-head parent and independent reviews were CLEAN, documentation/API/UI consistency passed, build and embedded sync/check left the worktree clean, orchestrator hook exited 0, and all GitHub checks were green. Task_7 integrated review gate opened.
 - 2026-07-11: Task_7 independent integrated review started as `/root/task7_integrated_review` in clean worktree `/Users/xpadev/.codex/worktrees/task7-review/ccx-t2`.
+- 2026-07-11: Task_7 returned NEEDS_REVISION after real server-restart E2E proved that a reconnect snapshot is appended to the existing terminal buffer, duplicating/garbling prior output. All other required browser flows passed at `1440x900` and `900x700`; full Go/race validation also exposed a separate local `internal/mcp` harness-start timeout to re-evaluate during final acceptance.
+- 2026-07-11: Task_10 split from Task_7 as the bounded reconnect snapshot-reset correction. Task_7 is waiting and will be rerun from a fresh integrated-review worktree after Task_10 merges.
 
 ## Decision Log
 - 2026-07-11: WebShell is the product UI; harness/task concepts remain backend-compatible but are removed from primary navigation.
@@ -442,3 +484,4 @@
 - 2026-07-11: Serialize frontend client then UI because both establish contracts consumed by `main.tsx`; avoiding parallel integration churn outweighs speed.
 - 2026-07-11: Approved Task_2 decomposition. Rejected further websocket-only queue-drain heuristics because capture sampling and pipe delivery are observationally ambiguous without a tmux-owned watermark.
 - 2026-07-11: Approved the minimal Task_5 generated-asset exception because CI requires embedded assets to match frontend source in the same PR; Task_6 retains documentation ownership and final post-merge rebuild/sync verification.
+- 2026-07-11: Split reconnect recovery into Task_10 because the existing protocol exposes snapshots as ordinary chunks; exactly-once replacement requires a cohesive server frame contract plus generation/identity-safe client and UI handling, not a reviewer-side workaround.
