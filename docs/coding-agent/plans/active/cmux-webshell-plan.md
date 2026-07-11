@@ -40,10 +40,14 @@
 ## Task Ledger
 
 ### Task_1: tmux project-window primitives
-- status: in_progress
+- status: complete
 - type: impl
 - branch: `codex/webshell-tmux-primitives`
 - thread: `019f4d7d-a6b6-7642-8607-3ca97d2cb2c1`
+- pr: `#65` https://github.com/xpadev-net/ccx-t2/pull/65
+- head: `32e2bccfb2248d983bf30912b66554a30efceecf`
+- merge_commit: `d58fa7d8423cee8fde89967662f2f7eae90428fa`
+- completion evidence: parent `$deep-review` and independent review CLEAN; parent `gh-review-hook 65` exit 0; normal/race/full `-race -count=20` (780 tests)/vet/diff checks passed; all seven GitHub checks green; worker archival initiated.
 - owns:
   - `server/internal/tmux/tmux.go`
   - `server/internal/tmux/tmux_test.go`
@@ -400,6 +404,7 @@
 - 2026-07-11: Wave 1 delegated in separate worktrees using `gpt-5.6-luna` / `high`. Task_1 startup system error received one required resume; Task_2 passed startup stability check.
 - 2026-07-11: Task_2 split after repeated parent deep-review proved the independent snapshot/pipe interfaces cannot establish an atomic no-gap/no-duplicate boundary. PR #66 continues as Task_8 reduced transport stability; Task_9 owns the new tmux attachment contract after Task_1 and Task_8 merge.
 - 2026-07-11: Task_8 merged via PR #66 at `6439fb12a3d6e3185d7d6280cbd1ab04ff398189` after reduced-scope parent deep-review APPROVED, independent Reviewer APPROVED, hook exit 0, normal/race/vet/stress passes, and all GitHub checks green. Worker archival initiated.
+- 2026-07-11: Task_1 merged via PR #65 at `d58fa7d8423cee8fde89967662f2f7eae90428fa` after parent and independent deep-review CLEAN, hook exit 0, normal/race/full 20x race stress/vet passes, and all GitHub checks green. Task_9 dependency gate opened.
 
 ## Decision Log
 - 2026-07-11: WebShell is the product UI; harness/task concepts remain backend-compatible but are removed from primary navigation.
