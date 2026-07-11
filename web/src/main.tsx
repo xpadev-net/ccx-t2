@@ -274,6 +274,7 @@ function App() {
   const applyToken = () => {
     const nextToken = tokenDraft.trim();
     storeToken(nextToken);
+    loadGenerationRef.current += 1;
     setLoading(true);
     setToken(nextToken);
     setNotice("Access token applied. Refreshing workspace…");
