@@ -117,6 +117,13 @@ function App() {
     ? connections[selectedTerminalKey] ?? idleState("Terminal is waiting to connect.")
     : idleState("Select a terminal to connect.");
 
+  useEffect(() => {
+    const list = terminalsByProject[selectedProjectSlug] ?? [];
+    if (list.length > 0 && !list.some((terminal) => terminalKey(selectedProjectSlug, terminal.window) === selectedTerminalKey)) {
+      setSelectedTerminalKey(firstTerminalKey(selectedProjectSlug, terminalsByProject));
+    }
+  }, [selectedProjectSlug, selectedTerminalKey, terminalsByProject]);
+
   const selectProject = useCallback(
     (slug: string) => {
       setSelectedProjectSlug(slug);
@@ -143,7 +150,7 @@ function App() {
   }, [loadWorkspace]);
 
   const handleCreateTerminal = useCallback(async () => {
-    if (!selectedProjectSlug || busyAction || refreshing) {
+    if (!selectedProjectSlug || busyAction || loading || refreshing) {
       return;
     }
     setBusyAction("create");
@@ -164,7 +171,7 @@ function App() {
     } finally {
       setBusyAction("");
     }
-  }, [busyAction, client, refreshing, selectedProjectSlug]);
+  }, [busyAction, client, loading, refreshing, selectedProjectSlug]);
 
   const handleCloseTerminal = useCallback(async () => {
     if (!selectedTerminal?.closable || busyAction || refreshing || !selectedProjectSlug) {
@@ -175,27 +182,24 @@ function App() {
     }
     const projectSlug = selectedProjectSlug;
     const key = terminalKey(projectSlug, selectedTerminal.window);
-    const list = terminalsByProject[projectSlug] ?? [];
-    const nextList = list.filter((terminal) => terminal.window !== selectedTerminal.window);
+    const windowName = selectedTerminal.window;
     setBusyAction("delete");
     setError("");
     setNotice("");
     try {
-      await client.deleteProjectTerminal(projectSlug, selectedTerminal.window);
-      setTerminalsByProject((current) => ({ ...current, [projectSlug]: nextList }));
-      setSelectedTerminalKey((current) => {
-        if (current !== key) {
-          return current;
-        }
-        return terminalKey(projectSlug, nextList[0]?.window ?? "");
-      });
+      await client.deleteProjectTerminal(projectSlug, windowName);
+      setTerminalsByProject((current) => ({
+        ...current,
+        [projectSlug]: (current[projectSlug] ?? []).filter((terminal) => terminal.window !== windowName)
+      }));
+      setSelectedTerminalKey((current) => current === key ? "" : current);
       setNotice(`${selectedTerminal.title} closed.`);
     } catch (err) {
       setError(`Could not close ${selectedTerminal.title}: ${errorMessage(err)}`);
     } finally {
       setBusyAction("");
     }
-  }, [busyAction, client, refreshing, selectedProjectSlug, selectedTerminal, terminalsByProject]);
+  }, [busyAction, client, refreshing, selectedProjectSlug, selectedTerminal]);
 
   const handleTerminalState = useCallback((key: string, state: TerminalState) => {
     setConnections((current) => ({ ...current, [key]: state }));
@@ -311,7 +315,7 @@ function App() {
           </div>
           <div className="workspace-actions">
             <button className="toolbar-button" type="button" onClick={refresh} disabled={refreshing || Boolean(busyAction)} aria-label="Refresh terminal list">{refreshing ? "Refreshing…" : "Refresh"}</button>
-            <button className="primary-button" type="button" onClick={() => void handleCreateTerminal()} disabled={!selectedProjectSlug || Boolean(busyAction) || refreshing} aria-label="Open a new shell">＋ New shell</button>
+            <button className="primary-button" type="button" onClick={() => void handleCreateTerminal()} disabled={!selectedProjectSlug || Boolean(busyAction) || loading || refreshing} aria-label="Open a new shell">＋ New shell</button>
           </div>
         </header>
 
@@ -399,11 +403,11 @@ function TerminalSurface({
 }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const terminalRef = useRef<Terminal | null>(null);
-  const fitRef = useRef<FitAddon | null>(null);
   const writtenRef = useRef(0);
   const sendInputRef = useRef<(data: string) => boolean>(() => false);
   const resizeRef = useRef<(size: { cols: number; rows: number }) => boolean>(() => false);
   const retryRef = useRef<() => void>(() => undefined);
+  const initialRetrySignalRef = useRef(retrySignal);
   const terminalKeyValue = terminalKey(projectSlug, terminal.window);
 
   const handleData = useCallback((data: string) => onData(data), [onData]);
@@ -423,9 +427,10 @@ function TerminalSurface({
   retryRef.current = retry;
 
   useEffect(() => {
-    if (retrySignal > 0) {
+    if (retrySignal > initialRetrySignalRef.current) {
       retryRef.current();
     }
+    initialRetrySignalRef.current = retrySignal;
   }, [retrySignal]);
 
   useEffect(() => {
@@ -462,7 +467,6 @@ function TerminalSurface({
     xterm.loadAddon(fit);
     xterm.open(container);
     terminalRef.current = xterm;
-    fitRef.current = fit;
     const dataDisposable = xterm.onData((data) => { sendInputRef.current(data); });
     let frame = 0;
     const fitTerminal = () => {
@@ -490,7 +494,6 @@ function TerminalSurface({
       dataDisposable.dispose();
       xterm.dispose();
       terminalRef.current = null;
-      fitRef.current = null;
       writtenRef.current = 0;
     };
   }, []);
@@ -508,7 +511,6 @@ function TerminalSurface({
       xterm.write(chunks[index]);
     }
     writtenRef.current = chunks.length;
-    fitRef.current?.fit();
   }, [chunks]);
 
   const placeholder = state.phase === "open" && chunks.length > 0 ? "" : terminalStateDetail(state, terminal.available);
