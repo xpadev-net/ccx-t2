@@ -31,6 +31,16 @@ export type UseTerminalControllerResult = {
   resize: (size: TerminalSize) => boolean;
 };
 
+export function matchesTerminalConnection(
+  identity: TerminalConnectionIdentity,
+  generation: number,
+  target: TerminalTarget,
+  token: string
+): boolean {
+  return identity.generation === generation && identity.projectSlug === target.projectSlug &&
+    identity.windowName === target.windowName && identity.token === token;
+}
+
 export function useTerminalController(options: UseTerminalControllerOptions): UseTerminalControllerResult {
   const controllerRef = useRef<TerminalController | null>(null);
   if (controllerRef.current === null) {
@@ -76,8 +86,12 @@ export function useTerminalController(options: UseTerminalControllerOptions): Us
   const token = options.token ?? "";
 
   useEffect(() => {
-    const accepts = (identity: TerminalConnectionIdentity) => identity.generation === generation &&
-      identity.projectSlug === target.projectSlug && identity.windowName === target.windowName && identity.token === token;
+    const accepts = (identity: TerminalConnectionIdentity) => matchesTerminalConnection(
+      identity,
+      controller.getGeneration(),
+      target,
+      token
+    );
     controller.setCallbacks({
       onStateChange: options.onStateChange,
       onSnapshot: (data, identity) => { if (accepts(identity)) options.onSnapshot?.(data, identity); },
