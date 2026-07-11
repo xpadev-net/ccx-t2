@@ -2,7 +2,10 @@
 
 ## 概要
 
-task-pr-orchestrator / task-pr-worker スキルのフローを複数のエージェントハーネスを跨いで実行できるようにするハーネスを Go + Web UI で実装する。オーケストレーションのうち機械的に処理できる部分（ハートビート、イベントルーティング、プロセス管理、台帳永続化）を Go 側に寄せ、AI には判断のみを担わせる。
+複数プロジェクトの tmux window を project ごとにまとめ、ブラウザから shell として操作できる
+terminal-first WebShell を Go + React で提供する。task-pr-orchestrator / task-pr-worker の runtime は
+同じ Go process に残すが、task dashboard ではなく project sidebar、terminal tab、1つの full-height
+terminal を primary UI とする。
 
 ハーネスは単一プロセスで起動し、グローバル設定ファイルに登録された複数プロジェクトを同時に扱う。プロジェクトごとの `config.yaml` は作成しない。Web UI、REST API、MCP サーバー、WebSocket、scheduler は同じプロセス内で動作し、リクエストまたはイベントに含まれる `project_slug` で対象プロジェクトを解決する。
 
@@ -12,6 +15,9 @@ Worker は専用 worktree と branch で実装、検証、PR 作成、`gh-review
 Orchestrator は親スレッドとしてタスク整理、分割、worker 起動、完了タスクの archive を担う。
 Go ハーネスはこのフローのうち、人手で繰り返していた台帳更新、プロセス管理、イベント処理、
 ログ配信、状態検査、cleanup を担保する。
+
+WebShell では UI-created shell、orchestrator、worker を同じ terminal model で扱う。harness-managed
+window は project 配下で discoverable かつ interactive な protected entry とし、generic close は許可しない。
 
 ---
 
@@ -23,7 +29,9 @@ Go ハーネスはこのフローのうち、人手で繰り返していた台�
 - Worktree の生成・削除
 - Worker プロセス（tmux ウィンドウ）の起動・停止
 - Worker へのフォローアップメッセージ送信（tmux send-keys）
-- Orchestrator へのブラウザ Web shell からのraw terminal input送信（WebSocket → tmux）
+- project terminal への raw input と resize 送信（WebSocket → tmux）
+- project window の列挙、shell 作成、UI-created shell の安全な削除
+- snapshot/live 境界、keepalive、slow-client resync を含む terminal stream lifecycle
 - Worker からのイベント受信・直列キュー処理
 - Orchestrator の起動トリガー（ハートビート・イベント駆動）
 - GitHub API による PR 状態取得
@@ -289,20 +297,29 @@ Orchestrator 起動時は対象プロジェクトの設定、台帳スナップ�
 
 | 機能 | 説明 |
 |---|---|
-| タスク台帳 CRUD | タスクの追加・編集・削除。削除は in_progress タスクに対して stop_worker と worktree 削除を連動して実行する。追加は Orchestrator 経由。 |
-| Orchestrator web shell | 選択中プロジェクトの Orchestrator（tmux ウィンドウ）をリアルタイムストリーミングし、ブラウザ上の terminal からraw inputを送信 |
-| Worker ダッシュボード | 各 Worker（tmux ウィンドウ）のログをリアルタイムストリーミングし、active Worker へ followup 入力を送信 |
-| タスク追加フォーム | 自然言語でタスクを入力 → Orchestrator がコードベースを調査して台帳に反映 |
-| ハーネス設定 | 利用可能ハーネスの登録・usage 確認 |
-| プロジェクト選択 | グローバル設定に登録されたプロジェクトを切り替え、選択中プロジェクトのタスクと worker を表示 |
-| Orchestrator 設定 | グローバル既定値とプロジェクトごとの上書き設定（使用するハーネス・ハートビート間隔等） |
+| Project sidebar | 登録済み project と、その project に属する tmux terminal を階層表示する。別 project の window は混在させない。 |
+| Terminal tab | sidebar または上部 tab から terminal を切り替え、terminal ごとの scrollback、focus、入力先を分離する。 |
+| Shell lifecycle | project repository を cwd に shell を作成し、UI-created shell だけを確認付きで close する。 |
+| Protected terminal | orchestrator / worker window を通常の terminal entry として表示・操作するが、generic close control は提供しない。 |
+| Connection state | connecting/open/retrying/missing/unauthorized/failed を区別し、manual retry と online/visibility wake recovery を提供する。 |
+| Terminal fidelity | raw input、multibyte paste、ANSI/alternate screen、container resize を xterm と tmux pane の間で同期する。 |
 
 ### 技術
 
-- フロントエンド：Web（詳細は実装フェーズで決定）
+- フロントエンド：React + TypeScript + xterm.js
 - バックエンド：Go
-- リアルタイム通信：WebSocket（Orchestrator/Worker ログ配信・台帳更新通知）
+- リアルタイム通信：project/window scoped WebSocket（terminal snapshot/live output、input、resize）
 - REST と MCP の両方が台帳を書き換えるため、Go プロセス内でミューテックスによる排他制御を行う
+
+### Terminal lifecycle と security
+
+- `GET /api/projects/{slug}/terminals` は `kind`（`shell|orchestrator|worker`）、boolean の `available`、`closable` を返す。
+- `POST /api/projects/{slug}/terminals` は衝突しない project-prefixed shell を repository cwd で作る。
+- `DELETE /api/projects/{slug}/terminals/{window}` は project ownership を検証し、UI-created shell だけを削除する。
+- `/ws/projects/{slug}/terminal/{window}` は接続前に project/window ownership と認証を検証する。
+- snapshot sampling と live stream の境界に出力の欠落・重複を作らず、slow subscriber は raw byte を黙って drop せず明示的に切断して resync させる。
+- WebSocket は ping/pong deadline で dead peer を回収する。client は bounded exponential backoff と jitter で無期限に再接続し、manual/online/visibility wake を受け付ける。
+- project/window generation が一致しない stale callback、input、resize は破棄する。再接続時は最後の resize を再送する。
 
 ---
 
