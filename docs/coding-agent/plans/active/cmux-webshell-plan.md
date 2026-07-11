@@ -323,7 +323,10 @@
     detail: `$deep-review`, independent subagent review, and `gh-review-hook` exit 0.
 
 ### Task_6: product documentation and embedded assets
-- status: in_progress
+- status: complete
+- pr: `#71` (`https://github.com/xpadev-net/ccx-t2/pull/71`)
+- merged_head: `eede2ef85add7694d8ef7c50c5104c091454e773`
+- merge_commit: `e4fd58879d0cc0e2645cb02bf2854e9ad6a3fab2`
 - type: docs
 - branch: `codex/webshell-docs-assets`
 - thread: `/root/task6_docs_assets` (collaboration worker fallback)
@@ -356,10 +359,11 @@
     detail: `$deep-review`, independent subagent review, and `gh-review-hook` exit 0.
 
 ### Task_7: integrated review and browser acceptance
-- status: waiting
+- status: in_progress
 - type: review
 - branch: none
-- thread: reviewer to be created after Task_6
+- thread: `/root/task7_integrated_review`
+- worktree: `/Users/xpadev/.codex/worktrees/task7-review/ccx-t2`
 - owns: []
 - depends_on: [Task_6]
 - acceptance:
@@ -429,6 +433,8 @@
 - 2026-07-11: Task_5 worker thread archived. Task_6 separate `gpt-5.6-luna` / `high` worktree setup queued as `client-new-thread:6fe51544-4be8-4da7-85c6-26cbf26bd227` on delegated branch `codex/webshell-docs-assets`; startup stability check pending thread materialization.
 - 2026-07-11: Original Task_6 queued setup did not materialize and no matching thread/worktree was discoverable after repeated checks. Replacement `gpt-5.6-luna` / `high` worktree setup queued as `client-new-thread:96f1ac2b-32f3-4f4a-928c-bb0ec8adf81d`; startup stability check remains pending.
 - 2026-07-11: Replacement user-owned thread also failed to materialize. Orchestrator created dedicated worktree `/Users/xpadev/.codex/worktrees/task6-docs/ccx-t2` on `codex/webshell-docs-assets` and started bounded collaboration Worker `/root/task6_docs_assets`; runtime does not expose per-worker model selection, so the requested luna-high setting could not be enforced on this fallback.
+- 2026-07-11: Task_6 merged via PR #71 at `e4fd58879d0cc0e2645cb02bf2854e9ad6a3fab2` after exact-head parent and independent reviews were CLEAN, documentation/API/UI consistency passed, build and embedded sync/check left the worktree clean, orchestrator hook exited 0, and all GitHub checks were green. Task_7 integrated review gate opened.
+- 2026-07-11: Task_7 independent integrated review started as `/root/task7_integrated_review` in clean worktree `/Users/xpadev/.codex/worktrees/task7-review/ccx-t2`.
 
 ## Decision Log
 - 2026-07-11: WebShell is the product UI; harness/task concepts remain backend-compatible but are removed from primary navigation.
