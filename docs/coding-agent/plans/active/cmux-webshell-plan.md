@@ -208,10 +208,10 @@
     detail: Independent review of tmux ordering proof, cancellation, cleanup, realtime semantics, and deterministic boundary tests.
 
 ### Task_3: project terminal REST and generic WS API
-- status: waiting
+- status: in_progress
 - type: impl
 - branch: `codex/webshell-terminal-api`
-- thread: pending
+- thread: `019f4f92-1b39-7701-8c78-01cde7f5cd7c`
 - owns:
   - `server/internal/web/server.go`
   - `server/internal/web/server_test.go`
@@ -410,6 +410,7 @@
 - 2026-07-11: Task_1 merged via PR #65 at `d58fa7d8423cee8fde89967662f2f7eae90428fa` after parent and independent deep-review CLEAN, hook exit 0, normal/race/full 20x race stress/vet passes, and all GitHub checks green. Task_9 dependency gate opened.
 - 2026-07-11: Task_9 started in separate worktree thread `019f4ec5-c782-7163-8fd4-41dac81831b7` on `codex/webshell-atomic-pane-attach` using `gpt-5.6-luna` / `high`.
 - 2026-07-11: Task_9 merged via PR #67 at `b32a8e9b12b9073bd8bb39b9a3b123bf16dc6eb3` after exact-head parent and two independent deep-reviews were CLEAN, orchestrator hook exit 0, 179 normal/race tests, vet, 260 focused race-stress cases, diff-check, and all GitHub checks passed. Task_3 dependency gate opened.
+- 2026-07-11: Task_3 started in separate worktree thread `019f4f92-1b39-7701-8c78-01cde7f5cd7c` on `codex/webshell-terminal-api` using `gpt-5.6-luna` / `high`.
 
 ## Decision Log
 - 2026-07-11: WebShell is the product UI; harness/task concepts remain backend-compatible but are removed from primary navigation.
