@@ -3636,8 +3636,15 @@ func TestProjectTerminalDeleteIsIdempotentWhenWindowDisappears(t *testing.T) {
 	if resp.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusOK, resp.Body.String())
 	}
-	if gotSession != "ccx-test" || gotWindow != "alpha-shell-1" {
-		t.Fatalf("kill args = %q %q, want ccx-test alpha-shell-1", gotSession, gotWindow)
+	if gotSession != "ccx-test" || gotWindow != "=alpha-shell-1" {
+		t.Fatalf("kill args = %q %q, want ccx-test =alpha-shell-1", gotSession, gotWindow)
+	}
+	var deleted map[string]any
+	if err := json.Unmarshal(resp.Body.Bytes(), &deleted); err != nil {
+		t.Fatalf("decode delete response: %v", err)
+	}
+	if deleted["window"] != "alpha-shell-1" {
+		t.Fatalf("delete response window = %#v, want raw alpha-shell-1", deleted["window"])
 	}
 }
 
@@ -3654,8 +3661,8 @@ func TestProjectTerminalWebSocketUsesAtomicTransportInputAndResize(t *testing.T)
 		Config:  cfg,
 		Manager: manager,
 		AttachPane: func(ctx context.Context, session, window string) (*PaneAttachment, error) {
-			if session != "ccx-test" || window != "alpha-shell-1" {
-				t.Fatalf("attach args = %q %q, want ccx-test alpha-shell-1", session, window)
+			if session != "ccx-test" || window != "=alpha-shell-1" {
+				t.Fatalf("attach args = %q %q, want ccx-test =alpha-shell-1", session, window)
 			}
 			return &PaneAttachment{
 				Snapshot: []byte("snapshot"),
@@ -3669,11 +3676,17 @@ func TestProjectTerminalWebSocketUsesAtomicTransportInputAndResize(t *testing.T)
 			}, nil
 		},
 		SendRawKeys: func(ctx context.Context, session, window, keys string) error {
+			if session != "ccx-test" || window != "=alpha-shell-1" {
+				t.Fatalf("input args = %q %q, want ccx-test =alpha-shell-1", session, window)
+			}
 			gotInput = keys
 			close(inputReceived)
 			return nil
 		},
 		ResizePane: func(ctx context.Context, session, window string, cols, rows int) error {
+			if session != "ccx-test" || window != "=alpha-shell-1" {
+				t.Fatalf("resize args = %q %q, want ccx-test =alpha-shell-1", session, window)
+			}
 			gotResize = [2]int{cols, rows}
 			close(resizeReceived)
 			return nil

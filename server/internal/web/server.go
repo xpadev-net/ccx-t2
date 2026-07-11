@@ -656,7 +656,7 @@ func (s *Server) deleteProjectTerminal(w http.ResponseWriter, r *http.Request, w
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if err := s.killWindow(ctx, session, window); err != nil && !isMissingTmuxWindowError(err) {
+	if err := s.killWindow(ctx, session, exactTmuxWindowTarget(window)); err != nil && !isMissingTmuxWindowError(err) {
 		writeError(w, http.StatusInternalServerError, "delete project terminal")
 		return
 	}
@@ -693,10 +693,17 @@ func (s *Server) handleProjectWSRoute(w http.ResponseWriter, r *http.Request) {
 			methodNotAllowed(w, http.MethodGet)
 			return
 		}
-		projectServer.handleTmuxLogWS(w, r, parts[2], "terminal")
+		projectServer.handleTmuxLogWS(w, r, exactTmuxWindowTarget(parts[2]), "terminal")
 		return
 	}
 	s.handleProjectWS(w, r)
+}
+
+// exactTmuxWindowTarget prevents tmux's target resolver from treating a
+// validated window name as a unique-prefix match. Public routes and DTOs keep
+// the raw project window name; only tmux operations receive the exact marker.
+func exactTmuxWindowTarget(window string) string {
+	return "=" + window
 }
 
 func terminalRouteError(status int) string {
