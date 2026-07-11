@@ -248,10 +248,13 @@
     detail: `$deep-review`, independent subagent review, and `gh-review-hook` exit 0.
 
 ### Task_4: frontend terminal client and reconnect state machine
-- status: in_progress
+- status: complete
 - type: impl
 - branch: `codex/webshell-terminal-client`
 - thread: `019f4fc6-9813-7012-a7fd-441fdc78fef5`
+- pr: `#69` (`https://github.com/xpadev-net/ccx-t2/pull/69`)
+- head: `b783e3fbc6d726615ad81c4b64122740f379bd08`
+- merge_commit: `1dad20bc56a5a48209a606ac4eed0dcb838de40a`
 - owns:
   - `web/src/terminal/**`
 - forbidden:
@@ -416,6 +419,7 @@
 - 2026-07-11: Task_3 started in separate worktree thread `019f4f92-1b39-7701-8c78-01cde7f5cd7c` on `codex/webshell-terminal-api` using `gpt-5.6-luna` / `high`.
 - 2026-07-11: Task_3 merged via PR #68 at `daf1d379d5f55f71c5ca38eb89abd0b12bb6f584` after stable tmux window-ID resolution closed prefix-collision findings; exact-head parent and two independent deep-reviews were CLEAN, hook exit 0, 149 normal/race tests, vet, 280 focused race-stress cases, diff-check, and all GitHub checks passed. Task_4 dependency gate opened.
 - 2026-07-11: Task_4 started in separate worktree thread `019f4fc6-9813-7012-a7fd-441fdc78fef5` on `codex/webshell-terminal-client` using `gpt-5.6-luna` / `high`.
+- 2026-07-11: Task_4 merged via PR #69 at `1dad20bc56a5a48209a606ac4eed0dcb838de40a` after target identity plus generation closed the React pre-passive-effect stale-action race; exact-head parent and two independent deep-reviews were CLEAN, build and diff-check passed, fresh hook exited 0, and all GitHub checks were green. Task_5 dependency gate opened.
 
 ## Decision Log
 - 2026-07-11: WebShell is the product UI; harness/task concepts remain backend-compatible but are removed from primary navigation.
