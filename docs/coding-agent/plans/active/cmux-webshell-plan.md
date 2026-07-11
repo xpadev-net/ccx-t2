@@ -166,10 +166,10 @@
     detail: `$deep-review` confirms the reduced PR preserves prior snapshot semantics while improving independent transport lifecycle concerns.
 
 ### Task_9: atomic tmux pane attachment and web integration
-- status: waiting
+- status: in_progress
 - type: impl
 - branch: `codex/webshell-atomic-pane-attach`
-- thread: pending
+- thread: `019f4ec5-c782-7163-8fd4-41dac81831b7`
 - owns:
   - `server/internal/tmux/tmux.go`
   - `server/internal/tmux/tmux_test.go`
@@ -405,6 +405,7 @@
 - 2026-07-11: Task_2 split after repeated parent deep-review proved the independent snapshot/pipe interfaces cannot establish an atomic no-gap/no-duplicate boundary. PR #66 continues as Task_8 reduced transport stability; Task_9 owns the new tmux attachment contract after Task_1 and Task_8 merge.
 - 2026-07-11: Task_8 merged via PR #66 at `6439fb12a3d6e3185d7d6280cbd1ab04ff398189` after reduced-scope parent deep-review APPROVED, independent Reviewer APPROVED, hook exit 0, normal/race/vet/stress passes, and all GitHub checks green. Worker archival initiated.
 - 2026-07-11: Task_1 merged via PR #65 at `d58fa7d8423cee8fde89967662f2f7eae90428fa` after parent and independent deep-review CLEAN, hook exit 0, normal/race/full 20x race stress/vet passes, and all GitHub checks green. Task_9 dependency gate opened.
+- 2026-07-11: Task_9 started in separate worktree thread `019f4ec5-c782-7163-8fd4-41dac81831b7` on `codex/webshell-atomic-pane-attach` using `gpt-5.6-luna` / `high`.
 
 ## Decision Log
 - 2026-07-11: WebShell is the product UI; harness/task concepts remain backend-compatible but are removed from primary navigation.
