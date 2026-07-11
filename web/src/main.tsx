@@ -40,6 +40,8 @@ function App() {
   const [retrySignals, setRetrySignals] = useState<Record<string, number>>({});
   const selectedProjectSlugRef = useRef("");
   const terminalsByProjectRef = useRef<TerminalMap>({});
+  const loadGenerationRef = useRef(0);
+  const terminalMutationGenerationRef = useRef(0);
   selectedProjectSlugRef.current = selectedProjectSlug;
   terminalsByProjectRef.current = terminalsByProject;
 
@@ -47,6 +49,8 @@ function App() {
 
   const loadWorkspace = useCallback(
     async (signal?: AbortSignal, isRefresh = false) => {
+      const loadGeneration = ++loadGenerationRef.current;
+      const terminalMutationGeneration = terminalMutationGenerationRef.current;
       if (isRefresh) {
         setRefreshing(true);
       } else {
@@ -75,10 +79,13 @@ function App() {
         if (signal?.aborted) {
           return;
         }
+        const terminalListsAreCurrent = terminalMutationGeneration === terminalMutationGenerationRef.current;
         const nextTerminals: TerminalMap = { ...terminalsByProjectRef.current };
-        for (const [slug, terminals] of terminalResults) {
-          if (terminals) {
-            nextTerminals[slug] = terminals;
+        if (terminalListsAreCurrent) {
+          for (const [slug, terminals] of terminalResults) {
+            if (terminals) {
+              nextTerminals[slug] = terminals;
+            }
           }
         }
         const currentProjectSlug = selectedProjectSlugRef.current;
@@ -87,8 +94,10 @@ function App() {
           : nextProjects[0]?.slug ?? "";
         setProjects(nextProjects);
         setTerminalsByProject(nextTerminals);
-        setTerminalLoadErrors(terminalErrors);
-        if (Object.keys(terminalErrors).length > 0) {
+        if (terminalListsAreCurrent) {
+          setTerminalLoadErrors(terminalErrors);
+        }
+        if (terminalListsAreCurrent && Object.keys(terminalErrors).length > 0) {
           setError(Object.entries(terminalErrors).map(([slug, detail]) => `${slug}: ${detail}`).join(" · "));
         }
         setSelectedProjectSlug(nextSelectedProjectSlug);
@@ -103,6 +112,9 @@ function App() {
           setError(errorMessage(err));
         }
       } finally {
+        if (loadGeneration !== loadGenerationRef.current) {
+          return;
+        }
         if (isRefresh) {
           setRefreshing(false);
         } else {
@@ -175,6 +187,7 @@ function App() {
     setNotice("");
     try {
       const terminal = await client.createProjectTerminal(selectedProjectSlug);
+      terminalMutationGenerationRef.current += 1;
       setTerminalsByProject((current) => ({
         ...current,
         [selectedProjectSlug]: [...(current[selectedProjectSlug] ?? []), terminal]
@@ -207,6 +220,7 @@ function App() {
     setNotice("");
     try {
       await client.deleteProjectTerminal(projectSlug, windowName);
+      terminalMutationGenerationRef.current += 1;
       setTerminalsByProject((current) => ({
         ...current,
         [projectSlug]: (current[projectSlug] ?? []).filter((terminal) => terminal.window !== windowName)
