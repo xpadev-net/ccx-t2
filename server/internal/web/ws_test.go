@@ -264,7 +264,7 @@ func TestTmuxSharedAtomicAttachmentLateSubscriberReplaysThroughJoinWatermark(t *
 func TestTmuxAtomicAttachmentRetiresAtHistoryCapAndResyncs(t *testing.T) {
 	registry := &tmuxStreamRegistry{}
 	key := "session\x00window"
-	firstSource := make(chan []byte, 1)
+	firstSource := make(chan []byte)
 	secondSource := make(chan []byte, 1)
 	firstStop := make(chan struct{})
 	var attachCount atomic.Int32
@@ -303,24 +303,26 @@ func TestTmuxAtomicAttachmentRetiresAtHistoryCapAndResyncs(t *testing.T) {
 	oldStream = registry.streams[key]
 	registry.mu.Unlock()
 
+	drainReady := make(chan struct{})
+	consumed := make(chan struct{})
 	drainDone := make(chan struct{})
 	go func() {
+		close(drainReady)
 		for range first.chunks {
+			consumed <- struct{}{}
 		}
 		close(drainDone)
 	}()
 	chunk := bytes.Repeat([]byte{'x'}, tmuxAttachmentHistoryMaxBytes/tmuxAttachmentHistoryMaxChunks)
-	producerDone := make(chan struct{})
-	go func() {
-		defer close(producerDone)
-		for i := 0; i < tmuxAttachmentHistoryMaxChunks+1; i++ {
-			select {
-			case firstSource <- chunk:
-			case <-firstStop:
-				return
-			}
-		}
-	}()
+	<-drainReady
+	for i := 0; i < tmuxAttachmentHistoryMaxChunks; i++ {
+		firstSource <- chunk
+		<-consumed
+	}
+	// The consumer has acknowledged every retained chunk, so this final send
+	// cannot be a slow-subscriber eviction. It deterministically triggers the
+	// rotation boundary instead.
+	firstSource <- chunk
 	select {
 	case <-first.resync:
 	case <-first.slow:
@@ -344,11 +346,6 @@ func TestTmuxAtomicAttachmentRetiresAtHistoryCapAndResyncs(t *testing.T) {
 		t.Fatalf("history before retirement = chunks=%d bytes=%d, want chunks=%d bytes=%d", gotHistoryChunks, gotHistoryBytes, tmuxAttachmentHistoryMaxChunks, tmuxAttachmentHistoryMaxBytes)
 	}
 	firstCleanup()
-	select {
-	case <-producerDone:
-	case <-time.After(time.Second):
-		t.Fatal("retired attachment producer did not stop")
-	}
 
 	freshSnapshot, second, secondCleanup, err := registry.subscribeAttachedWithStatus(context.Background(), key, "session", "window", attach)
 	if err != nil {

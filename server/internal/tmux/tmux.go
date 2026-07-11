@@ -1165,9 +1165,26 @@ func AttachPaneContext(ctx context.Context, session, window string) (*PaneAttach
 		case <-setupDone:
 		}
 	}()
+
+	var bufferCreated bool
+	var bufferDeleteAttempted bool
+	var bufferDeleted bool
+	paneID := ""
+	var fallbackDeleteOnce sync.Once
+	fallbackDelete := func() {
+		if !bufferCreated || bufferDeleted {
+			return
+		}
+		fallbackDeleteOnce.Do(func() {
+			if err := run("tmux", "delete-buffer", "-b", bufferName); err == nil {
+				bufferDeleted = true
+			}
+		})
+	}
 	var cleanupOnce sync.Once
 	cleanup := func() {
 		cleanupOnce.Do(func() {
+			fallbackDelete()
 			removeSnapshot()
 			finishSetup()
 			processCancel()
@@ -1179,20 +1196,51 @@ func AttachPaneContext(ctx context.Context, session, window string) (*PaneAttach
 		})
 	}
 
-	bufferCreated := false
-	deleteBuffer := func() {
-		if !bufferCreated {
-			return
+	deleteBuffer := func() ([][]byte, error) {
+		if !bufferCreated || bufferDeleteAttempted || bufferDeleted {
+			return nil, nil
 		}
-		bufferCreated = false
-		// The response is intentionally consumed by streamControlOutput after
-		// the watermark. It must not be read here because queued pane output
-		// can occur between save-buffer's %end and this cleanup command.
-		_ = writeControlCommand(stdin, "delete-buffer", "-b", tmuxControlQuote(bufferName))
+		bufferDeleteAttempted = true
+		// Keep deletion on the control client while it is healthy. Its response
+		// is part of the post-watermark stream, so notifications encountered
+		// before the matching frame are returned to the live reader in order.
+		if err := writeControlCommand(stdin, "delete-buffer", "-b", tmuxControlQuote(bufferName)); err != nil {
+			return nil, err
+		}
+		result := make(chan struct {
+			pending [][]byte
+			err     error
+		}, 1)
+		go func() {
+			_, pending, err := readControlResponseWithOutput(reader, paneID)
+			result <- struct {
+				pending [][]byte
+				err     error
+			}{pending: pending, err: err}
+		}()
+		timer := time.NewTimer(time.Second)
+		defer timer.Stop()
+		select {
+		case response := <-result:
+			if response.err != nil {
+				return response.pending, response.err
+			}
+			bufferCreated = false
+			bufferDeleted = true
+			return response.pending, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-timer.C:
+			return nil, errors.New("tmux control delete-buffer response timed out")
+		}
 	}
 
 	fail := func(err error) (*PaneAttachment, error) {
-		deleteBuffer()
+		if bufferCreated && !bufferDeleteAttempted {
+			if _, deleteErr := deleteBuffer(); deleteErr != nil {
+				fallbackDelete()
+			}
+		}
 		cleanup()
 		<-waitDone
 		if stderr.Len() > 0 {
@@ -1212,7 +1260,7 @@ func AttachPaneContext(ctx context.Context, session, window string) (*PaneAttach
 	if err != nil {
 		return fail(fmt.Errorf("tmux control pane lookup response: %w", err))
 	}
-	paneID := strings.TrimSpace(string(paneResponse))
+	paneID = strings.TrimSpace(string(paneResponse))
 	if paneID == "" || strings.ContainsAny(paneID, "\r\n \t") {
 		return fail(fmt.Errorf("tmux control pane lookup returned invalid pane id %q", paneID))
 	}
@@ -1240,7 +1288,12 @@ func AttachPaneContext(ctx context.Context, session, window string) (*PaneAttach
 	if err != nil {
 		return fail(fmt.Errorf("tmux control read pane snapshot: %w", err))
 	}
-	deleteBuffer()
+	deletePending, err := deleteBuffer()
+	if err != nil {
+		fallbackDelete()
+		return fail(fmt.Errorf("tmux control delete pane snapshot: %w", err))
+	}
+	pending = append(pending, deletePending...)
 
 	finishSetup()
 	chunks := make(chan []byte, 128)

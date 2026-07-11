@@ -66,6 +66,7 @@ func TestListWindowsContextParsesMetadataWithTabs(t *testing.T) {
 
 func TestAttachPaneContextUsesBodylessSnapshotResponseAsWatermark(t *testing.T) {
 	oldExecCommandContext := execCommandContext
+	deleteMarker := filepath.Join(t.TempDir(), "delete-complete")
 	execCommandContext = func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
 		script := `
 printf '%s\n' '%begin 0 1 0' '%end 0 1 0'
@@ -88,11 +89,15 @@ while IFS= read -r line; do
 		          printf '%s\n' '%begin 0 5 0' '%end 0 5 0' '%output %0 live\012' '%output %0 after\134' ;;
 	        *) exit 92 ;;
 	      esac ;;
-	    delete-buffer*) printf '%s\n' '%begin 0 6 0' '%end 0 6 0' ;;
+	    delete-buffer*)
+	      printf '%s' deleted > "$TMUX_DELETE_MARKER"
+	      printf '%s\n' '%output %0 delete-queued\012' '%begin 0 6 0' '%end 0 6 0' ;;
   esac
 done
 `
-		return exec.CommandContext(ctx, "sh", "-c", script)
+		cmd := exec.CommandContext(ctx, "sh", "-c", script)
+		cmd.Env = append(os.Environ(), "TMUX_DELETE_MARKER="+deleteMarker)
+		return cmd
 	}
 	t.Cleanup(func() { execCommandContext = oldExecCommandContext })
 
@@ -103,7 +108,7 @@ done
 	if got, want := string(attachment.Snapshot), "%end 0 5 0\n%error 0 5 0\n"; got != want {
 		t.Fatalf("snapshot = %q, want %q", got, want)
 	}
-	for i, want := range []string{"queued\n", "live\n", "after\\"} {
+	for i, want := range []string{"queued\n", "live\n", "after\\", "delete-queued\n"} {
 		select {
 		case chunk := <-attachment.Chunks:
 			if got := string(chunk); got != want {
@@ -112,6 +117,9 @@ done
 		case <-time.After(time.Second):
 			t.Fatalf("live chunk %d was not delivered", i)
 		}
+	}
+	if got, err := os.ReadFile(deleteMarker); err != nil || string(got) != "deleted" {
+		t.Fatalf("delete-buffer marker = %q, err = %v; want synchronized execution", got, err)
 	}
 	attachment.Cleanup()
 	select {
@@ -146,6 +154,41 @@ func TestAttachPaneContextCancelsDuringSetup(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("AttachPaneContext did not stop after cancellation")
+	}
+}
+
+func TestAttachPaneContextFallsBackToIndependentBufferDelete(t *testing.T) {
+	oldExecCommandContext := execCommandContext
+	fallbackMarker := filepath.Join(t.TempDir(), "fallback-delete")
+	execCommandContext = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		if name == "tmux" && len(args) == 3 && args[0] == "delete-buffer" {
+			marker := "invalid"
+			if strings.HasPrefix(args[2], "ccx-attach-") && !strings.ContainsAny(args[2], "' \t\r\n") {
+				marker = "deleted"
+			}
+			_ = os.WriteFile(fallbackMarker, []byte(marker), 0o600)
+			return exec.CommandContext(ctx, "sh", "-c", "true")
+		}
+		script := `
+printf '%s\n' '%begin 0 1 0' '%end 0 1 0'
+while IFS= read -r line; do
+  case "$line" in
+    display-message*) printf '%s\n' '%begin 0 2 0' '%0' '%end 0 2 0' ;;
+    refresh-client*) printf '%s\n' '%begin 0 3 0' '%end 0 3 0' ;;
+    capture-pane*) printf '%s\n' '%begin 0 4 0' '%end 0 4 0' ;;
+    save-buffer*) exit 0 ;;
+  esac
+done
+`
+		return exec.CommandContext(ctx, "sh", "-c", script)
+	}
+	t.Cleanup(func() { execCommandContext = oldExecCommandContext })
+
+	if _, err := AttachPaneContext(context.Background(), "session", "window"); err == nil {
+		t.Fatal("AttachPaneContext error = nil, want broken save response")
+	}
+	if got, err := os.ReadFile(fallbackMarker); err != nil || string(got) != "deleted" {
+		t.Fatalf("fallback delete marker = %q, err = %v; want independent cleanup", got, err)
 	}
 }
 
@@ -191,7 +234,7 @@ func TestAttachPaneContextUsesRealTmuxControlMode(t *testing.T) {
 	}
 	run("send-keys", "-t", "="+session+":0", "printf live", "C-m")
 	deadline := time.NewTimer(2 * time.Second)
-	defer deadline.Stop()
+	foundLive := false
 	for {
 		select {
 		case chunk, ok := <-attachment.Chunks:
@@ -199,6 +242,16 @@ func TestAttachPaneContextUsesRealTmuxControlMode(t *testing.T) {
 				t.Fatal("real tmux control-mode stream closed before live output")
 			}
 			if bytes.Contains(chunk, []byte("live")) {
+				foundLive = true
+			}
+			if foundLive {
+				deadline.Stop()
+				attachment.Cleanup()
+				for _, name := range strings.Split(strings.TrimSpace(string(run("list-buffers", "-F", "#{buffer_name}"))), "\n") {
+					if strings.HasPrefix(name, "ccx-attach-") {
+						t.Fatalf("attachment buffer %q remained after cleanup", name)
+					}
+				}
 				return
 			}
 		case <-deadline.C:
