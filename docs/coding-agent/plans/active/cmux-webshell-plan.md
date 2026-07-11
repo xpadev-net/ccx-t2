@@ -248,10 +248,10 @@
     detail: `$deep-review`, independent subagent review, and `gh-review-hook` exit 0.
 
 ### Task_4: frontend terminal client and reconnect state machine
-- status: waiting
+- status: in_progress
 - type: impl
 - branch: `codex/webshell-terminal-client`
-- thread: pending
+- thread: `019f4fc6-9813-7012-a7fd-441fdc78fef5`
 - owns:
   - `web/src/terminal/**`
 - forbidden:
@@ -415,6 +415,7 @@
 - 2026-07-11: Task_9 merged via PR #67 at `b32a8e9b12b9073bd8bb39b9a3b123bf16dc6eb3` after exact-head parent and two independent deep-reviews were CLEAN, orchestrator hook exit 0, 179 normal/race tests, vet, 260 focused race-stress cases, diff-check, and all GitHub checks passed. Task_3 dependency gate opened.
 - 2026-07-11: Task_3 started in separate worktree thread `019f4f92-1b39-7701-8c78-01cde7f5cd7c` on `codex/webshell-terminal-api` using `gpt-5.6-luna` / `high`.
 - 2026-07-11: Task_3 merged via PR #68 at `daf1d379d5f55f71c5ca38eb89abd0b12bb6f584` after stable tmux window-ID resolution closed prefix-collision findings; exact-head parent and two independent deep-reviews were CLEAN, hook exit 0, 149 normal/race tests, vet, 280 focused race-stress cases, diff-check, and all GitHub checks passed. Task_4 dependency gate opened.
+- 2026-07-11: Task_4 started in separate worktree thread `019f4fc6-9813-7012-a7fd-441fdc78fef5` on `codex/webshell-terminal-client` using `gpt-5.6-luna` / `high`.
 
 ## Decision Log
 - 2026-07-11: WebShell is the product UI; harness/task concepts remain backend-compatible but are removed from primary navigation.
