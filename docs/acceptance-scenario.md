@@ -20,6 +20,10 @@ cd ../server
 go run ./cmd/ccx --config /path/to/acceptance-config.yaml
 ```
 
+`embedded:check` の失敗は stale/missing embedded asset を検出した受け入れ失敗であり、この手順内では
+sync しない。asset 更新作業として `npm run embedded:sync` を実行・commitした後、clean worktreeで
+このbuild/checkを最初から再実行する。受け入れ中にsyncするとstale commitを自己修復して隠すためである。
+
 ```sh
 curl -fsS http://127.0.0.1:8080/api/projects | jq .
 tmux list-windows -t ccx-t2

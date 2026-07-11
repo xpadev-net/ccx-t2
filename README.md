@@ -82,7 +82,8 @@ Vite は `127.0.0.1:5173` で起動し、`/api` と `/ws` を `127.0.0.1:8080` �
 ## Build と embedded assets
 
 配布時は `server/internal/webui/dist` の asset が Go binary に埋め込まれます。`--web-dir`
-（既定 `web/dist`）が存在する場合だけ外部 directory を優先するため、開発 build の確認にも使えます。
+（既定 `web/dist`、実行時の working directory からの相対path）が存在する場合だけ外部 directory を
+優先します。`server/` から起動して開発 build を確認する場合は `--web-dir ../web/dist` を指定してください。
 
 Web UI を変更した時は clean build を同期し、一致を検証します。
 
