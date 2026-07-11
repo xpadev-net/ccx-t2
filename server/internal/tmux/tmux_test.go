@@ -192,6 +192,41 @@ done
 	}
 }
 
+func TestAttachPaneContextBoundsBlockedFallbackBufferDelete(t *testing.T) {
+	oldExecCommandContext := execCommandContext
+	fallbackMarker := filepath.Join(t.TempDir(), "fallback-delete-started")
+	execCommandContext = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		if name == "tmux" && len(args) == 3 && args[0] == "delete-buffer" {
+			_ = os.WriteFile(fallbackMarker, []byte("started"), 0o600)
+			return exec.CommandContext(ctx, "sh", "-c", "exec sleep 10")
+		}
+		script := `
+printf '%s\n' '%begin 0 1 0' '%end 0 1 0'
+while IFS= read -r line; do
+  case "$line" in
+    display-message*) printf '%s\n' '%begin 0 2 0' '%0' '%end 0 2 0' ;;
+    refresh-client*) printf '%s\n' '%begin 0 3 0' '%end 0 3 0' ;;
+    capture-pane*) printf '%s\n' '%begin 0 4 0' '%end 0 4 0' ;;
+    save-buffer*) exit 0 ;;
+  esac
+done
+`
+		return exec.CommandContext(ctx, "sh", "-c", script)
+	}
+	t.Cleanup(func() { execCommandContext = oldExecCommandContext })
+
+	started := time.Now()
+	if _, err := AttachPaneContext(context.Background(), "session", "window"); err == nil {
+		t.Fatal("AttachPaneContext error = nil, want broken save response")
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("blocked fallback cleanup took %s, want bounded return", elapsed)
+	}
+	if got, err := os.ReadFile(fallbackMarker); err != nil || string(got) != "started" {
+		t.Fatalf("fallback marker = %q, err = %v; want fallback invocation", got, err)
+	}
+}
+
 func TestAttachPaneContextUsesRealTmuxControlMode(t *testing.T) {
 	socket := fmt.Sprintf("ccx-t9-attach-%d", os.Getpid())
 	session := "ccx-t9-attach"

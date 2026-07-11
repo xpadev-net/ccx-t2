@@ -174,7 +174,12 @@ var errWSWriterClosed = errors.New("websocket writer is closed")
 type tmuxStreamRegistry struct {
 	mu             sync.Mutex
 	streams        map[string]*tmuxSharedStream
-	attachmentLock map[string]*sync.Mutex
+	attachmentLock map[string]*tmuxAttachmentLock
+}
+
+type tmuxAttachmentLock struct {
+	mu   sync.Mutex
+	refs int
 }
 
 type tmuxSharedStream struct {
@@ -267,16 +272,25 @@ func (s *tmuxStreamSubscription) wasResynced() bool {
 func (r *tmuxStreamRegistry) lockAttachment(key string) func() {
 	r.mu.Lock()
 	if r.attachmentLock == nil {
-		r.attachmentLock = make(map[string]*sync.Mutex)
+		r.attachmentLock = make(map[string]*tmuxAttachmentLock)
 	}
 	lock := r.attachmentLock[key]
 	if lock == nil {
-		lock = &sync.Mutex{}
+		lock = &tmuxAttachmentLock{}
 		r.attachmentLock[key] = lock
 	}
+	lock.refs++
 	r.mu.Unlock()
-	lock.Lock()
-	return lock.Unlock
+	lock.mu.Lock()
+	return func() {
+		lock.mu.Unlock()
+		r.mu.Lock()
+		lock.refs--
+		if lock.refs == 0 && r.attachmentLock[key] == lock {
+			delete(r.attachmentLock, key)
+		}
+		r.mu.Unlock()
+	}
 }
 
 func (r *tmuxStreamRegistry) addSubscriberLocked(key string, stream *tmuxSharedStream) (*tmuxStreamSubscription, []byte, [][]byte, func()) {

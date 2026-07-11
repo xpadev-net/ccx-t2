@@ -1176,7 +1176,9 @@ func AttachPaneContext(ctx context.Context, session, window string) (*PaneAttach
 			return
 		}
 		fallbackDeleteOnce.Do(func() {
-			if err := run("tmux", "delete-buffer", "-b", bufferName); err == nil {
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 500*time.Millisecond)
+			defer cancel()
+			if err := runCtx(cleanupCtx, "tmux", "delete-buffer", "-b", bufferName); err == nil {
 				bufferDeleted = true
 			}
 		})
@@ -1184,7 +1186,6 @@ func AttachPaneContext(ctx context.Context, session, window string) (*PaneAttach
 	var cleanupOnce sync.Once
 	cleanup := func() {
 		cleanupOnce.Do(func() {
-			fallbackDelete()
 			removeSnapshot()
 			finishSetup()
 			processCancel()
@@ -1193,6 +1194,7 @@ func AttachPaneContext(ctx context.Context, session, window string) (*PaneAttach
 			if cmd.Process != nil {
 				_ = cmd.Process.Kill()
 			}
+			fallbackDelete()
 		})
 	}
 

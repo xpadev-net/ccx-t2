@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -437,6 +438,58 @@ func TestTmuxAtomicAttachmentDoesNotBlockUnrelatedKeys(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("slow attachment did not finish after release")
+	}
+}
+
+func TestTmuxAttachmentLocksReclaimChurnWithoutSameKeyOverlap(t *testing.T) {
+	registry := &tmuxStreamRegistry{}
+	var inFlight atomic.Int32
+	var maxInFlight atomic.Int32
+	attach := func(context.Context, string, string) (*PaneAttachment, error) {
+		current := inFlight.Add(1)
+		for {
+			observed := maxInFlight.Load()
+			if current <= observed || maxInFlight.CompareAndSwap(observed, current) {
+				break
+			}
+		}
+		time.Sleep(time.Millisecond)
+		inFlight.Add(-1)
+		return nil, errors.New("synthetic attachment failure")
+	}
+
+	const sameKeyCallers = 8
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < sameKeyCallers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, _, _, err := registry.subscribeAttachedWithStatus(context.Background(), "same-key", "session", "window", attach)
+			if err == nil {
+				t.Errorf("same-key attachment error = nil, want synthetic failure")
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	if got := maxInFlight.Load(); got != 1 {
+		t.Fatalf("same-key attachments overlapped at %d, want serialized", got)
+	}
+
+	for i := 0; i < 100; i++ {
+		key := fmt.Sprintf("churn-%d", i)
+		_, _, _, err := registry.subscribeAttachedWithStatus(context.Background(), key, "session", key, attach)
+		if err == nil {
+			t.Fatalf("churn attachment %q error = nil, want synthetic failure", key)
+		}
+	}
+	registry.mu.Lock()
+	gotLocks := len(registry.attachmentLock)
+	registry.mu.Unlock()
+	if gotLocks != 0 {
+		t.Fatalf("attachment lock entries after churn = %d, want 0", gotLocks)
 	}
 }
 
