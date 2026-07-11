@@ -83,12 +83,13 @@ function App() {
           return;
         }
         const terminalListsAreCurrent = terminalMutationGeneration === terminalMutationGenerationRef.current;
+        if (!terminalListsAreCurrent) {
+          return;
+        }
         const nextTerminals: TerminalMap = { ...terminalsByProjectRef.current };
-        if (terminalListsAreCurrent) {
-          for (const [slug, terminals] of terminalResults) {
-            if (terminals) {
-              nextTerminals[slug] = terminals;
-            }
+        for (const [slug, terminals] of terminalResults) {
+          if (terminals) {
+            nextTerminals[slug] = terminals;
           }
         }
         const currentProjectSlug = selectedProjectSlugRef.current;
@@ -97,10 +98,8 @@ function App() {
           : nextProjects[0]?.slug ?? "";
         setProjects(nextProjects);
         setTerminalsByProject(nextTerminals);
-        if (terminalListsAreCurrent) {
-          setTerminalLoadErrors(terminalErrors);
-        }
-        if (terminalListsAreCurrent && Object.keys(terminalErrors).length > 0) {
+        setTerminalLoadErrors(terminalErrors);
+        if (Object.keys(terminalErrors).length > 0) {
           setError(Object.entries(terminalErrors).map(([slug, detail]) => `${slug}: ${detail}`).join(" · "));
         }
         setSelectedProjectSlug(nextSelectedProjectSlug);
