@@ -4,7 +4,8 @@ import {
   type TerminalControllerCallbacks,
   type TerminalControllerOptions,
   type TerminalSize,
-  type TerminalState
+  type TerminalState,
+  type TerminalTarget
 } from "./controller";
 
 export type UseTerminalControllerOptions = Omit<
@@ -116,15 +117,16 @@ export function useTerminalController(options: UseTerminalControllerOptions): Us
     controller.getSnapshot
   );
   const generation = controller.getGeneration();
-  // Keep event handlers bound to the render's project/window generation so a queued
-  // event from a previous terminal cannot write into a newly selected terminal.
+  const target: TerminalTarget = { projectSlug: options.projectSlug, windowName: options.windowName };
+  // Keep event handlers bound to the render's project/window target and generation so
+  // queued callbacks fail closed both before and after a passive target-switch effect.
 
   return {
     controller,
     state,
     generation,
     retry: () => controller.retry(),
-    sendInput: (data) => controller.sendInput(data, generation),
-    resize: (size) => controller.resize(size.cols, size.rows, generation)
+    sendInput: (data) => controller.sendInput(data, generation, target),
+    resize: (size) => controller.resize(size.cols, size.rows, generation, target)
   };
 }

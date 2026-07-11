@@ -17,6 +17,8 @@ export type TerminalState =
 
 export type TerminalSize = { cols: number; rows: number };
 
+export type TerminalTarget = { projectSlug: string; windowName: string };
+
 export type RetryPolicy = {
   baseMs: number;
   maxMs: number;
@@ -204,7 +206,7 @@ export class TerminalController {
     return this.generation;
   }
 
-  getTarget(): { projectSlug: string; windowName: string } {
+  getTarget(): TerminalTarget {
     return { projectSlug: this.projectSlug, windowName: this.windowName };
   }
 
@@ -318,16 +320,17 @@ export class TerminalController {
     }
   }
 
-  sendInput(data: string, expectedGeneration = this.generation): boolean {
-    return this.sendFrame({ type: "input", data }, expectedGeneration);
+  sendInput(data: string, expectedGeneration = this.generation, expectedTarget = this.getTarget()): boolean {
+    return this.sendFrame({ type: "input", data }, expectedGeneration, expectedTarget);
   }
 
-  resize(cols: number, rows: number, expectedGeneration = this.generation): boolean {
-    if (!Number.isInteger(cols) || !Number.isInteger(rows) || cols <= 0 || rows <= 0 || expectedGeneration !== this.generation) {
+  resize(cols: number, rows: number, expectedGeneration = this.generation, expectedTarget = this.getTarget()): boolean {
+    if (!Number.isInteger(cols) || !Number.isInteger(rows) || cols <= 0 || rows <= 0 ||
+      !this.matchesExpectedTarget(expectedGeneration, expectedTarget)) {
       return false;
     }
     this.lastSize = { cols, rows };
-    return this.sendFrame({ type: "resize", cols, rows }, expectedGeneration);
+    return this.sendFrame({ type: "resize", cols, rows }, expectedGeneration, expectedTarget);
   }
 
   private hasTarget(): boolean {
@@ -453,9 +456,9 @@ export class TerminalController {
     }
   }
 
-  private sendFrame(frame: Record<string, string | number>, expectedGeneration: number): boolean {
+  private sendFrame(frame: Record<string, string | number>, expectedGeneration: number, expectedTarget: TerminalTarget): boolean {
     const socket = this.socket;
-    if (expectedGeneration !== this.generation || !socket || socket !== this.socket || socket.readyState !== OPEN) {
+    if (!this.matchesExpectedTarget(expectedGeneration, expectedTarget) || !socket || socket !== this.socket || socket.readyState !== OPEN) {
       return false;
     }
     try {
@@ -466,6 +469,11 @@ export class TerminalController {
       safeClose(socket);
       return false;
     }
+  }
+
+  private matchesExpectedTarget(expectedGeneration: number, expectedTarget: TerminalTarget): boolean {
+    return expectedGeneration === this.generation && expectedTarget.projectSlug === this.projectSlug &&
+      expectedTarget.windowName === this.windowName;
   }
 
   private scheduleRetry(generation: number, detail: string, error?: ApiError): void {
