@@ -60,7 +60,7 @@ function App() {
       setTerminalLoadErrors({});
       try {
         const nextProjects = await client.listProjects(signal);
-        if (signal?.aborted) {
+        if (signal?.aborted || loadGeneration !== loadGenerationRef.current) {
           return;
         }
         const terminalErrors: Record<string, string> = {};
@@ -76,7 +76,7 @@ function App() {
             }
           })
         );
-        if (signal?.aborted) {
+        if (signal?.aborted || loadGeneration !== loadGenerationRef.current) {
           return;
         }
         const terminalListsAreCurrent = terminalMutationGeneration === terminalMutationGenerationRef.current;
@@ -108,7 +108,7 @@ function App() {
           return firstTerminalKey(nextSelectedProjectSlug, nextTerminals);
         });
       } catch (err) {
-        if (!signal?.aborted) {
+        if (!signal?.aborted && loadGeneration === loadGenerationRef.current) {
           setError(errorMessage(err));
         }
       } finally {
