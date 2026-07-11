@@ -96,6 +96,8 @@ export function useTerminalController(options: UseTerminalControllerOptions): Us
     controller.getSnapshot
   );
   const generation = controller.getGeneration();
+  // Keep event handlers bound to the render's project/window generation so a queued
+  // event from a previous terminal cannot write into a newly selected terminal.
 
   return {
     controller,
