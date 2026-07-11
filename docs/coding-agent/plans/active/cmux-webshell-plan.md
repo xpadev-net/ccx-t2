@@ -283,7 +283,10 @@
     detail: `$deep-review`, independent subagent review, and `gh-review-hook` exit 0.
 
 ### Task_5: cmux-style terminal-first workspace
-- status: in_progress
+- status: complete
+- pr: `#70` (`https://github.com/xpadev-net/ccx-t2/pull/70`)
+- merged_head: `f5487dd17f4be640320afd5edc272bcecc8f51fd`
+- merge_commit: `ba48493fa61314ba824a2c0881d3e616532bd904`
 - type: impl
 - branch: `codex/webshell-cmux-ui`
 - thread: `019f5015-78ee-7e21-a1aa-626735d4c5b7`
@@ -421,9 +424,11 @@
 - 2026-07-11: Task_4 started in separate worktree thread `019f4fc6-9813-7012-a7fd-441fdc78fef5` on `codex/webshell-terminal-client` using `gpt-5.6-luna` / `high`.
 - 2026-07-11: Task_4 merged via PR #69 at `1dad20bc56a5a48209a606ac4eed0dcb838de40a` after target identity plus generation closed the React pre-passive-effect stale-action race; exact-head parent and two independent deep-reviews were CLEAN, build and diff-check passed, fresh hook exited 0, and all GitHub checks were green. Task_5 dependency gate opened.
 - 2026-07-11: Task_5 started in separate worktree thread `019f5015-78ee-7e21-a1aa-626735d4c5b7` on `codex/webshell-cmux-ui` using `gpt-5.6-luna` / `high`, with required desktop/narrow browser probes and the user-provided cmux reference image.
+- 2026-07-11: Task_5 merged via PR #70 at `ba48493fa61314ba824a2c0881d3e616532bd904` after parent and independent deep-review were CLEAN, current-head build/embedded check/hook and all GitHub checks passed, and Reviewer E2E at `1440x900`/`900x700` approved project/tab lifecycle, credential isolation, stale-scrollback prevention, protected terminals, focus, errors, and responsive overflow. Task_6 dependency gate opened; Task_5 archival was requested.
 
 ## Decision Log
 - 2026-07-11: WebShell is the product UI; harness/task concepts remain backend-compatible but are removed from primary navigation.
 - 2026-07-11: Split stream reliability from REST routing and tmux primitives to isolate concurrency/security review.
 - 2026-07-11: Serialize frontend client then UI because both establish contracts consumed by `main.tsx`; avoiding parallel integration churn outweighs speed.
 - 2026-07-11: Approved Task_2 decomposition. Rejected further websocket-only queue-drain heuristics because capture sampling and pipe delivery are observationally ambiguous without a tmux-owned watermark.
+- 2026-07-11: Approved the minimal Task_5 generated-asset exception because CI requires embedded assets to match frontend source in the same PR; Task_6 retains documentation ownership and final post-merge rebuild/sync verification.
