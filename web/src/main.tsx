@@ -27,6 +27,7 @@ function App() {
   const [tokenDraft, setTokenDraft] = useState(() => initialToken());
   const [projects, setProjects] = useState<ProjectInfo[]>([]);
   const [terminalsByProject, setTerminalsByProject] = useState<TerminalMap>({});
+  const [terminalLoadErrors, setTerminalLoadErrors] = useState<Record<string, string>>({});
   const [selectedProjectSlug, setSelectedProjectSlug] = useState("");
   const [selectedTerminalKey, setSelectedTerminalKey] = useState("");
   const [buffers, setBuffers] = useState<BufferMap>({});
@@ -38,7 +39,9 @@ function App() {
   const [notice, setNotice] = useState("");
   const [retrySignals, setRetrySignals] = useState<Record<string, number>>({});
   const selectedProjectSlugRef = useRef("");
+  const terminalsByProjectRef = useRef<TerminalMap>({});
   selectedProjectSlugRef.current = selectedProjectSlug;
+  terminalsByProjectRef.current = terminalsByProject;
 
   const client = useMemo(() => createTerminalApiClient({ token }), [token]);
 
@@ -50,33 +53,44 @@ function App() {
         setLoading(true);
       }
       setError("");
+      setTerminalLoadErrors({});
       try {
         const nextProjects = await client.listProjects(signal);
         if (signal?.aborted) {
           return;
         }
+        const terminalErrors: Record<string, string> = {};
         const terminalResults = await Promise.all(
           nextProjects.map(async (project) => {
             try {
               return [project.slug, await client.listProjectTerminals(project.slug, signal)] as const;
             } catch (err) {
               if (!signal?.aborted) {
-                setError(`${project.slug}: ${errorMessage(err)}`);
+                terminalErrors[project.slug] = errorMessage(err);
               }
-              return [project.slug, []] as const;
+              return [project.slug, null] as const;
             }
           })
         );
         if (signal?.aborted) {
           return;
         }
-        const nextTerminals = Object.fromEntries(terminalResults) as TerminalMap;
+        const nextTerminals: TerminalMap = { ...terminalsByProjectRef.current };
+        for (const [slug, terminals] of terminalResults) {
+          if (terminals) {
+            nextTerminals[slug] = terminals;
+          }
+        }
         const currentProjectSlug = selectedProjectSlugRef.current;
         const nextSelectedProjectSlug = nextProjects.some((project) => project.slug === currentProjectSlug)
           ? currentProjectSlug
           : nextProjects[0]?.slug ?? "";
         setProjects(nextProjects);
         setTerminalsByProject(nextTerminals);
+        setTerminalLoadErrors(terminalErrors);
+        if (Object.keys(terminalErrors).length > 0) {
+          setError(Object.entries(terminalErrors).map(([slug, detail]) => `${slug}: ${detail}`).join(" · "));
+        }
         setSelectedProjectSlug(nextSelectedProjectSlug);
         setSelectedTerminalKey((current) => {
           if (hasTerminalInProject(nextTerminals, nextSelectedProjectSlug, current)) {
@@ -145,9 +159,12 @@ function App() {
   }, []);
 
   const refresh = useCallback(() => {
+    if (loading || refreshing || busyAction) {
+      return;
+    }
     const controller = new AbortController();
     void loadWorkspace(controller.signal, true).finally(() => controller.abort());
-  }, [loadWorkspace]);
+  }, [busyAction, loadWorkspace, loading, refreshing]);
 
   const handleCreateTerminal = useCallback(async () => {
     if (!selectedProjectSlug || busyAction || loading || refreshing) {
@@ -183,6 +200,8 @@ function App() {
     const projectSlug = selectedProjectSlug;
     const key = terminalKey(projectSlug, selectedTerminal.window);
     const windowName = selectedTerminal.window;
+    const successor = (terminalsByProject[projectSlug] ?? []).find((terminal) => terminal.window !== windowName);
+    const successorKey = successor ? terminalKey(projectSlug, successor.window) : "";
     setBusyAction("delete");
     setError("");
     setNotice("");
@@ -192,7 +211,12 @@ function App() {
         ...current,
         [projectSlug]: (current[projectSlug] ?? []).filter((terminal) => terminal.window !== windowName)
       }));
-      setSelectedTerminalKey((current) => current === key ? "" : current);
+      setSelectedTerminalKey((current) => current === key ? successorKey : current);
+      if (successorKey && selectedProjectSlugRef.current === projectSlug) {
+        window.requestAnimationFrame(() => {
+          window.requestAnimationFrame(() => tabRefs.current[successorKey]?.focus());
+        });
+      }
       setNotice(`${selectedTerminal.title} closed.`);
     } catch (err) {
       setError(`Could not close ${selectedTerminal.title}: ${errorMessage(err)}`);
@@ -259,7 +283,7 @@ function App() {
             <span className="eyebrow">Workspace</span>
             <h1>Projects</h1>
           </div>
-          <button className="icon-button" type="button" onClick={refresh} disabled={refreshing || Boolean(busyAction)} aria-label="Refresh projects and terminals" title="Refresh">
+          <button className="icon-button" type="button" onClick={refresh} disabled={loading || refreshing || Boolean(busyAction)} aria-label="Refresh projects and terminals" title="Refresh">
             {refreshing ? "…" : "↻"}
           </button>
         </div>
@@ -268,6 +292,7 @@ function App() {
           {!loading && projects.length === 0 && <div className="sidebar-empty">No projects are configured.</div>}
           {projects.map((project) => {
             const terminals = terminalsByProject[project.slug] ?? [];
+            const terminalLoadError = terminalLoadErrors[project.slug];
             const projectSelected = project.slug === selectedProjectSlug;
             return (
               <section className={`project-group ${projectSelected ? "selected" : ""}`} key={project.slug}>
@@ -291,7 +316,8 @@ function App() {
                         </button>
                       );
                     })}
-                    {terminals.length === 0 && <div className="terminal-empty">No shell windows yet.</div>}
+                    {terminalLoadError && <div className="terminal-empty error-text">Terminal list unavailable. {terminalLoadError}</div>}
+                    {!terminalLoadError && terminals.length === 0 && <div className="terminal-empty">No shell windows yet.</div>}
                 </div>
               </section>
             );
@@ -314,7 +340,7 @@ function App() {
             <p>{selectedProject?.repo_path ?? "Choose a project from the sidebar to open a terminal."}</p>
           </div>
           <div className="workspace-actions">
-            <button className="toolbar-button" type="button" onClick={refresh} disabled={refreshing || Boolean(busyAction)} aria-label="Refresh terminal list">{refreshing ? "Refreshing…" : "Refresh"}</button>
+            <button className="toolbar-button" type="button" onClick={refresh} disabled={loading || refreshing || Boolean(busyAction)} aria-label="Refresh terminal list">{refreshing ? "Refreshing…" : "Refresh"}</button>
             <button className="primary-button" type="button" onClick={() => void handleCreateTerminal()} disabled={!selectedProjectSlug || Boolean(busyAction) || loading || refreshing} aria-label="Open a new shell">＋ New shell</button>
           </div>
         </header>

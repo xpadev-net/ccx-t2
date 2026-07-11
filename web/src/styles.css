@@ -337,6 +337,10 @@ input:focus-visible {
   line-height: 1.45;
 }
 
+.terminal-empty.error-text {
+  color: #d98c94;
+}
+
 .sidebar-footer {
   display: grid;
   gap: 8px;
