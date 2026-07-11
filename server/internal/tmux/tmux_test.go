@@ -866,6 +866,15 @@ func TestRollbackProjectWindowsDoesNotKillAfterOwnershipReadInterleaving(t *test
 	}
 }
 
+func TestOwnershipConditionIncludesRawAndCanonicalRepositoryPaths(t *testing.T) {
+	condition := ownershipCondition(pendingProjectWindowPrefix + "0123456789abcdef01234567")
+	for _, required := range []string{projectWindowRepoPathFormat, projectWindowRawRepoPathFormat} {
+		if !strings.Contains(condition, required) {
+			t.Fatalf("ownership condition = %q, missing repository path guard %q", condition, required)
+		}
+	}
+}
+
 func TestRestorePendingWindowSkipsRenameAfterOwnershipReadInterleaving(t *testing.T) {
 	oldExecCommandContext := execCommandContext
 	oldTimeout := projectWindowReconcileTimeout

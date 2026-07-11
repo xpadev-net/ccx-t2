@@ -43,14 +43,15 @@ const (
 // Name is the stable project-facing identifier; Index and ID are tmux runtime
 // metadata and may change when windows are reordered or recreated.
 type WindowInfo struct {
-	Index            int    `json:"index"`
-	ID               string `json:"id"`
-	Name             string `json:"name"`
-	CurrentPath      string `json:"current_path"`
-	CurrentCommand   string `json:"current_command"`
-	CreationMarker   string `json:"creation_marker,omitempty"`
-	CreationSession  string `json:"creation_session,omitempty"`
-	CreationRepoPath string `json:"creation_repo_path,omitempty"`
+	Index               int    `json:"index"`
+	ID                  string `json:"id"`
+	Name                string `json:"name"`
+	CurrentPath         string `json:"current_path"`
+	CurrentCommand      string `json:"current_command"`
+	CreationMarker      string `json:"creation_marker,omitempty"`
+	CreationSession     string `json:"creation_session,omitempty"`
+	CreationRepoPath    string `json:"creation_repo_path,omitempty"`
+	CreationRawRepoPath string `json:"creation_raw_repo_path,omitempty"`
 }
 
 // Window is kept as a concise alias for callers that use tmux window terminology.
@@ -155,6 +156,7 @@ func ListWindowsContext(ctx context.Context, session string) ([]WindowInfo, erro
 			{name: "creation marker", dest: &window.CreationMarker, format: projectWindowMarkerFormat},
 			{name: "creation session", dest: &window.CreationSession, format: projectWindowSessionFormat},
 			{name: "creation repository path", dest: &window.CreationRepoPath, format: projectWindowRepoPathFormat},
+			{name: "creation raw repository path", dest: &window.CreationRawRepoPath, format: projectWindowRawRepoPathFormat},
 		}
 		skipWindow := false
 		for _, field := range fields {
@@ -347,6 +349,7 @@ func markProjectWindowContext(ctx context.Context, session, windowID, marker, re
 		{projectWindowMarkerOption, marker},
 		{projectWindowSessionOption, session},
 		{projectWindowRepoPathOption, canonicalPath(repoPath)},
+		{projectWindowRawRepoPathOption, repoPath},
 	} {
 		if err := runCtx(ctx, "tmux", "set-option", "-w", "-t", windowID, option[0], option[1]); err != nil {
 			return err
@@ -784,6 +787,8 @@ const projectWindowSessionOption = "@ccx-project-window-session"
 const projectWindowSessionFormat = "#{@ccx-project-window-session}"
 const projectWindowRepoPathOption = "@ccx-project-window-repo-path"
 const projectWindowRepoPathFormat = "#{@ccx-project-window-repo-path}"
+const projectWindowRawRepoPathOption = "@ccx-project-window-raw-repo-path"
+const projectWindowRawRepoPathFormat = "#{@ccx-project-window-raw-repo-path}"
 
 var projectWindowReconcileTimeout = 5 * time.Second
 
@@ -804,6 +809,8 @@ func ownershipCondition(marker string) string {
 	markerCondition := fmt.Sprintf("#{==:%s,%s}", projectWindowMarkerFormat, marker)
 	sessionCondition := fmt.Sprintf("#{==:#{session_name},%s}", projectWindowSessionFormat)
 	pathCondition := fmt.Sprintf("#{==:#{pane_current_path},%s}", projectWindowRepoPathFormat)
+	rawPathCondition := fmt.Sprintf("#{==:#{pane_current_path},%s}", projectWindowRawRepoPathFormat)
+	pathCondition = fmt.Sprintf("#{||:%s,%s}", pathCondition, rawPathCondition)
 	return fmt.Sprintf("#{&&:%s,#{&&:%s,%s}}", markerCondition, sessionCondition, pathCondition)
 }
 
