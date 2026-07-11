@@ -3625,6 +3625,9 @@ func TestProjectTerminalDeleteIsIdempotentWhenWindowDisappears(t *testing.T) {
 	handler := New(Deps{
 		Config:  cfg,
 		Manager: manager,
+		ListProjectWindows: func(ctx context.Context, session, projectSlug string) ([]tmux.WindowInfo, error) {
+			return []tmux.WindowInfo{{ID: "@1", Name: "alpha-shell-1"}}, nil
+		},
 		KillWindow: func(ctx context.Context, session, window string) error {
 			gotSession, gotWindow = session, window
 			return errors.New("tmux: can't find window: alpha-shell-1")
@@ -3636,8 +3639,40 @@ func TestProjectTerminalDeleteIsIdempotentWhenWindowDisappears(t *testing.T) {
 	if resp.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusOK, resp.Body.String())
 	}
-	if gotSession != "ccx-test" || gotWindow != "=alpha-shell-1" {
-		t.Fatalf("kill args = %q %q, want ccx-test =alpha-shell-1", gotSession, gotWindow)
+	if gotSession != "ccx-test" || gotWindow != "@1" {
+		t.Fatalf("kill args = %q %q, want ccx-test @1", gotSession, gotWindow)
+	}
+	var deleted map[string]any
+	if err := json.Unmarshal(resp.Body.Bytes(), &deleted); err != nil {
+		t.Fatalf("decode delete response: %v", err)
+	}
+	if deleted["window"] != "alpha-shell-1" {
+		t.Fatalf("delete response window = %#v, want raw alpha-shell-1", deleted["window"])
+	}
+}
+
+func TestProjectTerminalDeleteDoesNotMatchWindowPrefix(t *testing.T) {
+	cfg, manager := newTestProjectManager(t, "alpha")
+	kills := 0
+	handler := New(Deps{
+		Config:  cfg,
+		Manager: manager,
+		ListProjectWindows: func(ctx context.Context, session, projectSlug string) ([]tmux.WindowInfo, error) {
+			return []tmux.WindowInfo{{ID: "@10", Name: "alpha-shell-10"}}, nil
+		},
+		KillWindow: func(ctx context.Context, session, window string) error {
+			kills++
+			return nil
+		},
+		AuthDisabled: true,
+	})
+
+	resp := performRequest(handler, http.MethodDelete, "/api/projects/alpha/terminals/alpha-shell-1")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	if kills != 0 {
+		t.Fatalf("kill calls = %d, want none for a missing exact window", kills)
 	}
 	var deleted map[string]any
 	if err := json.Unmarshal(resp.Body.Bytes(), &deleted); err != nil {
@@ -3660,9 +3695,12 @@ func TestProjectTerminalWebSocketUsesAtomicTransportInputAndResize(t *testing.T)
 	server := httptest.NewServer(New(Deps{
 		Config:  cfg,
 		Manager: manager,
+		ListProjectWindows: func(ctx context.Context, session, projectSlug string) ([]tmux.WindowInfo, error) {
+			return []tmux.WindowInfo{{ID: "@2", Name: "alpha-shell-1"}}, nil
+		},
 		AttachPane: func(ctx context.Context, session, window string) (*PaneAttachment, error) {
-			if session != "ccx-test" || window != "=alpha-shell-1" {
-				t.Fatalf("attach args = %q %q, want ccx-test =alpha-shell-1", session, window)
+			if session != "ccx-test" || window != "@2" {
+				t.Fatalf("attach args = %q %q, want ccx-test @2", session, window)
 			}
 			return &PaneAttachment{
 				Snapshot: []byte("snapshot"),
@@ -3676,16 +3714,16 @@ func TestProjectTerminalWebSocketUsesAtomicTransportInputAndResize(t *testing.T)
 			}, nil
 		},
 		SendRawKeys: func(ctx context.Context, session, window, keys string) error {
-			if session != "ccx-test" || window != "=alpha-shell-1" {
-				t.Fatalf("input args = %q %q, want ccx-test =alpha-shell-1", session, window)
+			if session != "ccx-test" || window != "@2" {
+				t.Fatalf("input args = %q %q, want ccx-test @2", session, window)
 			}
 			gotInput = keys
 			close(inputReceived)
 			return nil
 		},
 		ResizePane: func(ctx context.Context, session, window string, cols, rows int) error {
-			if session != "ccx-test" || window != "=alpha-shell-1" {
-				t.Fatalf("resize args = %q %q, want ccx-test =alpha-shell-1", session, window)
+			if session != "ccx-test" || window != "@2" {
+				t.Fatalf("resize args = %q %q, want ccx-test @2", session, window)
 			}
 			gotResize = [2]int{cols, rows}
 			close(resizeReceived)
@@ -3740,6 +3778,39 @@ func TestProjectTerminalWebSocketUsesAtomicTransportInputAndResize(t *testing.T)
 	}
 }
 
+func TestProjectTerminalWebSocketRejectsWindowPrefixBeforeUpgrade(t *testing.T) {
+	cfg, manager := newTestProjectManager(t, "alpha")
+	server := httptest.NewServer(New(Deps{
+		Config:  cfg,
+		Manager: manager,
+		ListProjectWindows: func(ctx context.Context, session, projectSlug string) ([]tmux.WindowInfo, error) {
+			return []tmux.WindowInfo{{ID: "@10", Name: "alpha-shell-10"}}, nil
+		},
+		AttachPane: func(ctx context.Context, session, window string) (*PaneAttachment, error) {
+			t.Fatal("AttachPane called for a missing exact terminal")
+			return nil, nil
+		},
+		SendRawKeys: func(ctx context.Context, session, window, keys string) error {
+			t.Fatal("SendRawKeys called for a missing exact terminal")
+			return nil
+		},
+		ResizePane: func(ctx context.Context, session, window string, cols, rows int) error {
+			t.Fatal("ResizePane called for a missing exact terminal")
+			return nil
+		},
+		AuthDisabled: true,
+	}))
+	defer server.Close()
+
+	_, resp, err := websocket.DefaultDialer.Dial(wsURL(server.URL, "/ws/projects/alpha/terminal/alpha-shell-1"), nil)
+	if err == nil {
+		t.Fatal("Dial error = nil, want not found")
+	}
+	if resp == nil || resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("response = %#v, want 404", resp)
+	}
+}
+
 func TestProjectTerminalWebSocketRejectsForeignWindowBeforeAttach(t *testing.T) {
 	cfg, manager := newTestProjectManager(t, "alpha", "beta")
 	server := httptest.NewServer(New(Deps{
@@ -3767,7 +3838,13 @@ func TestProjectTerminalWebSocketToleratesDisappearingWindow(t *testing.T) {
 	server := httptest.NewServer(New(Deps{
 		Config:  cfg,
 		Manager: manager,
+		ListProjectWindows: func(ctx context.Context, session, projectSlug string) ([]tmux.WindowInfo, error) {
+			return []tmux.WindowInfo{{ID: "@2", Name: "alpha-shell-1"}}, nil
+		},
 		AttachPane: func(ctx context.Context, session, window string) (*PaneAttachment, error) {
+			if window != "@2" {
+				t.Fatalf("attach window = %q, want @2", window)
+			}
 			return nil, errors.New("tmux: can't find window: alpha-shell-1")
 		},
 		AuthDisabled: true,

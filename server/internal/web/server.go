@@ -656,7 +656,16 @@ func (s *Server) deleteProjectTerminal(w http.ResponseWriter, r *http.Request, w
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if err := s.killWindow(ctx, session, exactTmuxWindowTarget(window)); err != nil && !isMissingTmuxWindowError(err) {
+	windowID, found, err := s.resolveProjectTerminalWindow(ctx, session, slug, window)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "list project terminals")
+		return
+	}
+	if !found {
+		writeJSON(w, http.StatusOK, map[string]any{"deleted": true, "window": window})
+		return
+	}
+	if err := s.killWindow(ctx, session, windowID); err != nil && !isMissingTmuxWindowError(err) {
 		writeError(w, http.StatusInternalServerError, "delete project terminal")
 		return
 	}
@@ -693,17 +702,39 @@ func (s *Server) handleProjectWSRoute(w http.ResponseWriter, r *http.Request) {
 			methodNotAllowed(w, http.MethodGet)
 			return
 		}
-		projectServer.handleTmuxLogWS(w, r, exactTmuxWindowTarget(parts[2]), "terminal")
+		session, err := projectServer.tmuxSessionName()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), followupTmuxOperationTimeout)
+		windowID, found, err := projectServer.resolveProjectTerminalWindow(ctx, session, parts[0], parts[2])
+		cancel()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "list project terminals")
+			return
+		}
+		if !found {
+			writeError(w, http.StatusNotFound, terminalRouteError(http.StatusNotFound))
+			return
+		}
+		projectServer.handleTmuxLogWS(w, r, windowID, "terminal")
 		return
 	}
 	s.handleProjectWS(w, r)
 }
 
-// exactTmuxWindowTarget prevents tmux's target resolver from treating a
-// validated window name as a unique-prefix match. Public routes and DTOs keep
-// the raw project window name; only tmux operations receive the exact marker.
-func exactTmuxWindowTarget(window string) string {
-	return "=" + window
+func (s *Server) resolveProjectTerminalWindow(ctx context.Context, session, slug, requested string) (string, bool, error) {
+	windows, err := s.listProjectWindows(ctx, session, slug)
+	if err != nil {
+		return "", false, err
+	}
+	for _, window := range windows {
+		if window.Name == requested && window.ID != "" {
+			return window.ID, true, nil
+		}
+	}
+	return "", false, nil
 }
 
 func terminalRouteError(status int) string {
