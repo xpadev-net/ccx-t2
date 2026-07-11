@@ -166,10 +166,13 @@
     detail: `$deep-review` confirms the reduced PR preserves prior snapshot semantics while improving independent transport lifecycle concerns.
 
 ### Task_9: atomic tmux pane attachment and web integration
-- status: in_progress
+- status: complete
 - type: impl
 - branch: `codex/webshell-atomic-pane-attach`
 - thread: `019f4ec5-c782-7163-8fd4-41dac81831b7`
+- pr: `#67` (`https://github.com/xpadev-net/ccx-t2/pull/67`)
+- head: `dabc006837993f09a96d1226fd50068e39f43cdd`
+- merge_commit: `b32a8e9b12b9073bd8bb39b9a3b123bf16dc6eb3`
 - owns:
   - `server/internal/tmux/tmux.go`
   - `server/internal/tmux/tmux_test.go`
@@ -406,6 +409,7 @@
 - 2026-07-11: Task_8 merged via PR #66 at `6439fb12a3d6e3185d7d6280cbd1ab04ff398189` after reduced-scope parent deep-review APPROVED, independent Reviewer APPROVED, hook exit 0, normal/race/vet/stress passes, and all GitHub checks green. Worker archival initiated.
 - 2026-07-11: Task_1 merged via PR #65 at `d58fa7d8423cee8fde89967662f2f7eae90428fa` after parent and independent deep-review CLEAN, hook exit 0, normal/race/full 20x race stress/vet passes, and all GitHub checks green. Task_9 dependency gate opened.
 - 2026-07-11: Task_9 started in separate worktree thread `019f4ec5-c782-7163-8fd4-41dac81831b7` on `codex/webshell-atomic-pane-attach` using `gpt-5.6-luna` / `high`.
+- 2026-07-11: Task_9 merged via PR #67 at `b32a8e9b12b9073bd8bb39b9a3b123bf16dc6eb3` after exact-head parent and two independent deep-reviews were CLEAN, orchestrator hook exit 0, 179 normal/race tests, vet, 260 focused race-stress cases, diff-check, and all GitHub checks passed. Task_3 dependency gate opened.
 
 ## Decision Log
 - 2026-07-11: WebShell is the product UI; harness/task concepts remain backend-compatible but are removed from primary navigation.
