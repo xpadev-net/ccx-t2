@@ -277,11 +277,17 @@ function App() {
     }
   }, [busyAction, client, loading, refreshing, selectedProjectSlug, selectedTerminal, token]);
 
-  const handleTerminalState = useCallback((key: string, state: TerminalState) => {
+  const handleTerminalState = useCallback((key: string, state: TerminalState, credentialGeneration: number) => {
+    if (credentialGeneration !== credentialGenerationRef.current) {
+      return;
+    }
     setConnections((current) => ({ ...current, [key]: state }));
   }, []);
 
-  const handleTerminalData = useCallback((key: string, data: string) => {
+  const handleTerminalData = useCallback((key: string, data: string, credentialGeneration: number) => {
+    if (credentialGeneration !== credentialGenerationRef.current) {
+      return;
+    }
     setBuffers((current) => {
       const previous = current[key] ?? [];
       const next = [...previous, data];
@@ -289,7 +295,10 @@ function App() {
     });
   }, []);
 
-  const handleTerminalError = useCallback((title: string, err: Error) => {
+  const handleTerminalError = useCallback((title: string, err: Error, credentialGeneration: number) => {
+    if (credentialGeneration !== credentialGenerationRef.current) {
+      return;
+    }
     setError(`${title}: ${err.message}`);
   }, []);
 
@@ -320,6 +329,7 @@ function App() {
   };
 
   const tabRefs = useRef<Record<string, HTMLButtonElement | null>>({});
+  const renderedCredentialGeneration = credentialGenerationRef.current;
   const handleTabKeyDown = useCallback(
     (event: KeyboardEvent<HTMLButtonElement>, index: number) => {
       if (!selectedTerminals.length || !["ArrowRight", "ArrowLeft", "Home", "End"].includes(event.key)) {
@@ -453,9 +463,9 @@ function App() {
               token={token}
               chunks={buffers[selectedTerminalKey] ?? []}
               retrySignal={retrySignals[selectedTerminalKey] ?? 0}
-              onData={(data) => handleTerminalData(selectedTerminalKey, data)}
-              onStateChange={(state) => handleTerminalState(selectedTerminalKey, state)}
-              onError={(err) => handleTerminalError(selectedTerminal.title, err)}
+              onData={(data) => handleTerminalData(selectedTerminalKey, data, renderedCredentialGeneration)}
+              onStateChange={(state) => handleTerminalState(selectedTerminalKey, state, renderedCredentialGeneration)}
+              onError={(err) => handleTerminalError(selectedTerminal.title, err, renderedCredentialGeneration)}
             />
           ) : (
             <WorkspaceEmptyState loading={loading} hasProjects={projects.length > 0} onCreate={() => void handleCreateTerminal()} />
