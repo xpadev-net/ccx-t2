@@ -323,10 +323,10 @@
     detail: `$deep-review`, independent subagent review, and `gh-review-hook` exit 0.
 
 ### Task_6: product documentation and embedded assets
-- status: waiting
+- status: in_progress
 - type: docs
 - branch: `codex/webshell-docs-assets`
-- thread: pending
+- thread: `client-new-thread:6fe51544-4be8-4da7-85c6-26cbf26bd227` (worktree setup queued)
 - owns:
   - `README.md`
   - `docs/requirements.md`
@@ -425,6 +425,7 @@
 - 2026-07-11: Task_4 merged via PR #69 at `1dad20bc56a5a48209a606ac4eed0dcb838de40a` after target identity plus generation closed the React pre-passive-effect stale-action race; exact-head parent and two independent deep-reviews were CLEAN, build and diff-check passed, fresh hook exited 0, and all GitHub checks were green. Task_5 dependency gate opened.
 - 2026-07-11: Task_5 started in separate worktree thread `019f5015-78ee-7e21-a1aa-626735d4c5b7` on `codex/webshell-cmux-ui` using `gpt-5.6-luna` / `high`, with required desktop/narrow browser probes and the user-provided cmux reference image.
 - 2026-07-11: Task_5 merged via PR #70 at `ba48493fa61314ba824a2c0881d3e616532bd904` after parent and independent deep-review were CLEAN, current-head build/embedded check/hook and all GitHub checks passed, and Reviewer E2E at `1440x900`/`900x700` approved project/tab lifecycle, credential isolation, stale-scrollback prevention, protected terminals, focus, errors, and responsive overflow. Task_6 dependency gate opened; Task_5 archival was requested.
+- 2026-07-11: Task_5 worker thread archived. Task_6 separate `gpt-5.6-luna` / `high` worktree setup queued as `client-new-thread:6fe51544-4be8-4da7-85c6-26cbf26bd227` on delegated branch `codex/webshell-docs-assets`; startup stability check pending thread materialization.
 
 ## Decision Log
 - 2026-07-11: WebShell is the product UI; harness/task concepts remain backend-compatible but are removed from primary navigation.
