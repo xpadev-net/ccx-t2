@@ -208,10 +208,13 @@
     detail: Independent review of tmux ordering proof, cancellation, cleanup, realtime semantics, and deterministic boundary tests.
 
 ### Task_3: project terminal REST and generic WS API
-- status: in_progress
+- status: complete
 - type: impl
 - branch: `codex/webshell-terminal-api`
 - thread: `019f4f92-1b39-7701-8c78-01cde7f5cd7c`
+- pr: `#68` (`https://github.com/xpadev-net/ccx-t2/pull/68`)
+- head: `317ea34c6c4748ddc6c430348d438b1006274cc4`
+- merge_commit: `daf1d379d5f55f71c5ca38eb89abd0b12bb6f584`
 - owns:
   - `server/internal/web/server.go`
   - `server/internal/web/server_test.go`
@@ -411,6 +414,7 @@
 - 2026-07-11: Task_9 started in separate worktree thread `019f4ec5-c782-7163-8fd4-41dac81831b7` on `codex/webshell-atomic-pane-attach` using `gpt-5.6-luna` / `high`.
 - 2026-07-11: Task_9 merged via PR #67 at `b32a8e9b12b9073bd8bb39b9a3b123bf16dc6eb3` after exact-head parent and two independent deep-reviews were CLEAN, orchestrator hook exit 0, 179 normal/race tests, vet, 260 focused race-stress cases, diff-check, and all GitHub checks passed. Task_3 dependency gate opened.
 - 2026-07-11: Task_3 started in separate worktree thread `019f4f92-1b39-7701-8c78-01cde7f5cd7c` on `codex/webshell-terminal-api` using `gpt-5.6-luna` / `high`.
+- 2026-07-11: Task_3 merged via PR #68 at `daf1d379d5f55f71c5ca38eb89abd0b12bb6f584` after stable tmux window-ID resolution closed prefix-collision findings; exact-head parent and two independent deep-reviews were CLEAN, hook exit 0, 149 normal/race tests, vet, 280 focused race-stress cases, diff-check, and all GitHub checks passed. Task_4 dependency gate opened.
 
 ## Decision Log
 - 2026-07-11: WebShell is the product UI; harness/task concepts remain backend-compatible but are removed from primary navigation.
