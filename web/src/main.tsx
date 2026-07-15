@@ -15,7 +15,8 @@ import { useTerminalController } from "./terminal";
 import "./styles.css";
 
 type TerminalMap = Record<string, TerminalInfo[]>;
-type BufferMap = Record<string, string[]>;
+type TerminalBuffer = { revision: number; chunks: string[] };
+type BufferMap = Record<string, TerminalBuffer>;
 type ConnectionMap = Record<string, TerminalState>;
 
 const tokenStorageKey = "ccx.webToken";
@@ -288,10 +289,29 @@ function App() {
       return;
     }
     setBuffers((current) => {
-      const previous = current[key] ?? [];
-      const next = [...previous, data];
-      return { ...current, [key]: next.length > maxBufferedChunks ? next.slice(-retainedBufferedChunks) : next };
+      const previous = current[key] ?? { revision: 0, chunks: [] };
+      const next = [...previous.chunks, data];
+      return {
+        ...current,
+        [key]: {
+          revision: previous.revision,
+          chunks: next.length > maxBufferedChunks ? next.slice(-retainedBufferedChunks) : next
+        }
+      };
     });
+  }, []);
+
+  const handleTerminalSnapshot = useCallback((key: string, data: string, credentialGeneration: number) => {
+    if (credentialGeneration !== credentialGenerationRef.current) {
+      return;
+    }
+    setBuffers((current) => ({
+      ...current,
+      [key]: {
+        revision: (current[key]?.revision ?? 0) + 1,
+        chunks: data === "" ? [] : [normalizeTerminalSnapshot(data)]
+      }
+    }));
   }, []);
 
   const handleTerminalError = useCallback((title: string, err: Error, credentialGeneration: number) => {
@@ -460,8 +480,9 @@ function App() {
               projectSlug={selectedProjectSlug}
               terminal={selectedTerminal}
               token={token}
-              chunks={buffers[selectedTerminalKey] ?? []}
+              buffer={buffers[selectedTerminalKey] ?? { revision: 0, chunks: [] }}
               retrySignal={retrySignals[selectedTerminalKey] ?? 0}
+              onSnapshot={(data) => handleTerminalSnapshot(selectedTerminalKey, data, renderedCredentialGeneration)}
               onData={(data) => handleTerminalData(selectedTerminalKey, data, renderedCredentialGeneration)}
               onStateChange={(state) => handleTerminalState(selectedTerminalKey, state, renderedCredentialGeneration)}
               onError={(err) => handleTerminalError(selectedTerminal.title, err, renderedCredentialGeneration)}
@@ -492,8 +513,9 @@ function TerminalSurface({
   projectSlug,
   terminal,
   token,
-  chunks,
+  buffer,
   retrySignal,
+  onSnapshot,
   onData,
   onStateChange,
   onError
@@ -501,8 +523,9 @@ function TerminalSurface({
   projectSlug: string;
   terminal: TerminalInfo;
   token: string;
-  chunks: string[];
+  buffer: TerminalBuffer;
   retrySignal: number;
+  onSnapshot: (data: string) => void;
   onData: (data: string) => void;
   onStateChange: (state: TerminalState) => void;
   onError: (error: Error) => void;
@@ -510,12 +533,14 @@ function TerminalSurface({
   const containerRef = useRef<HTMLDivElement | null>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const writtenRef = useRef(0);
+  const revisionRef = useRef(buffer.revision);
   const sendInputRef = useRef<(data: string) => boolean>(() => false);
   const resizeRef = useRef<(size: { cols: number; rows: number }) => boolean>(() => false);
   const retryRef = useRef<() => void>(() => undefined);
   const initialRetrySignalRef = useRef(retrySignal);
   const terminalKeyValue = terminalKey(projectSlug, terminal.window);
 
+  const handleSnapshot = useCallback((data: string) => onSnapshot(data), [onSnapshot]);
   const handleData = useCallback((data: string) => onData(data), [onData]);
   const handleState = useCallback((state: TerminalState) => onStateChange(state), [onStateChange]);
   const handleError = useCallback((error: Error) => onError(error), [onError]);
@@ -523,6 +548,7 @@ function TerminalSurface({
     projectSlug,
     windowName: terminal.window,
     token,
+    onSnapshot: handleSnapshot,
     onData: handleData,
     onStateChange: handleState,
     onError: handleError
@@ -601,6 +627,7 @@ function TerminalSurface({
       xterm.dispose();
       terminalRef.current = null;
       writtenRef.current = 0;
+      revisionRef.current = buffer.revision;
     };
   }, []);
 
@@ -609,17 +636,20 @@ function TerminalSurface({
     if (!xterm) {
       return;
     }
-    if (writtenRef.current > chunks.length) {
-      xterm.reset();
+    if (revisionRef.current !== buffer.revision || writtenRef.current > buffer.chunks.length) {
+      // Queue RIS with prior writes so an older asynchronous xterm write cannot
+      // land after a synchronous reset and resurrect stale pre-snapshot output.
+      xterm.write("\x1bc");
       writtenRef.current = 0;
+      revisionRef.current = buffer.revision;
     }
-    for (let index = writtenRef.current; index < chunks.length; index += 1) {
-      xterm.write(chunks[index]);
+    for (let index = writtenRef.current; index < buffer.chunks.length; index += 1) {
+      xterm.write(buffer.chunks[index]);
     }
-    writtenRef.current = chunks.length;
-  }, [chunks]);
+    writtenRef.current = buffer.chunks.length;
+  }, [buffer]);
 
-  const placeholder = state.phase === "open" && chunks.length > 0 ? "" : terminalStateDetail(state, terminal.available);
+  const placeholder = state.phase === "open" && buffer.chunks.length > 0 ? "" : terminalStateDetail(state, terminal.available);
   return (
     <div className="terminal-view" onMouseDown={() => terminalRef.current?.focus()}>
       <div className="terminal-view-header">
@@ -647,6 +677,13 @@ function WorkspaceEmptyState({ loading, hasProjects, onCreate }: { loading: bool
 
 function terminalKey(projectSlug: string, windowName: string) {
   return `${projectSlug}\u0000${windowName}`;
+}
+
+function normalizeTerminalSnapshot(data: string) {
+  // tmux capture-pane separates rows with LF while the interactive xterm keeps
+  // convertEol disabled so live PTY bytes remain exact. Snapshot rows therefore
+  // need an explicit carriage return without altering live stream bytes.
+  return data.replace(/\r?\n/g, "\r\n");
 }
 
 function terminalDomId(prefix: string, key: string) {

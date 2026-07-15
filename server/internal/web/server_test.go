@@ -2207,6 +2207,7 @@ func TestWorkerLogWebSocketStreamsLines(t *testing.T) {
 		t.Fatalf("Dial: %v", err)
 	}
 	defer conn.Close()
+	readTerminalSnapshot(t, conn, "")
 
 	for _, want := range []string{"hello", "world"} {
 		var msg wsMessage
@@ -2250,6 +2251,7 @@ func TestWorkerLogWebSocketAcceptsTokenQueryAuth(t *testing.T) {
 		t.Fatalf("Dial: %v", err)
 	}
 	defer conn.Close()
+	readTerminalSnapshot(t, conn, "")
 	var msg wsMessage
 	if err := conn.ReadJSON(&msg); err != nil {
 		t.Fatalf("ReadJSON: %v", err)
@@ -2294,6 +2296,7 @@ func TestProjectWorkerLogWebSocketStreamsProjectWorker(t *testing.T) {
 		t.Fatalf("Dial: %v", err)
 	}
 	defer conn.Close()
+	readTerminalSnapshot(t, conn, "")
 
 	var msg wsMessage
 	if err := conn.ReadJSON(&msg); err != nil {
@@ -2339,6 +2342,7 @@ func TestWorkerLogWebSocketStreamsSelectedProjectWorker(t *testing.T) {
 		t.Fatalf("Dial: %v", err)
 	}
 	defer conn.Close()
+	readTerminalSnapshot(t, conn, "")
 
 	var msg wsMessage
 	if err := conn.ReadJSON(&msg); err != nil {
@@ -2545,6 +2549,7 @@ func TestProjectOrchestratorLogWebSocketStreamsProjectWindow(t *testing.T) {
 		t.Fatalf("Dial: %v", err)
 	}
 	defer conn.Close()
+	readTerminalSnapshot(t, conn, "")
 
 	var msg wsMessage
 	if err := conn.ReadJSON(&msg); err != nil {
@@ -2590,7 +2595,7 @@ func TestProjectOrchestratorLogWebSocketSendsInitialPaneSnapshot(t *testing.T) {
 	if err := conn.ReadJSON(&msg); err != nil {
 		t.Fatalf("ReadJSON: %v", err)
 	}
-	if msg.Type != "chunk" || msg.Data != "existing shell\r\n$ " {
+	if msg.Type != "snapshot" || msg.Data != "existing shell\r\n$ " {
 		t.Fatalf("message = %#v, want initial shell snapshot", msg)
 	}
 }
@@ -2635,8 +2640,8 @@ func TestProjectOrchestratorLogWebSocketUsesAtomicPaneAttachment(t *testing.T) {
 	if err := conn.ReadJSON(&msg); err != nil {
 		t.Fatalf("ReadJSON snapshot: %v", err)
 	}
-	if msg.Type != "chunk" || msg.Data != "same\n" {
-		t.Fatalf("snapshot message = %#v, want one snapshot chunk", msg)
+	if msg.Type != "snapshot" || msg.Data != "same\n" {
+		t.Fatalf("snapshot message = %#v, want one snapshot frame", msg)
 	}
 	select {
 	case <-attached:
@@ -3015,6 +3020,8 @@ func TestProjectOrchestratorLogWebSocketAllowsMultipleSubscribers(t *testing.T) 
 		t.Fatalf("second Dial: %v", err)
 	}
 	defer second.Close()
+	readTerminalSnapshot(t, first, "")
+	readTerminalSnapshot(t, second, "")
 
 	lines <- "shared output"
 	for _, conn := range []*websocket.Conn{first, second} {
@@ -3135,6 +3142,8 @@ func TestWorkerLogWebSocketAllowsMultipleSubscribers(t *testing.T) {
 		t.Fatalf("second Dial: %v", err)
 	}
 	defer second.Close()
+	readTerminalSnapshot(t, first, "")
+	readTerminalSnapshot(t, second, "")
 
 	lines <- "worker output"
 	for _, conn := range []*websocket.Conn{first, second} {
@@ -3741,8 +3750,8 @@ func TestProjectTerminalWebSocketUsesAtomicTransportInputAndResize(t *testing.T)
 	if err := conn.ReadJSON(&message); err != nil {
 		t.Fatalf("ReadJSON snapshot: %v", err)
 	}
-	if message.Type != "chunk" || message.Data != "snapshot" {
-		t.Fatalf("snapshot = %#v, want snapshot chunk", message)
+	if message.Type != "snapshot" || message.Data != "snapshot" {
+		t.Fatalf("snapshot = %#v, want snapshot frame", message)
 	}
 	if err := conn.WriteJSON(wsMessage{Type: "input", Data: "echo hi"}); err != nil {
 		t.Fatalf("WriteJSON input: %v", err)
@@ -3867,6 +3876,17 @@ func TestProjectTerminalWebSocketToleratesDisappearingWindow(t *testing.T) {
 
 func wsURL(baseURL, path string) string {
 	return "ws" + strings.TrimPrefix(baseURL, "http") + path
+}
+
+func readTerminalSnapshot(t *testing.T, conn *websocket.Conn, want string) {
+	t.Helper()
+	var message wsMessage
+	if err := conn.ReadJSON(&message); err != nil {
+		t.Fatalf("ReadJSON snapshot: %v", err)
+	}
+	if message.Type != "snapshot" || message.Data != want {
+		t.Fatalf("snapshot = %#v, want snapshot %q", message, want)
+	}
 }
 
 func TestBearerAuth(t *testing.T) {
